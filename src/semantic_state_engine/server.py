@@ -167,6 +167,11 @@ SYNC_BATCH_MIN = 1
 SYNC_BATCH_MAX = 100
 SYNC_DEFAULT_LIMIT = 100
 
+# Maximum raw UTF-8 bytes accepted in any POST request body (1 MiB). Every
+# POST interface shares this cap; a larger declared Content-Length is
+# rejected with 413 before a single body byte is read.
+MAX_BODY_BYTES = 1_048_576
+
 
 def parse_sync_batch(raw: bytes | str | dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """Parse and validate a sync-import batch.
@@ -1298,11 +1303,39 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
-    def _read_body(self) -> bytes:
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
+    def _read_bounded_body(self) -> bytes | None:
+        """Validate Content-Length and read exactly the declared bytes.
+
+        Every POST interface shares this contract, checked before any body
+        byte is consumed: the request must carry a Content-Length header
+        holding one ASCII decimal integer (several headers are tolerated
+        only when every value is identical). A missing, blank, signed,
+        whitespace-padded, non-ASCII, or otherwise malformed value — or
+        conflicting values — is a 400 and is never treated as an empty
+        body. A declared length above :data:`MAX_BODY_BYTES` is a 413
+        answered without reading the body, so an oversized request never
+        reaches JSON parsing, the commit lock, memory, or the data file,
+        even when the body itself would have been invalid. A declared
+        length at exactly the cap is processed normally: exactly that many
+        bytes are read and handed to the endpoint's usual validation.
+
+        Returns the body bytes, or None after the error response was sent.
+        """
+        values = self.headers.get_all("Content-Length")
+        if not values:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return None
+        token = values[0]
+        if any(value != token for value in values):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return None
+        length = _non_negative_int(token)
+        if length is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return None
+        if length > MAX_BODY_BYTES:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "payload_too_large"})
+            return None
         return self.rfile.read(length) if length > 0 else b""
 
     def _handle_checkpoint_get(self, peer_id: str) -> None:
@@ -1316,11 +1349,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._json(status, payload)
 
     def _handle_checkpoint_post(self, peer_id: str) -> None:
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
         if peer_id == "":
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         try:
-            cursor = parse_checkpoint_payload(self._read_body())
+            cursor = parse_checkpoint_payload(raw)
         except ValueError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
@@ -1382,11 +1418,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_sync_post(self) -> None:
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        raw = self.rfile.read(length) if length > 0 else b""
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
         try:
             records = parse_sync_batch(raw)
         except ValueError:
@@ -1410,11 +1444,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_resolve_post(self, key: str) -> None:
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        raw = self.rfile.read(length) if length > 0 else b""
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
         try:
             resolution = parse_resolve_payload(raw)
         except ValueError:
@@ -1454,11 +1486,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[3] == "operations"
         ):
             replica_id = segments[2]
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                length = 0
-            raw = self.rfile.read(length) if length > 0 else b""
+            raw = self._read_bounded_body()
+            if raw is None:
+                return
             try:
                 operation = parse_operation_payload(raw, replica_id)
             except ValueError:
