@@ -29,6 +29,7 @@ All four POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/s
 - A declared length over the limit returns HTTP 413 with `{"error":"payload_too_large"}` **before the body is read**, before JSON parsing, and before the commit lock or any memory/data-file state is touched — an over-limit declaration is rejected on its size alone, even when the content would also have been invalid.
 - When the declared length is within the limit, exactly that many bytes are read and the endpoint's existing JSON and field validation, status codes, batch atomicity, idempotency, and persistence-failure semantics apply unchanged.
 - A rejected request (400 or 413) adds no operation, candidate, checkpoint, or audit record and creates no temporary persistence file; memory and the data file are exactly as they were before the request.
+- When bearer-token authentication is enabled (see below), these 400/413 rejections keep their priority: they are answered before the 401 authentication check, and only a request with a valid declared length can reach the authentication check at all.
 
 ### Local persistence and recovery (optional)
 
@@ -56,6 +57,21 @@ The data file is a single UTF-8 JSON document, e.g.:
 ```
 
 The `checkpoints` section is optional and holds sender-side replication cursors (see below); a file written before checkpoints existed contains only `version` and `operations`, and recovers with no registered checkpoints. `version` stays `1`: the supplemented format is backward compatible, and an old file is upgraded on disk the first time a checkpoint (or any other new commit) is persisted.
+
+### Optional bearer-token authentication
+
+The service is anonymous by default: without authentication options every documented behavior above is unchanged. Pass `--auth-token-file PATH` to require a bearer token on every endpoint except the health probe:
+
+```bash
+PYTHONPATH=src python3 -m semantic_state_engine.server --auth-token-file ./var/token
+```
+
+- The token file is read and validated **before the service begins listening**. It must be a readable regular file whose entire content is exactly one non-empty ASCII printable token — no whitespace, no newlines, nothing before or after it. A missing, unreadable, or non-regular target (for example a directory) and any format violation make startup fail with exit code 2, exactly like a rejected data file: no port is bound and the token is never printed.
+- `GET /health` stays anonymous. Every other route — known or unknown, GET or POST — requires the request to carry **exactly one** `Authorization` header whose value is exactly `Bearer ` (one space) followed by the token. A missing, duplicated, or malformed header and any token mismatch return HTTP 401 with `{"error":"unauthorized"}` and a `WWW-Authenticate: Bearer` response header — before route matching, query parsing, the commit lock, any state read, any data-file access, and any POST body read. The comparison uses the standard library's constant-time primitive.
+- A rejected request changes nothing: it creates no temporary file and leaves memory, logs, checkpoints, audit streams, and the data file exactly as they were; the token is never leaked in responses or logs.
+- The four POST endpoints keep their Content-Length priority: a missing/malformed declaration still returns 400 and an over-limit declaration still returns 413 **before** authentication is checked. When the declared length is valid but the request is unauthorized, the 401 is sent **without reading the body** and the connection is closed.
+- Once a request is authenticated, every existing behavior — success codes, 400/404/409/500, paging, digests, idempotency, concurrency, and recovery — is exactly as documented for the anonymous service.
+- The authentication configuration is never written to the data file: a `--data-file` restart recovers only operations and checkpoints, and the token is supplied again (or not) via the command line on each start.
 
 ### Writing operations
 

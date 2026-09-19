@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import stat
@@ -449,6 +450,43 @@ class PersistenceError(Exception):
     At startup this means the service must refuse to start; while serving
     it means the current write could not be committed durably.
     """
+
+
+class AuthTokenError(Exception):
+    """Raised when the auth token file cannot be used.
+
+    Always a startup failure: the service refuses to start before it begins
+    listening, exactly like a rejected data file. The token itself is never
+    included in the error message.
+    """
+
+
+def load_auth_token(path: str) -> str:
+    """Read and strictly validate the bearer token file.
+
+    The target must be a readable regular file whose entire content is one
+    non-empty ASCII printable token (bytes 0x21-0x7E): no whitespace, no
+    newlines, nothing before or after the token. Raises AuthTokenError on a
+    missing, unreadable, or non-regular target and on any format violation;
+    the error never echoes the file's content.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except OSError as exc:
+        raise AuthTokenError(f"cannot access auth token file {path!r}: {exc}") from exc
+    if not stat.S_ISREG(mode):
+        raise AuthTokenError(f"auth token path is not a regular file: {path!r}")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise AuthTokenError(f"cannot read auth token file {path!r}: {exc}") from exc
+    if not raw or any(byte < 0x21 or byte > 0x7E for byte in raw):
+        raise AuthTokenError(
+            "auth token file must contain exactly one non-empty ASCII "
+            "printable token without whitespace or newlines"
+        )
+    return raw.decode("ascii")
 
 
 def _validate_stored_operation(entry: Any) -> tuple[str, dict[str, Any]]:
@@ -1323,6 +1361,7 @@ class SemanticStateServer(ThreadingHTTPServer):
         *,
         data_file: str | None = None,
         store: StateStore | None = None,
+        auth_token: str | None = None,
     ) -> None:
         # Build (and thus preflight/recover) the store before binding and
         # listening, so a rejected data file fails startup before any port is
@@ -1330,6 +1369,9 @@ class SemanticStateServer(ThreadingHTTPServer):
         resolved_store = store if store is not None else StateStore(data_file=data_file)
         super().__init__(server_address, handler_class or RequestHandler)
         self.store = resolved_store
+        # The bearer token clients must present, or None when authentication
+        # is disabled. It is never written to the data file or any log.
+        self.auth_token = auth_token
 
 
 _FALLBACK_STORE = StateStore()
@@ -1342,13 +1384,48 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _store(self) -> StateStore:
         return getattr(self.server, "store", _FALLBACK_STORE)
 
-    def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+    def _json(
+        self,
+        status: HTTPStatus,
+        payload: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _require_auth(self) -> bool:
+        """Enforce bearer-token authentication when it is configured.
+
+        Returns True when the request may proceed (authentication disabled,
+        or the request carries exactly one Authorization header whose value
+        is exactly ``Bearer <token>``). Otherwise sends HTTP 401 with
+        ``WWW-Authenticate: Bearer`` and returns False. The comparison uses
+        the standard library's constant-time primitive, the request body is
+        never read here (so the connection is closed because an unread body
+        can no longer be framed), and neither memory nor the data file is
+        touched.
+        """
+        token = getattr(self.server, "auth_token", None)
+        if token is None:
+            return True
+        values = self.headers.get_all("Authorization")
+        if values is not None and len(values) == 1 and hmac.compare_digest(
+            values[0].encode("utf-8"), f"Bearer {token}".encode("utf-8")
+        ):
+            return True
+        self.close_connection = True
+        self._json(
+            HTTPStatus.UNAUTHORIZED,
+            {"error": "unauthorized"},
+            {"WWW-Authenticate": "Bearer"},
+        )
+        return False
 
     def _path_segments(self) -> list[str]:
         path = urlsplit(self.path).path
@@ -1373,7 +1450,12 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path == "/health":
+            # The health probe stays anonymous even when auth is enabled.
             self._json(HTTPStatus.OK, health_payload())
+            return
+        # Every other route — known or unknown — authenticates before route
+        # matching, query parsing, or any state access.
+        if not self._require_auth():
             return
         segments = self._path_segments()
         if len(segments) == 2 and segments[0] == "v1" and segments[1] == "metrics":
@@ -1423,18 +1505,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
-    def _read_bounded_body(self) -> bytes | None:
-        """Read the request body under the shared POST size contract.
+    def _validate_declared_length(self) -> int | None:
+        """Validate the declared Content-Length, sending 400/413 on rejection.
 
-        Content-Length is validated before anything else: a missing,
-        malformed, or conflicting declaration is answered with HTTP 400 and
-        a declared length over ``MAX_BODY_BYTES`` with HTTP 413 — both
-        before a single body byte is read, so an over-limit declaration is
-        rejected on its declared size alone, however invalid the content
-        would have been. Only when the declared length is within the limit
-        are exactly that many bytes read. Returns the body, or None when
-        the error response has already been sent. Either rejection closes
-        the connection because the unread body can no longer be framed.
+        A missing, malformed, or conflicting declaration is answered with
+        HTTP 400 and a declared length over ``MAX_BODY_BYTES`` with HTTP 413.
+        Both rejections close the connection because the unread body can no
+        longer be framed. Returns the validated length, or None when the
+        error response has already been sent.
         """
         length = declared_body_length(self.headers)
         if length is None:
@@ -1444,6 +1522,22 @@ class RequestHandler(BaseHTTPRequestHandler):
         if length > MAX_BODY_BYTES:
             self.close_connection = True
             self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "payload_too_large"})
+            return None
+        return length
+
+    def _read_bounded_body(self) -> bytes | None:
+        """Read the request body under the shared POST size contract.
+
+        Content-Length is validated before anything else (see
+        :meth:`_validate_declared_length`): an over-limit declaration is
+        rejected on its declared size alone, before a single body byte is
+        read and however invalid the content would have been. Only when the
+        declared length is within the limit are exactly that many bytes
+        read. Returns the body, or None when the error response has already
+        been sent.
+        """
+        length = self._validate_declared_length()
+        if length is None:
             return None
         return self.rfile.read(length) if length > 0 else b""
 
@@ -1592,16 +1686,46 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
-        if matched:
-            self._handle_checkpoint_post(checkpoint_peer)
-            return
         segments = self._path_segments()
-        if (
+        is_operation_post = (
             len(segments) == 4
             and segments[0] == "v1"
             and segments[1] == "replicas"
             and segments[3] == "operations"
-        ):
+        )
+        is_resolve_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "states"
+            and segments[3] == "resolve"
+        )
+        is_sync_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "sync"
+            and segments[2] == "operations"
+        )
+        if matched or is_operation_post or is_resolve_post or is_sync_post:
+            # On the four POST endpoints the Content-Length contract keeps
+            # its priority: a 400/413 is answered before authentication.
+            # Authentication then runs before the body is read, the commit
+            # lock is taken, or any state or data file is touched; an
+            # unauthorized request leaves the body unread and the
+            # connection closed.
+            if self._validate_declared_length() is None:
+                return
+            if not self._require_auth():
+                return
+        else:
+            # Every other route authenticates before anything else.
+            if not self._require_auth():
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        if matched:
+            self._handle_checkpoint_post(checkpoint_peer)
+            return
+        if is_operation_post:
             replica_id = segments[2]
             raw = self._read_bounded_body()
             if raw is None:
@@ -1627,23 +1751,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             }
             self._json(status, payload)
             return
-        if (
-            len(segments) == 4
-            and segments[0] == "v1"
-            and segments[1] == "states"
-            and segments[3] == "resolve"
-        ):
+        if is_resolve_post:
             self._handle_resolve_post(segments[2])
             return
-        if (
-            len(segments) == 3
-            and segments[0] == "v1"
-            and segments[1] == "sync"
-            and segments[2] == "operations"
-        ):
-            self._handle_sync_post()
-            return
-        self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+        self._handle_sync_post()
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -1661,7 +1772,27 @@ def main(argv: list[str] | None = None) -> None:
             "recover them on startup; without it the service stays purely in memory"
         ),
     )
+    parser.add_argument(
+        "--auth-token-file",
+        default=None,
+        help=(
+            "optional path to a readable regular file containing the bearer "
+            "token clients must present; without it every endpoint stays "
+            "anonymous except that /health always is"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    auth_token = None
+    if args.auth_token_file is not None:
+        # Read and validate the token before binding any port; a rejected
+        # file fails startup exactly like a rejected data file, and the
+        # token is never printed.
+        try:
+            auth_token = load_auth_token(args.auth_token_file)
+        except AuthTokenError as exc:
+            print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
 
     try:
         store = StateStore(data_file=args.data_file)
@@ -1669,7 +1800,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    server = SemanticStateServer((args.host, args.port), store=store)
+    server = SemanticStateServer((args.host, args.port), store=store, auth_token=auth_token)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
