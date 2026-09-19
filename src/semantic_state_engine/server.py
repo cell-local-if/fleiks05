@@ -406,6 +406,43 @@ def _verification_digest_input(candidates: dict[str, list[dict[str, Any]]]) -> b
     return "".join(parts).encode("utf-8")
 
 
+def _key_audit_digest_input(records: list[tuple[str, dict[str, Any]]]) -> bytes:
+    """Serialize one key's accepted-operation stream to the digest input.
+
+    The result is a compact UTF-8 JSON array with one entry per accepted
+    operation for the key, in global commit order (the caller filters the
+    shared accepted-operation log, which already preserves that order).
+    Each entry has the fixed shape
+    ``{"replicaId":R,"operation":{"operationId":I,"key":K,"value":V,"clock":C}}``
+    and the clock's component names are sorted lexicographically (Unicode
+    code point order). No whitespace is emitted anywhere, and strings are
+    escaped exactly as in :func:`_escape_digest_string` — only the quote,
+    the backslash, and U+0000-U+001F control characters. An empty stream
+    serializes to ``[]``.
+    """
+    parts: list[str] = ["["]
+    for index, (replica_id, operation) in enumerate(records):
+        if index:
+            parts.append(",")
+        clock = ",".join(
+            f"{_escape_digest_string(name)}:{tick}"
+            for name, tick in sorted(operation["clock"].items())
+        )
+        parts.append('{"replicaId":')
+        parts.append(_escape_digest_string(replica_id))
+        parts.append(',"operation":{"operationId":')
+        parts.append(_escape_digest_string(operation["operationId"]))
+        parts.append(',"key":')
+        parts.append(_escape_digest_string(operation["key"]))
+        parts.append(',"value":')
+        parts.append(_escape_digest_string(operation["value"]))
+        parts.append(',"clock":{')
+        parts.append(clock)
+        parts.append("}}}")
+    parts.append("]")
+    return "".join(parts).encode("utf-8")
+
+
 class PersistenceError(Exception):
     """Raised when the data file cannot be opened, parsed, or written.
 
@@ -1082,6 +1119,41 @@ class StateStore:
             "candidateVersions": candidate_versions,
         }
 
+    def get_key_audit_digest(self, key: str) -> dict[str, Any]:
+        """Return one key's audit-integrity digest from a single snapshot.
+
+        The key's filtered accepted-operation stream and the digest input
+        are computed together under the same commit lock used by local
+        writes, sync imports, and repairs, so ``operations`` and ``digest``
+        always describe the same commit: a read can never observe half an
+        import batch or a partially applied repair. The snapshot mutates
+        neither memory, the data file, logs, nor checkpoints.
+
+        The digest covers the key's whole audit stream in global commit
+        order — including stale writes that added no candidate and accepted
+        conflict repairs — serialized by :func:`_key_audit_digest_input` and
+        hashed with SHA-256. Identical replays, conflicting or malformed
+        requests, operations for other keys, and operations whose durable
+        commit failed never enter the log and so never influence the
+        digest. A key with no history yields the hash of ``[]`` with
+        ``operations`` 0. With ``--data-file`` the log is rebuilt
+        identically during recovery, so the same history yields the same
+        digest before and after a restart.
+        """
+        with self._lock:
+            key_records = [
+                (replica_id, operation)
+                for replica_id, operation in self._accepted
+                if operation["key"] == key
+            ]
+            operations = len(key_records)
+            digest_input = _key_audit_digest_input(key_records)
+        return {
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "operations": operations,
+        }
+
     def import_operations(
         self, records: list[tuple[str, dict[str, Any]]]
     ) -> tuple[HTTPStatus, int, int]:
@@ -1336,6 +1408,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_audit_get(segments[3])
             return
+        if (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "audit"
+            and segments[2] == "keys"
+            and segments[4] == "digest"
+        ):
+            self._handle_audit_digest_get(segments[3])
+            return
         matched, checkpoint_peer = self._checkpoint_route()
         if matched:
             self._handle_checkpoint_get(checkpoint_peer)
@@ -1444,6 +1525,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             HTTPStatus.OK,
             {"operations": page, "nextCursor": next_cursor, "hasMore": has_more},
         )
+
+    def _handle_audit_digest_get(self, key: str) -> None:
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # Every path key is a valid audit subject: a key with no accepted
+        # history hashes the empty stream and reports operations 0.
+        self._json(HTTPStatus.OK, self._store.get_key_audit_digest(key))
 
     def _handle_sync_post(self) -> None:
         raw = self._read_bounded_body()
