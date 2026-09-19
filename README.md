@@ -69,6 +69,23 @@ Candidates are stored per key with vector-clock semantics (missing components co
 
 Keys are isolated from each other, and reads reflect the latest writes.
 
+### Resolving conflicts
+
+`POST /v1/states/{key}/resolve` accepts a JSON object with exactly five keys:
+
+- `replicaId`: a non-empty string naming the replica that performs the resolution.
+- `operationId`, `value`: non-empty strings, and `clock`: a write clock — all under the same constraints as a local write operation, including that `clock` must contain `replicaId`. The operation's key is the path's `{key}`.
+- `candidates`: a non-empty array without duplicate identities; each item has exactly `replicaId` and `operationId` (non-empty strings).
+
+A resolution commits only when the key is currently in conflict, the `candidates` set equals the key's current candidate set, and `clock` dominates every current candidate. On success the resolution is accepted atomically as one operation: the dominated candidates are cleared and the key resolves to `value`. HTTP 201 returns `{"status":"created","key","replicaId","operationId"}`, and `GET /v1/states/{key}` then reports `status:"resolved"` with that value.
+
+- Replaying the same `(replicaId, operationId)` with identical operation content returns HTTP 200 with `"status":"ok"` and appends no log record; the same identity with different content returns HTTP 409 with `{"error":"operation_conflict"}` and changes nothing.
+- A malformed request or candidate item, a duplicate candidate identity, or a clock that does not dominate the current candidates returns HTTP 400 with `{"error":"invalid_request"}` and changes nothing.
+- A key that does not exist, is not in conflict, or whose current candidate set differs from the request's (including a concurrent change since the client read the state) returns HTTP 409 with `{"error":"resolution_conflict"}` and changes nothing.
+- With `--data-file`, the resolution is persisted in the same atomic commit before the 201 response; a durable failure returns HTTP 500 with `{"error":"internal_error"}` and leaves memory, the identity index, and the file exactly as they were (the request can be retried).
+
+A committed resolution is an ordinary accepted operation in the log: it is exported by `GET /v1/sync/operations`, accepted by `POST /v1/sync/operations`, and recovered from the data file, sharing the single commit order with local writes and import batches. A replica that imports a resolution applies it like any other write — candidates its clock dominates are cleared — so a candidate the resolving replica never saw survives the import as a concurrent version.
+
 ### Incremental sync between replicas
 
 Two additional endpoints stream the accepted-operation log between replicas. The existing endpoints, payloads, and status codes are unchanged; a sync record is simply the path `replicaId` paired with an otherwise ordinary `operation`.

@@ -86,6 +86,78 @@ def parse_operation_payload(raw: bytes | str | dict[str, Any], replica_id: str) 
     }
 
 
+def parse_resolve_payload(
+    raw: bytes | str | dict[str, Any], key: str
+) -> tuple[str, dict[str, Any], list[tuple[str, str]]]:
+    """Parse and validate a conflict-resolution payload for ``key``.
+
+    The body must be a JSON object with exactly ``replicaId``,
+    ``operationId``, ``value``, ``clock``, and ``candidates``. The first
+    four follow the live operation constraints (the operation's key is the
+    path's ``key``); ``candidates`` must be a non-empty list of
+    ``{"replicaId", "operationId"}`` items without duplicate identities.
+    Returns ``(replica_id, operation, candidate_identities)``. Raises
+    ValueError on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            payload: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or set(payload.keys()) != {
+        "replicaId",
+        "operationId",
+        "value",
+        "clock",
+        "candidates",
+    }:
+        raise ValueError(
+            "payload must be an object with only replicaId, operationId, "
+            "value, clock, and candidates"
+        )
+
+    replica_id = payload["replicaId"]
+    if not isinstance(replica_id, str) or replica_id == "":
+        raise ValueError("replicaId must be a non-empty string")
+    operation = parse_operation_payload(
+        {
+            "operationId": payload["operationId"],
+            "key": key,
+            "value": payload["value"],
+            "clock": payload["clock"],
+        },
+        replica_id,
+    )
+
+    candidates_raw = payload["candidates"]
+    if not isinstance(candidates_raw, list) or not candidates_raw:
+        raise ValueError("candidates must be a non-empty list")
+    identities: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in candidates_raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {"replicaId", "operationId"}:
+            raise ValueError("each candidate must have only replicaId and operationId")
+        candidate_replica = entry["replicaId"]
+        candidate_operation = entry["operationId"]
+        if not isinstance(candidate_replica, str) or candidate_replica == "":
+            raise ValueError("candidate replicaId must be a non-empty string")
+        if not isinstance(candidate_operation, str) or candidate_operation == "":
+            raise ValueError("candidate operationId must be a non-empty string")
+        identity = (candidate_replica, candidate_operation)
+        if identity in seen:
+            raise ValueError("candidates must not contain duplicate identities")
+        seen.add(identity)
+        identities.append(identity)
+    return replica_id, operation, identities
+
+
 SYNC_BATCH_MIN = 1
 SYNC_BATCH_MAX = 100
 SYNC_DEFAULT_LIMIT = 100
@@ -590,6 +662,71 @@ class StateStore:
             self._candidates[operation["key"]] = next_candidates
             return HTTPStatus.CREATED
 
+    def resolve(
+        self,
+        key: str,
+        replica_id: str,
+        operation: dict[str, Any],
+        candidate_identities: list[tuple[str, str]],
+    ) -> tuple[HTTPStatus, str | None]:
+        """Commit a conflict resolution for ``key`` as one accepted operation.
+
+        The resolution commits only when the key is currently in conflict,
+        ``candidate_identities`` equals the key's current candidate set, and
+        the operation's clock dominates every current candidate. On success
+        the resolution joins the single commit order shared with local
+        writes and import batches: it is persisted (when configured) before
+        the in-memory commit becomes visible, and committing it clears the
+        dominated candidates so the key resolves to its value.
+
+        Returns ``(status, error)``: ``(201, None)`` when committed,
+        ``(200, None)`` for an identical replay (nothing is appended),
+        ``(409, "operation_conflict")`` when the identity is known with
+        different content, ``(409, "resolution_conflict")`` when the key is
+        missing, not in conflict, or its candidate set no longer matches,
+        and ``(400, "invalid_request")`` when the clock does not dominate
+        the current candidates. Any non-2xx outcome leaves memory, the
+        identity index, and the data file exactly as they were.
+        """
+        with self._lock:
+            identity = (replica_id, operation["operationId"])
+            seen = self._operations.get(identity)
+            if seen is not None:
+                if seen == operation:
+                    return HTTPStatus.OK, None
+                return HTTPStatus.CONFLICT, "operation_conflict"
+
+            current = self._candidates.get(key, [])
+            if not current:
+                return HTTPStatus.CONFLICT, "resolution_conflict"
+            if all(c["value"] == current[0]["value"] for c in current):
+                # The key is resolved, not in conflict.
+                return HTTPStatus.CONFLICT, "resolution_conflict"
+            if {(c["replicaId"], c["operationId"]) for c in current} != set(
+                candidate_identities
+            ):
+                return HTTPStatus.CONFLICT, "resolution_conflict"
+            if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
+                return HTTPStatus.BAD_REQUEST, "invalid_request"
+
+            # The clock dominates every candidate, so committing the
+            # resolution clears them all and leaves it as the sole version.
+            next_candidates = self._next_candidates(current, replica_id, operation)
+            if self._data_file is not None:
+                # Stage the full new log before touching the visible state,
+                # exactly like a local write or an import batch.
+                self._accepted.append((replica_id, operation))
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    self._accepted.pop()
+                    raise
+            else:
+                self._accepted.append((replica_id, operation))
+            self._operations[identity] = operation
+            self._candidates[key] = next_candidates
+            return HTTPStatus.CREATED, None
+
     def get_sync_operations(
         self, after: int, limit: int
     ) -> tuple[list[dict[str, Any]], int, bool]:
@@ -845,6 +982,43 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "key": operation["key"],
             }
             self._json(status, payload)
+            return
+        if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "states"
+            and segments[3] == "resolve"
+        ):
+            key = segments[2]
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                replica_id, operation, candidate_identities = parse_resolve_payload(raw, key)
+            except ValueError:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            try:
+                status, error = self._store.resolve(
+                    key, replica_id, operation, candidate_identities
+                )
+            except PersistenceError:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+                return
+            if error is not None:
+                self._json(status, {"error": error})
+                return
+            self._json(
+                status,
+                {
+                    "status": "ok" if status is HTTPStatus.OK else "created",
+                    "key": key,
+                    "replicaId": replica_id,
+                    "operationId": operation["operationId"],
+                },
+            )
             return
         if (
             len(segments) == 3
