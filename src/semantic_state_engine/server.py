@@ -258,6 +258,17 @@ def parse_sync_query(query: str) -> tuple[int, int] | None:
     return parse_paging_query(query)
 
 
+def parse_metrics_query(query: str) -> bool:
+    """Validate the metrics query string, which accepts no parameters.
+
+    Returns True only for an empty query. Any parameter is rejected,
+    including repeated names (``x=1&x=2``) and blank names/values
+    (``x=``, ``x``, ``=1``); ``keep_blank_values`` ensures the latter are
+    seen rather than silently dropped.
+    """
+    return not parse_qs(query, keep_blank_values=True)
+
+
 class PersistenceError(Exception):
     """Raised when the data file cannot be opened, parsed, or written.
 
@@ -803,6 +814,50 @@ class StateStore:
         next_cursor = after + len(page)
         return page, next_cursor, next_cursor < total
 
+    def get_metrics(self) -> dict[str, int]:
+        """Return read-only engine counters from a single locked snapshot.
+
+        All six counters are computed together under the same commit lock
+        used by local writes, sync imports, and resolutions, so they always
+        describe one commit: a read can never observe half an import batch
+        or a partially applied repair. The snapshot mutates neither memory
+        nor the data file.
+
+        ``acceptedOperations`` counts first-accepted operations in the
+        shared log (ordinary writes, stale writes that add no candidate, and
+        conflict repairs) and therefore excludes identical replays,
+        conflicting/invalid requests, and operations whose durable commit
+        failed. ``keys`` counts keys that currently hold at least one
+        candidate and ``candidateVersions`` the candidates across them; a
+        key contributes to exactly one of ``conflictKeys`` (its candidates
+        disagree on the value) or ``resolvedKeys`` (all agree), so those two
+        always sum to ``keys``. ``replicas`` is the number of distinct
+        ``replicaId`` values in the accepted log (a repair counts under its
+        initiating replica). With ``--data-file`` the counters are rebuilt
+        identically during recovery, so they match the pre-restart values.
+        """
+        with self._lock:
+            accepted = len(self._accepted)
+            replicas = {replica_id for replica_id, _ in self._accepted}
+            keys = 0
+            candidate_versions = 0
+            conflict_keys = 0
+            for candidates in self._candidates.values():
+                keys += 1
+                candidate_versions += len(candidates)
+                first_value = candidates[0]["value"]
+                if any(c["value"] != first_value for c in candidates):
+                    conflict_keys += 1
+            resolved_keys = keys - conflict_keys
+            return {
+                "acceptedOperations": accepted,
+                "keys": keys,
+                "candidateVersions": candidate_versions,
+                "conflictKeys": conflict_keys,
+                "resolvedKeys": resolved_keys,
+                "replicas": len(replicas),
+            }
+
     def import_operations(
         self, records: list[tuple[str, dict[str, Any]]]
     ) -> tuple[HTTPStatus, int, int]:
@@ -943,6 +998,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, health_payload())
             return
         segments = self._path_segments()
+        if len(segments) == 2 and segments[0] == "v1" and segments[1] == "metrics":
+            self._handle_metrics_get()
+            return
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
@@ -965,6 +1023,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_audit_get(segments[3])
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def _handle_metrics_get(self) -> None:
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json(HTTPStatus.OK, self._store.get_metrics())
 
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)

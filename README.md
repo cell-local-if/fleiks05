@@ -69,6 +69,27 @@ Candidates are stored per key with vector-clock semantics (missing components co
 
 Keys are isolated from each other, and reads reflect the latest writes.
 
+### Read-only metrics
+
+`GET /v1/metrics` returns HTTP 200 with a UTF-8 JSON object containing exactly six non-negative integer counters:
+
+```json
+{"acceptedOperations":4,"candidateVersions":3,"conflictKeys":1,"keys":2,"replicas":3,"resolvedKeys":1}
+```
+
+- `acceptedOperations`: the total number of first-accepted operations in the shared log — ordinary writes, stale writes that add no candidate, and conflict repairs — excluding identical replays (`200`), conflicting or invalid requests (`409`/`400`), and operations whose durable commit failed.
+- `keys`: the number of keys that currently hold at least one candidate.
+- `candidateVersions`: the total number of current candidates across those keys.
+- `conflictKeys`: keys whose candidates do not all agree on a value.
+- `resolvedKeys`: all other keys; `conflictKeys + resolvedKeys` always equals `keys`.
+- `replicas`: the number of distinct `replicaId` values in the accepted-operation log; a repair counts under its initiating replica.
+
+The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}`. Extra path segments (for example `/v1/metrics/extra`) return HTTP 404 with `{"error":"not_found"}`.
+
+All six counters are computed from one snapshot under the same commit lock used by local writes, sync-import batches, and repairs, so they always describe a single commit: a read can never observe half a batch or counters that disagree with each other. The request is strictly read-only — it modifies neither memory nor the data file or sync log — and its response uses the same explicit `Content-Length` contract as the other endpoints.
+
+With `--data-file`, the counters are rebuilt from the recovered log on startup, so after a restart they are identical to those reported just before the restart.
+
 ### Resolving conflicts
 
 `POST /v1/states/{key}/resolve` repairs a key that is currently in conflict. The body is a JSON object with exactly these keys:
