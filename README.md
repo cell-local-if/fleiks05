@@ -221,6 +221,34 @@ It never contains operations for other keys, identical replays (`200`), conflict
 
 With `--data-file`, the audit reads exactly the same durable log that sync export and recovery use: after a restart the per-key order, page boundaries, cursor resume, stale-write records, and accepted repair records are identical to a process that never restarted. A durable commit failure leaves no audit record (the operation neither reaches memory nor the file), and a conflicting import batch is rejected as a whole and likewise leaves no audit trace.
 
+### Per-key audit integrity digest
+
+`GET /v1/audit/keys/{key}/digest` returns an integrity summary of one key's audit stream as a UTF-8 JSON object containing exactly three fields:
+
+```json
+{"algorithm":"sha256","digest":"<64 lowercase hex chars>","operations":3}
+```
+
+- `algorithm` is always `"sha256"`.
+- `digest` is the 64-character lowercase hexadecimal SHA-256 of the canonical audit input described below.
+- `operations` is the number of accepted operations for the key — the same record count paged by `GET /v1/audit/keys/{key}/operations` (a key with no history reports `0`).
+
+The digest covers the key's whole audit stream in global commit order: every first-accepted operation for the key, including stale writes whose clock was already dominated (and therefore added no candidate) and conflict repairs accepted through `POST /v1/states/{key}/resolve`. It never covers operations for other keys, identical replays (`200`), conflicting or malformed requests (`409`/`400`), uncommitted requests, or sync checkpoints.
+
+The hash input is a compact UTF-8 JSON array with one entry per record, in global commit order (a key with no history hashes over `[]`):
+
+- Each entry has the fixed shape `{"replicaId":R,"operation":{"operationId":I,"key":K,"value":V,"clock":C}}` — field order is fixed as shown.
+- `C`'s component names are sorted lexicographically (Unicode code point).
+- No whitespace appears anywhere. Strings escape only the quote (`\"`), the backslash (`\\`), and control characters U+0000–U+001F (always as `\u00XX` with lowercase hex); every other Unicode code point is written literally.
+
+The SHA-256 is computed over exactly those bytes.
+
+The filtered stream, the record count, and the digest input are computed from one snapshot under the same commit lock shared by local writes, sync-import batches, and conflict repairs, so the response always describes a single commit: it can never observe half an import batch, and an import batch's records for the key are treated as one indivisible segment of the global order. The request is strictly read-only — it modifies neither memory, the log, the data file, nor any checkpoint — and its response uses the same explicit `Content-Length` contract as the other endpoints.
+
+The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}`. Missing or extra path segments (for example `/v1/audit/keys/{key}/digest/extra`, `/v1/audit/keys/{key}`, or `/v1/audit/keys//digest`) return HTTP 404 with `{"error":"not_found"}` (a bad shape wins over a bad query string).
+
+With `--data-file`, the audit digest is rebuilt from the same recovered log as the audit stream itself, so after a restart the same recovered history yields the identical digest and count; a durable-commit failure leaves no record in memory or the file, and a rejected import batch is untouched, so neither can influence the digest.
+
 ## Tests
 
 ```bash
