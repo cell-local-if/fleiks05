@@ -164,13 +164,19 @@ def load_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
 def ensure_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
     """Validate the data-file location and return its committed records.
 
-    A missing target file is accepted (its parent directory must exist and
-    be writable); an existing target must be a regular, parseable data
-    file. Anything else raises PersistenceError.
+    The parent directory must exist and pass the atomic-commit preflight
+    probe before anything else is accepted. A missing target file is then
+    accepted (it is created by the store immediately afterwards); an
+    existing target must be a regular, parseable data file. Anything else
+    raises PersistenceError.
     """
     parent = os.path.dirname(os.path.abspath(path))
     if not os.path.isdir(parent):
         raise PersistenceError(f"data file parent directory does not exist: {parent!r}")
+    # Prove the directory can perform the write-fsync-rename-fsync commit
+    # before the service starts listening, so the first accepted write can
+    # never be the first observation that durable commit is unavailable.
+    preflight_directory_atomic_commit(parent)
     try:
         exists = os.path.lexists(path)
         if exists:
@@ -196,6 +202,75 @@ def _fsync_directory(directory: str) -> None:
         pass
     finally:
         os.close(fd)
+
+
+def _fsync_directory_strict(directory: str) -> None:
+    """Open and fsync a directory, raising OSError if either step fails.
+
+    Unlike the best-effort fsync used after a successful commit, the startup
+    probe must detect a directory that cannot be fsynced at all.
+    """
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def preflight_directory_atomic_commit(directory: str) -> None:
+    """Prove ``directory`` supports the atomic commit the store relies on.
+
+    Creates two exclusively named probe files in ``directory``: a small
+    payload is written to the source probe, flushed and fsynced, then moved
+    onto the destination probe with an atomic ``os.replace``; the directory
+    itself is then fsynced. Both probe paths are always removed afterwards,
+    including anything left behind by a failed attempt.
+
+    The check touches only its own probe names: an existing data file in the
+    same directory is never opened for writing, truncated, or replaced. On
+    any failure PersistenceError is raised so the caller refuses to start
+    before binding the listening socket. It verifies only this directory
+    level capability -- per-file locks, ACLs on an existing target, and
+    post-startup environment changes are out of scope.
+    """
+    source = os.path.join(directory, ".sestate-preflight.src.tmp")
+    target = os.path.join(directory, ".sestate-preflight.dst.tmp")
+    payload = b'semantic-state-engine preflight\n'
+    source_fd: int | None = None
+    try:
+        try:
+            source_fd = os.open(source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(source_fd, payload)
+            os.fsync(source_fd)
+            os.close(source_fd)
+            source_fd = None
+            os.replace(source, target)
+            _fsync_directory_strict(directory)
+        except OSError as exc:
+            raise PersistenceError(
+                f"atomic-commit preflight failed in directory {directory!r}: {exc}"
+            ) from exc
+    finally:
+        if source_fd is not None:
+            try:
+                os.close(source_fd)
+            except OSError:
+                pass
+        # Remove both probe names. Before the rename only the source can
+        # exist; after it only the target can; an exclusive-create failure
+        # may instead find probes a crashed earlier run left behind. Unlinking
+        # both names covers every partial state, including that last one.
+        for probe in (target, source):
+            try:
+                os.unlink(probe)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        try:
+            _fsync_directory_strict(directory)
+        except OSError:
+            pass
 
 
 class StateStore:
@@ -372,8 +447,11 @@ class SemanticStateServer(ThreadingHTTPServer):
         data_file: str | None = None,
         store: StateStore | None = None,
     ) -> None:
-        super().__init__(server_address, handler_class or RequestHandler)
+        # Build and validate the store (including its startup preflight)
+        # before binding the socket, so any persistence startup failure is
+        # raised before this server can listen on anything.
         self.store = store if store is not None else StateStore(data_file=data_file)
+        super().__init__(server_address, handler_class or RequestHandler)
 
 
 _FALLBACK_STORE = StateStore()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import http.client
 import json
 import os
@@ -22,6 +23,7 @@ from semantic_state_engine.server import (
     SemanticStateServer,
     StateStore,
     load_data_file,
+    preflight_directory_atomic_commit,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +89,187 @@ class DataFileStartupTests(TempDirTestCase):
         os.mkfifo(fifo)
         with self.assertRaises(PersistenceError):
             StateStore(data_file=str(fifo))
+
+
+PROBE_NAMES = (".sestate-preflight.src.tmp", ".sestate-preflight.dst.tmp")
+
+
+class PreflightProbeTests(TempDirTestCase):
+    def test_preflight_succeeds_in_writable_directory(self) -> None:
+        preflight_directory_atomic_commit(str(self.tmp))
+
+    def test_preflight_leaves_no_probe_files(self) -> None:
+        preflight_directory_atomic_commit(str(self.tmp))
+        leftovers = sorted(p.name for p in self.tmp.iterdir())
+        self.assertEqual(leftovers, [])
+
+    def test_preflight_does_not_touch_sibling_files(self) -> None:
+        sibling = self.tmp / "state.json"
+        payload = b'{"version":1,"operations":[]}'
+        sibling.write_bytes(payload)
+        preflight_directory_atomic_commit(str(self.tmp))
+        self.assertEqual(sibling.read_bytes(), payload)
+
+    def test_preflight_fails_in_unwritable_directory(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permission bits")
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o755)
+        with self.assertRaises(PersistenceError):
+            preflight_directory_atomic_commit(str(locked))
+
+    def test_preflight_failure_cleans_up_partial_probes(self) -> None:
+        # Fail the atomic replace: the source probe has already been created,
+        # written and fsynced, and the destination must not come into being.
+        def fail_replace(source, target):
+            raise OSError(errno.EACCES, "simulated rename failure")
+
+        with patch("semantic_state_engine.server.os.replace", side_effect=fail_replace):
+            with self.assertRaises(PersistenceError):
+                preflight_directory_atomic_commit(str(self.tmp))
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [])
+
+    def test_preflight_failure_after_source_open_cleans_up(self) -> None:
+        # Fail fsync of the freshly written source probe itself; cleanup still
+        # unlinks it and must not propagate the fsync error.
+        def fail_fsync(fd, *args, **kwargs):
+            raise OSError(errno.EIO, "simulated fsync failure")
+
+        with patch("semantic_state_engine.server.os.fsync", side_effect=fail_fsync):
+            with self.assertRaises(PersistenceError):
+                preflight_directory_atomic_commit(str(self.tmp))
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [])
+
+    def test_preflight_failure_removes_stale_probes_left_by_crash(self) -> None:
+        # Simulate probes a crashed earlier process left behind. The exclusive
+        # create makes this attempt fail, but the failure path must remove the
+        # leftovers so the next startup succeeds instead of wedging forever.
+        for name in PROBE_NAMES:
+            (self.tmp / name).write_bytes(b"stale")
+        with self.assertRaises(PersistenceError):
+            preflight_directory_atomic_commit(str(self.tmp))
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [])
+        preflight_directory_atomic_commit(str(self.tmp))
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [])
+
+
+class PreflightStartupTests(TempDirTestCase):
+    def test_store_runs_preflight_before_accepting_missing_target(self) -> None:
+        with patch(
+            "semantic_state_engine.server.preflight_directory_atomic_commit"
+        ) as probe:
+            store = StateStore(data_file=str(self.data_file))
+        try:
+            probe.assert_called_once_with(str(self.tmp))
+        finally:
+            del store
+
+    def test_store_runs_preflight_before_reading_existing_target(self) -> None:
+        self.data_file.write_text(
+            json.dumps({"version": 1, "operations": []}), encoding="utf-8"
+        )
+        with patch(
+            "semantic_state_engine.server.preflight_directory_atomic_commit"
+        ) as probe:
+            store = StateStore(data_file=str(self.data_file))
+        try:
+            probe.assert_called_once_with(str(self.tmp))
+        finally:
+            del store
+
+    def test_preflight_failure_refuses_start_without_creating_data_file(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permission bits")
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o755)
+        target = locked / "state.json"
+        with self.assertRaises(PersistenceError):
+            StateStore(data_file=str(target))
+        os.chmod(locked, 0o755)
+        self.assertFalse(target.exists())
+
+    def test_preflight_failure_skips_existing_file_validation(self) -> None:
+        # When the preflight fails, an existing data file must neither be read
+        # nor replaced; startup fails on the directory capability alone.
+        original = b"{broken data that would otherwise be rejected"
+        self.data_file.write_bytes(original)
+        with patch(
+            "semantic_state_engine.server.preflight_directory_atomic_commit",
+            side_effect=PersistenceError("probe failed"),
+        ):
+            with self.assertRaises(PersistenceError):
+                StateStore(data_file=str(self.data_file))
+        self.assertEqual(self.data_file.read_bytes(), original)
+
+    def test_successful_preflight_keeps_existing_bytes_and_state(self) -> None:
+        document = {
+            "version": 1,
+            "operations": [
+                {"replicaId": "r1", "operation": operation("o1", "k", "v", {"r1": 1})}
+            ],
+        }
+        raw = json.dumps(document).encode("utf-8")
+        self.data_file.write_bytes(raw)
+        store = StateStore(data_file=str(self.data_file))
+        try:
+            self.assertEqual(self.data_file.read_bytes(), raw)
+            status, state = store.get_state("k")
+            self.assertIs(status, HTTPStatus.OK)
+            self.assertEqual(
+                state,
+                {"key": "k", "value": "v", "clock": {"r1": 1}, "status": "resolved"},
+            )
+        finally:
+            del store
+
+    def test_preflight_never_opens_existing_data_file_for_writing(self) -> None:
+        document = {
+            "version": 1,
+            "operations": [
+                {"replicaId": "r1", "operation": operation("o1", "k", "v", {"r1": 1})}
+            ],
+        }
+        self.data_file.write_text(json.dumps(document), encoding="utf-8")
+        os.chmod(self.data_file, 0o444)
+        self.addCleanup(os.chmod, self.data_file, 0o644)
+        # Read-only data file plus a writable directory: preflight and
+        # read-only recovery must still succeed without writing the file.
+        store = StateStore(data_file=str(self.data_file))
+        try:
+            status, state = store.get_state("k")
+            self.assertIs(status, HTTPStatus.OK)
+            self.assertEqual(state["value"], "v")
+        finally:
+            del store
+
+    def test_server_construction_fails_before_binding_socket(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permission bits")
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o755)
+        # Hold a port the server cannot bind. If the socket were bound before
+        # the store/preflight ran, construction would raise OSError
+        # (EADDRINUSE); it must instead raise the startup PersistenceError,
+        # proving validation happens before any socket is created.
+        holder = socket.socket()
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        holder.bind(("127.0.0.1", 0))
+        port = holder.getsockname()[1]
+        self.addCleanup(holder.close)
+        with self.assertRaises(PersistenceError):
+            SemanticStateServer(
+                ("127.0.0.1", port),
+                RequestHandler,
+                data_file=str(locked / "state.json"),
+            )
+        # The holder still owns the port untouched: no server socket leaked.
+        self.assertEqual(holder.getsockname()[1], port)
 
 
 class CorruptDataFileTests(TempDirTestCase):
@@ -509,6 +692,65 @@ class CommandLineTests(TempDirTestCase):
             self.stop(proc)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn(b"startup failed", stderr)
+
+    def test_cli_preflight_failure_exits_before_listening(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permission bits")
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o755)
+        target = locked / "state.json"
+        proc = self.spawn("--data-file", str(target))
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        finally:
+            self.stop(proc)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(b"startup failed", stderr)
+        self.assertEqual(stdout, b"")
+        # The process exited on its own: the port never served, no data file
+        # was created, and no probe files linger.
+        os.chmod(locked, 0o755)
+        self.assertFalse(target.exists())
+        self.assertEqual(sorted(p.name for p in locked.iterdir()), [])
+
+    def test_cli_preflight_does_not_modify_existing_data_file(self) -> None:
+        document = {
+            "version": 1,
+            "operations": [
+                {"replicaId": "r1", "operation": operation("o1", "color", "blue", {"r1": 1})}
+            ],
+        }
+        self.data_file.write_text(json.dumps(document), encoding="utf-8")
+        before = self.data_file.read_bytes()
+        proc = self.spawn("--data-file", str(self.data_file))
+        try:
+            self.wait_for_health()
+            status, payload = self.get("/v1/states/color")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["value"], "blue")
+        finally:
+            self.stop(proc)
+        self.assertEqual(self.data_file.read_bytes(), before)
+        leftovers = [
+            p.name
+            for p in self.tmp.iterdir()
+            if p.name != self.data_file.name and p.name.startswith(".sestate-")
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_cli_memory_mode_without_data_file_still_serves(self) -> None:
+        proc = self.spawn()
+        try:
+            self.wait_for_health()
+            self.assertEqual(
+                self.post("r1", operation("o1", "color", "blue", {"r1": 1})), 201
+            )
+            status, _ = self.get("/v1/states/color")
+            self.assertEqual(status, 200)
+        finally:
+            self.stop(proc)
 
 
 if __name__ == "__main__":
