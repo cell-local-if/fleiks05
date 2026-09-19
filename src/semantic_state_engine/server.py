@@ -219,8 +219,8 @@ def _non_negative_int(token: str) -> int | None:
     return int(token)
 
 
-def parse_sync_query(query: str) -> tuple[int, int] | None:
-    """Validate the sync-export query string.
+def parse_page_query(query: str) -> tuple[int, int] | None:
+    """Validate a paged-log query string (sync export and per-key audit).
 
     Accepts only ``after`` (default 0) and ``limit`` (default 100, 1-100),
     each non-negative integers with no repeats. Unknown parameters, malformed
@@ -760,6 +760,37 @@ class StateStore:
         next_cursor = after + len(page)
         return page, next_cursor, next_cursor < total
 
+    def get_audit_operations(
+        self, key: str, after: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        """Return one page of the accepted operations for ``key``.
+
+        The page is filtered from the shared commit log under the same lock
+        that orders commits, so local writes, import batches, and resolutions
+        appear in exactly their commit order, an import batch is always
+        contiguous, and no reader can observe half a batch. ``after`` counts
+        records of this key's stream already skipped; the slice, cursor, and
+        ``has_more`` all come from one snapshot, so they agree even while
+        commits land concurrently. Returns ``(records, next_cursor,
+        has_more)`` where ``next_cursor`` is the number of this key's records
+        skipped after this page.
+        """
+        with self._lock:
+            stream = [
+                (replica_id, operation)
+                for replica_id, operation in self._accepted
+                if operation["key"] == key
+            ]
+            total = len(stream)
+            if after > total:
+                raise ValueError("after is past the end of the key's operation stream")
+            page = [
+                {"replicaId": replica_id, "operation": operation}
+                for replica_id, operation in stream[after : after + limit]
+            ]
+        next_cursor = after + len(page)
+        return page, next_cursor, next_cursor < total
+
     def import_operations(
         self, records: list[tuple[str, dict[str, Any]]]
     ) -> tuple[HTTPStatus, int, int]:
@@ -912,10 +943,35 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_sync_get()
             return
+        if (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "audit"
+            and segments[2] == "keys"
+            and segments[4] == "operations"
+        ):
+            self._handle_audit_get(segments[3])
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
+    def _handle_audit_get(self, key: str) -> None:
+        params = parse_page_query(urlsplit(self.path).query)
+        if params is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        after, limit = params
+        try:
+            page, next_cursor, has_more = self._store.get_audit_operations(key, after, limit)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json(
+            HTTPStatus.OK,
+            {"operations": page, "nextCursor": next_cursor, "hasMore": has_more},
+        )
+
     def _handle_sync_get(self) -> None:
-        params = parse_sync_query(urlsplit(self.path).query)
+        params = parse_page_query(urlsplit(self.path).query)
         if params is None:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return

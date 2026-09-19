@@ -119,6 +119,19 @@ Imports share the single commit order with local `POST /v1/replicas/...` writes:
 
 With `--data-file`, all new operations of a batch are written to the file in one atomic commit before the success response; a durable failure returns HTTP 500 `{"error":"internal_error"}` and leaves memory, the identity index, and the file exactly as they were before the batch (the request can be retried). Pure-replay batches need no write and still succeed. After a restart the export order, cursor resume, replay `200`, and conflict `409` are identical to a process that never restarted.
 
+### Per-key audit
+
+`GET /v1/audit/keys/{key}/operations?after=N&limit=N` returns the accepted operations of one key, filtered from the shared commit log in commit order:
+
+- Only operations whose `operation.key` equals the path key appear — local writes, stale writes that added no candidate, imported records, and resolutions accepted through `/resolve` alike. Operations of other keys and requests that were never committed (conflicts, rejected bodies, failed durable writes) are absent.
+- Each record is `{"replicaId","operation"}` in the same shape as the sync export and the data file.
+- `after` is the number of this key's records already skipped (a 0-based resume cursor over the key's own stream, not the shared log); it defaults to `0`. `after` equal to the key's record count is a valid empty tail. `limit` defaults to `100` and must be between `1` and `100`.
+- A successful HTTP 200 response is `{"operations":[...],"nextCursor":N,"hasMore":bool}`; a key with no history returns an empty page. `nextCursor` is the number of this key's records skipped after this page — feed it back as the next `after` — and `hasMore` reports whether records remain.
+- The page, cursor, and `hasMore` are computed from a single snapshot under the commit lock, so they always agree even while writes commit concurrently, and an import batch is always contiguous in the stream — no reader sees half a batch.
+- A negative, blank, or non-ASCII-decimal `after`/`limit`, a limit outside `1-100`, an `after` past the end of the key's stream, or any unknown/repeated query parameter returns HTTP 400 with `{"error":"invalid_request"}`.
+
+With `--data-file`, the audit stream is recovered from the same commit log as everything else, so after a restart the per-key order, cursor resume, stale operations, and repair records are identical to a process that never restarted; a persistence failure or a conflicting import batch leaves no audit records behind.
+
 ## Tests
 
 ```bash
