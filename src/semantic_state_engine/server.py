@@ -269,6 +269,35 @@ def parse_metrics_query(query: str) -> bool:
     return not parse_qs(query, keep_blank_values=True)
 
 
+def parse_checkpoint_payload(raw: bytes | str | dict[str, Any]) -> int:
+    """Parse and validate a checkpoint body, returning the cursor.
+
+    The body must be a JSON object whose only key is ``cursor`` holding a
+    non-negative integer (booleans are rejected, as everywhere else). The
+    bound against the accepted-log length is checked by the store, not here,
+    because the cursor is only meaningful against a committed snapshot.
+    Raises ValueError on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            payload: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or set(payload.keys()) != {"cursor"}:
+        raise ValueError("body must be an object with only cursor")
+    cursor = payload["cursor"]
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+        raise ValueError("cursor must be a non-negative integer")
+    return cursor
+
+
 class PersistenceError(Exception):
     """Raised when the data file cannot be opened, parsed, or written.
 
@@ -303,13 +332,46 @@ def _validate_stored_operation(entry: Any) -> tuple[str, dict[str, Any]]:
     return replica_id, operation
 
 
-def load_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
+def _validate_stored_checkpoints(
+    document: Any, log_length: int
+) -> dict[str, int]:
+    """Validate the optional ``checkpoints`` section of a data file.
+
+    Returns a clean ``{peerId: cursor}`` mapping. The section is optional
+    (a version:1 file written before checkpoints existed simply has none);
+    when present it must be an object of non-empty peer ids mapped to
+    non-boolean non-negative integers no greater than the accepted-log
+    length, since a cursor may never name an unaccepted record.
+    """
+    if "checkpoints" not in document:
+        return {}
+    raw = document["checkpoints"]
+    if not isinstance(raw, dict):
+        raise PersistenceError("data file checkpoints must be an object")
+    checkpoints: dict[str, int] = {}
+    for peer_id, cursor in raw.items():
+        if not isinstance(peer_id, str) or peer_id == "":
+            raise PersistenceError("checkpoint peerId must be a non-empty string")
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise PersistenceError("checkpoint cursor must be a non-negative integer")
+        if cursor > log_length:
+            raise PersistenceError(
+                f"checkpoint cursor {cursor} for {peer_id!r} is past the accepted log"
+            )
+        checkpoints[peer_id] = cursor
+    return checkpoints
+
+
+def load_data_file_full(
+    path: str,
+) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int]]:
     """Read and strictly validate a data file.
 
-    Returns the accepted operations in their original commit order. Raises
-    PersistenceError when the file is missing-readable, not UTF-8 JSON, has
-    an unexpected structure, or contains records violating the live input
-    constraints.
+    Returns the accepted operations in their original commit order and the
+    persisted ``{peerId: cursor}`` checkpoints (empty for a version:1 file
+    written before checkpoints existed). Raises PersistenceError when the
+    file is missing-readable, not UTF-8 JSON, has an unexpected structure,
+    or contains records or checkpoints violating the live constraints.
     """
     try:
         with open(path, "rb") as handle:
@@ -323,8 +385,15 @@ def load_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
     except json.JSONDecodeError as exc:
         raise PersistenceError(f"data file is not complete, valid JSON: {exc}") from exc
 
-    if not isinstance(document, dict) or set(document.keys()) != {"version", "operations"}:
-        raise PersistenceError("data file root must be an object with version and operations")
+    if not isinstance(document, dict) or not set(document.keys()) <= {
+        "version",
+        "operations",
+        "checkpoints",
+    } or "version" not in document or "operations" not in document:
+        raise PersistenceError(
+            "data file root must be an object with version and operations "
+            "and optionally checkpoints"
+        )
     version = document["version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != DATA_FORMAT_VERSION:
         raise PersistenceError(f"unsupported data file version: {version!r}")
@@ -341,15 +410,30 @@ def load_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
             raise PersistenceError(f"duplicate accepted operation {identity!r} in data file")
         identities.add(identity)
         records.append((replica_id, operation))
+    checkpoints = _validate_stored_checkpoints(document, len(records))
+    return records, checkpoints
+
+
+def load_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
+    """Read and strictly validate a data file, returning its operations.
+
+    Thin wrapper over :func:`load_data_file_full` for callers that only
+    need the accepted-operation log; persisted checkpoints are validated
+    the same way but not returned.
+    """
+    records, _ = load_data_file_full(path)
     return records
 
 
-def ensure_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
-    """Validate the data-file location and return its committed records.
+def ensure_data_file(
+    path: str,
+) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int]]:
+    """Validate the data-file location and return its committed state.
 
     A missing target file is accepted (its parent directory must exist and
     be writable); an existing target must be a regular, parseable data
-    file. Anything else raises PersistenceError.
+    file. Returns ``(records, checkpoints)``. Anything else raises
+    PersistenceError.
     """
     parent = os.path.dirname(os.path.abspath(path))
     if not os.path.isdir(parent):
@@ -363,8 +447,8 @@ def ensure_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
     if exists:
         if not stat.S_ISREG(mode):
             raise PersistenceError(f"data file path is not a regular file: {path!r}")
-        return load_data_file(path)
-    return []
+        return load_data_file_full(path)
+    return [], {}
 
 
 def _fsync_directory(directory: str) -> None:
@@ -564,6 +648,7 @@ class StateStore:
         self._candidates: dict[str, list[dict[str, Any]]] = {}
         self._operations: dict[tuple[str, str], dict[str, Any]] = {}
         self._accepted: list[tuple[str, dict[str, Any]]] = []
+        self._checkpoints: dict[str, int] = {}
         self._data_file: str | None = None
         if data_file is not None:
             path = os.path.abspath(data_file)
@@ -571,10 +656,11 @@ class StateStore:
             # file is never touched by the probe and is opened only for
             # reading afterwards.
             preflight_data_file_directory(path)
-            records = ensure_data_file(path)
+            records, checkpoints = ensure_data_file(path)
             with self._lock:
                 for replica_id, operation in records:
                     self._commit_locked(replica_id, operation)
+                self._checkpoints = dict(checkpoints)
                 self._data_file = path
                 if not records and not os.path.exists(path):
                     # The target is missing and the preflight proved the
@@ -621,12 +707,13 @@ class StateStore:
         previous complete file or the new complete file, never a mix.
         """
         assert self._data_file is not None
-        document = {
+        document: dict[str, Any] = {
             "version": DATA_FORMAT_VERSION,
             "operations": [
                 {"replicaId": replica_id, "operation": operation}
                 for replica_id, operation in self._accepted
             ],
+            "checkpoints": dict(self._checkpoints),
         }
         data = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
         directory = os.path.dirname(self._data_file)
@@ -921,6 +1008,71 @@ class StateStore:
                 )
             return HTTPStatus.CREATED, accepted, replayed
 
+    def save_checkpoint(self, peer_id: str, cursor: int) -> tuple[HTTPStatus, str | None]:
+        """Persist a sender-side replication checkpoint for ``peer_id``.
+
+        A checkpoint is not an operation: it never touches the accepted
+        log, the identity index, the candidate state, sync export, the
+        per-key audit, or the metrics counters. It shares their commit
+        lock, however, so validating the cursor against the accepted-log
+        length, persisting, and making the new cursor visible are one
+        indivisible commit: the cursor can never name a record that is not
+        durably accepted, and a concurrent reader sees either the old or
+        the new checkpoint, never a half state.
+
+        Returns ``(status, error)``: 200 with ``error=None`` for a first
+        registration, an equal-value replay, or an advance; 409 with
+        ``"checkpoint_conflict"`` when a larger cursor is already stored
+        (the stored value never moves backwards). Raises ValueError when
+        ``cursor`` is past the accepted-log length of the validation
+        snapshot; raises PersistenceError when the durable commit fails, in
+        which case memory and the file are unchanged and the request can be
+        retried.
+        """
+        with self._lock:
+            # Validate against the same committed snapshot the write will
+            # use, so the cursor can never be committed past an unaccepted
+            # or not-yet-durable record.
+            if cursor > len(self._accepted):
+                raise ValueError("cursor is past the end of the accepted log")
+            current = self._checkpoints.get(peer_id)
+            if current is not None and current > cursor:
+                return HTTPStatus.CONFLICT, "checkpoint_conflict"
+            if current == cursor:
+                # An equal-value replay is idempotent and needs no durable
+                # rewrite. (A first registration at cursor 0 is not a
+                # replay: current is None, so it falls through and is
+                # durably committed like any other registration.)
+                return HTTPStatus.OK, None
+            if self._data_file is not None:
+                # Same commit discipline as the operation paths: stage the
+                # new mapping, make the atomic rename the single commit
+                # point, and move the visible state only after it succeeds.
+                self._checkpoints[peer_id] = cursor
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    if current is None:
+                        del self._checkpoints[peer_id]
+                    else:
+                        self._checkpoints[peer_id] = current
+                    raise
+            else:
+                self._checkpoints[peer_id] = cursor
+            return HTTPStatus.OK, None
+
+    def get_checkpoint(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return the registered checkpoint, or 404 when ``peer_id`` is unknown.
+
+        Read under the shared commit lock so the response never observes a
+        checkpoint commit halfway through its durable update.
+        """
+        with self._lock:
+            cursor = self._checkpoints.get(peer_id)
+        if cursor is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+        return HTTPStatus.OK, {"peerId": peer_id, "cursor": cursor}
+
     def get_state(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
         with self._lock:
             candidates = list(self._candidates.get(key, []))
@@ -993,6 +1145,23 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         return [unquote(segment) for segment in path.split("/") if segment != ""]
 
+    def _checkpoint_route(self) -> tuple[bool, str]:
+        """Match ``/v1/sync/peers/{peerId}/checkpoint`` on the raw path.
+
+        Returns ``(matched, peer_id)``. Unlike :meth:`_path_segments`, the
+        empty segment of ``/v1/sync/peers//checkpoint`` is preserved: the
+        path still matches the route shape (so it is not a generic 404) but
+        yields an empty ``peer_id``, letting the caller reject it as an
+        invalid request. Any other segment count falls through to 404, so
+        extra segments such as ``.../checkpoint/extra`` never match.
+        """
+        parts = urlsplit(self.path).path.split("/")
+        if len(parts) != 6:
+            return False, ""
+        if parts[1:4] != ["v1", "sync", "peers"] or parts[5] != "checkpoint":
+            return False, ""
+        return True, unquote(parts[4])
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path == "/health":
             self._json(HTTPStatus.OK, health_payload())
@@ -1022,7 +1191,50 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_audit_get(segments[3])
             return
+        matched, checkpoint_peer = self._checkpoint_route()
+        if matched:
+            self._handle_checkpoint_get(checkpoint_peer)
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def _read_body(self) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        return self.rfile.read(length) if length > 0 else b""
+
+    def _handle_checkpoint_get(self, peer_id: str) -> None:
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        if peer_id == "":
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._store.get_checkpoint(peer_id)
+        self._json(status, payload)
+
+    def _handle_checkpoint_post(self, peer_id: str) -> None:
+        if peer_id == "":
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            cursor = parse_checkpoint_payload(self._read_body())
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status, error = self._store.save_checkpoint(peer_id, cursor)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        except PersistenceError:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json(status, {"error": error})
+            return
+        self._json(status, {"peerId": peer_id, "cursor": cursor})
 
     def _handle_metrics_get(self) -> None:
         if not parse_metrics_query(urlsplit(self.path).query):
@@ -1123,6 +1335,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        matched, checkpoint_peer = self._checkpoint_route()
+        if matched:
+            self._handle_checkpoint_post(checkpoint_peer)
+            return
         segments = self._path_segments()
         if (
             len(segments) == 4
