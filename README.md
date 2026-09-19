@@ -45,6 +45,22 @@ Candidates are stored per key with vector-clock semantics (missing components co
 
 Keys are isolated from each other, and reads reflect the latest writes.
 
+### Persistence
+
+By default the service is purely in-memory. Passing `--data-file PATH` makes accepted operations durable across restarts:
+
+```bash
+PYTHONPATH=src python3 -m semantic_state_engine.server --host 127.0.0.1 --port 8080 --data-file /var/lib/sse/state.json
+```
+
+- If `PATH` does not exist, it is created on first start (the parent directory must already exist). If the parent directory is missing, the path is inaccessible, or the path exists but is not a regular file, startup fails with an error and no service instance is created.
+- On startup the file is read back and strictly validated: every accepted operation (with its `replicaId` + `operationId` identity and full content) and every per-key candidate is restored. A file that cannot be parsed completely, has an unexpected structure, or contains records violating the input constraints above causes startup to fail; nothing is silently dropped or repaired.
+- Every newly accepted operation (HTTP 201, including stale writes that add no candidate) is persisted before its response is sent, so an acknowledged write survives a restart. Replays (HTTP 200) and conflicts (HTTP 409) never modify memory or the file.
+- Each update replaces the file atomically (write to a sibling temp file, fsync, rename), so an interrupted process never recovers partial or corrupted state; commits reach the file in the same order they are applied in memory under concurrency.
+- If a write cannot be persisted at runtime (e.g. the disk fails), the operation is rejected with HTTP 500 and `{"error":"persistence_error"}` and the in-memory state is left unchanged.
+
+The file is a JSON document of the form `{"format": "semantic-state-engine/v1", "operations": [...], "candidates": {...}}` and is managed exclusively by the service.
+
 ## Tests
 
 ```bash
