@@ -258,6 +258,16 @@ def parse_sync_query(query: str) -> tuple[int, int] | None:
     return parse_paging_query(query)
 
 
+def parse_empty_query(query: str) -> bool:
+    """Validate a route that accepts no query string at all.
+
+    Any non-empty query is rejected, including blanks, separators only
+    (``parse_qs`` drops a bare ``&``), repeated parameters, and empty
+    values. Only the exact empty string is accepted.
+    """
+    return query == ""
+
+
 class PersistenceError(Exception):
     """Raised when the data file cannot be opened, parsed, or written.
 
@@ -894,6 +904,42 @@ class StateStore:
             ],
         }
 
+    def get_metrics(self) -> dict[str, int]:
+        """Return one consistent snapshot of the service counters.
+
+        Every field is computed under the same commit lock used by local
+        writes, sync imports, and resolutions, so the counters always agree
+        with one another and a reader can never observe half an import
+        batch. The snapshot is read-only: it changes no state and writes
+        nothing.
+
+        ``acceptedOperations`` is the length of the accepted-operation log
+        (ordinary writes, stale writes, and repairs; excluding replays,
+        conflicts, invalid requests, and failed durable commits). ``keys``
+        counts keys that currently have at least one candidate and
+        ``candidateVersions`` their total candidate count. ``conflictKeys``
+        counts keys whose candidates do not all share one value and
+        ``resolvedKeys`` the rest, so the two sum to ``keys``. ``replicas``
+        is the number of distinct replica ids in the log; a repair counts
+        under its initiating replica.
+        """
+        with self._lock:
+            conflict_keys = 0
+            for candidates in self._candidates.values():
+                value = candidates[0]["value"]
+                if any(c["value"] != value for c in candidates):
+                    conflict_keys += 1
+            keys = len(self._candidates)
+            replicas = len({replica_id for replica_id, _ in self._accepted})
+            return {
+                "acceptedOperations": len(self._accepted),
+                "keys": keys,
+                "candidateVersions": sum(len(cs) for cs in self._candidates.values()),
+                "conflictKeys": conflict_keys,
+                "resolvedKeys": keys - conflict_keys,
+                "replicas": replicas,
+            }
+
 
 class SemanticStateServer(ThreadingHTTPServer):
     """Threading HTTP server carrying its own StateStore."""
@@ -943,6 +989,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, health_payload())
             return
         segments = self._path_segments()
+        if len(segments) == 2 and segments[0] == "v1" and segments[1] == "metrics":
+            self._handle_metrics_get()
+            return
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
@@ -965,6 +1014,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_audit_get(segments[3])
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def _handle_metrics_get(self) -> None:
+        if not parse_empty_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json(HTTPStatus.OK, self._store.get_metrics())
 
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)

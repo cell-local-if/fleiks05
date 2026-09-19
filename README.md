@@ -138,6 +138,27 @@ It never contains operations for other keys, identical replays (`200`), conflict
 
 With `--data-file`, the audit reads exactly the same durable log that sync export and recovery use: after a restart the per-key order, page boundaries, cursor resume, stale-write records, and accepted repair records are identical to a process that never restarted. A durable commit failure leaves no audit record (the operation neither reaches memory nor the file), and a conflicting import batch is rejected as a whole and likewise leaves no audit trace.
 
+### Service metrics
+
+`GET /v1/metrics` returns a read-only snapshot of service counters as a UTF-8 JSON object with exactly these six non-negative integers:
+
+```json
+{"acceptedOperations":3,"candidateVersions":1,"conflictKeys":0,"keys":1,"replicas":3,"resolvedKeys":1}
+```
+
+- `acceptedOperations`: the total number of first-accepted operations — ordinary writes, stale writes that added no candidate, and conflict repairs — excluding identical replays (`200`), conflicts (`409`), invalid requests (`400`), and operations whose durable commit failed (`500`). It is the length of the same accepted-operation log that sync export streams.
+- `keys`: the number of keys that currently have at least one candidate.
+- `candidateVersions`: the total number of current candidates across those keys.
+- `conflictKeys`: the number of keys whose candidates do not all carry the same value.
+- `resolvedKeys`: the number of remaining keys; `conflictKeys + resolvedKeys` always equals `keys`.
+- `replicas`: the number of distinct `replicaId` values appearing in the accepted-operation log; a repair counts under its initiating replica.
+
+All six fields are computed together in one snapshot under the same commit lock used by local writes, sync import batches, and repairs, so they always agree with one another and a read can never observe half a batch. The endpoint is strictly read-only: it never modifies memory, never writes the data file or a sync log, and leaves no temp files. With `--data-file`, recovery replays the accepted log, so the metrics after a restart are identical to those before it.
+
+- The endpoint accepts no query parameters. Any query string — including an unknown parameter, a repeated parameter, a parameter with an empty value, or a bare separator — returns HTTP 400 with `{"error":"invalid_request"}`. (A trailing empty query, as in `/v1/metrics?`, carries no parameters and succeeds.)
+- Extra path segments (for example `/v1/metrics/extra`) return HTTP 404 with `{"error":"not_found"}`.
+- As with every other route, the response includes an explicit `Content-Length`.
+
 ## Tests
 
 ```bash
