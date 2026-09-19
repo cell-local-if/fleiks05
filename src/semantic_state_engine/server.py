@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import stat
@@ -296,6 +297,69 @@ def parse_checkpoint_payload(raw: bytes | str | dict[str, Any]) -> int:
     if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
         raise ValueError("cursor must be a non-negative integer")
     return cursor
+
+
+def _escape_digest_string(value: str) -> str:
+    """Escape a string for the canonical verification-digest input.
+
+    Only the quote, the backslash, and control characters (U+0000-U+001F)
+    are escaped — control characters always as ``\\u00XX`` with lowercase
+    hex. Every other Unicode code point is written literally, so the
+    resulting byte sequence is a single deterministic encoding of the
+    string.
+    """
+    escaped: list[str] = []
+    for ch in value:
+        if ch == '"' or ch == "\\":
+            escaped.append("\\" + ch)
+        elif ch < " ":
+            escaped.append(f"\\u{ord(ch):04x}")
+        else:
+            escaped.append(ch)
+    return '"' + "".join(escaped) + '"'
+
+
+def _verification_digest_input(candidates: dict[str, list[dict[str, Any]]]) -> bytes:
+    """Serialize the current candidate sets to the canonical digest input.
+
+    The result is a compact UTF-8 JSON array with one ``{"key","candidates"}``
+    entry per key, keys in lexicographic (Unicode code point) order. Each
+    candidate list is sorted by ``(replicaId, operationId)`` ascending, each
+    candidate carries its fields in the fixed order ``value``, ``clock``,
+    ``replicaId``, ``operationId``, and the clock's component names are
+    sorted lexicographically. No whitespace is emitted anywhere. Only the
+    current candidates are covered — never the accepted-operation log,
+    stale writes, or checkpoints.
+    """
+    parts: list[str] = ["["]
+    for key_index, key in enumerate(sorted(candidates)):
+        if key_index:
+            parts.append(",")
+        parts.append('{"key":')
+        parts.append(_escape_digest_string(key))
+        parts.append(',"candidates":[')
+        ordered = sorted(
+            candidates[key], key=lambda c: (c["replicaId"], c["operationId"])
+        )
+        for index, candidate in enumerate(ordered):
+            if index:
+                parts.append(",")
+            clock = ",".join(
+                f"{_escape_digest_string(name)}:{tick}"
+                for name, tick in sorted(candidate["clock"].items())
+            )
+            parts.append('{"value":')
+            parts.append(_escape_digest_string(candidate["value"]))
+            parts.append(',"clock":{')
+            parts.append(clock)
+            parts.append('},"replicaId":')
+            parts.append(_escape_digest_string(candidate["replicaId"]))
+            parts.append(',"operationId":')
+            parts.append(_escape_digest_string(candidate["operationId"]))
+            parts.append("}")
+        parts.append("]}")
+    parts.append("]")
+    return "".join(parts).encode("utf-8")
 
 
 class PersistenceError(Exception):
@@ -945,6 +1009,35 @@ class StateStore:
                 "replicas": len(replicas),
             }
 
+    def get_verification_digest(self) -> dict[str, Any]:
+        """Return the read-only replica-convergence digest from one snapshot.
+
+        The digest input and both counters are computed together under the
+        same commit lock used by local writes, sync imports, and repairs, so
+        the response always describes a single commit: a read can never
+        observe half an import batch or a partially applied repair. The
+        snapshot mutates neither memory nor the data file.
+
+        The digest covers only the current candidate sets — never the
+        accepted-operation log, stale writes that added no candidate, or
+        checkpoints — serialized by :func:`_verification_digest_input` and
+        hashed with SHA-256. ``keys`` counts keys holding at least one
+        candidate and ``candidateVersions`` the candidates across them.
+        With ``--data-file`` the candidate state is rebuilt identically
+        during recovery, so the same state yields the same response before
+        and after a restart.
+        """
+        with self._lock:
+            keys = len(self._candidates)
+            candidate_versions = sum(len(c) for c in self._candidates.values())
+            digest_input = _verification_digest_input(self._candidates)
+        return {
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "keys": keys,
+            "candidateVersions": candidate_versions,
+        }
+
     def import_operations(
         self, records: list[tuple[str, dict[str, Any]]]
     ) -> tuple[HTTPStatus, int, int]:
@@ -1170,6 +1263,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         if len(segments) == 2 and segments[0] == "v1" and segments[1] == "metrics":
             self._handle_metrics_get()
             return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "verification"
+            and segments[2] == "digest"
+        ):
+            self._handle_verification_digest_get()
+            return
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
@@ -1241,6 +1342,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         self._json(HTTPStatus.OK, self._store.get_metrics())
+
+    def _handle_verification_digest_get(self) -> None:
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json(HTTPStatus.OK, self._store.get_verification_digest())
 
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)

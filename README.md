@@ -93,6 +93,34 @@ All six counters are computed from one snapshot under the same commit lock used 
 
 With `--data-file`, the counters are rebuilt from the recovered log on startup, so after a restart they are identical to those reported just before the restart.
 
+### Replica-convergence verification digest
+
+`GET /v1/verification/digest` returns HTTP 200 with a UTF-8 JSON object containing exactly four fields:
+
+```json
+{"algorithm":"sha256","candidateVersions":3,"digest":"<64 lowercase hex chars>","keys":2}
+```
+
+- `algorithm` is always `"sha256"`.
+- `digest` is the 64-character lowercase hexadecimal SHA-256 of the canonical candidate snapshot described below.
+- `keys` and `candidateVersions` are the same non-negative counts reported by `GET /v1/metrics`: keys currently holding at least one candidate, and the total number of current candidates across them.
+
+The digest covers **only the current candidate sets** — never the accepted-operation log, stale writes that added no candidate, or sync checkpoints. Two replicas holding the same candidates therefore report the same digest no matter how their logs, checkpoints, or operation histories differ, which is what makes it usable as a convergence check.
+
+The digest input is a compact UTF-8 JSON array with one entry per key:
+
+- Entries are `{"key":K,"candidates":C}`, sorted by key in lexicographic (Unicode code point) order.
+- `C` is sorted by `(replicaId, operationId)` ascending; each candidate carries its fields in the fixed order `{"value":V,"clock":D,"replicaId":R,"operationId":O}`, and `D`'s component names are sorted lexicographically.
+- No whitespace appears anywhere. Strings escape only the quote (`\"`), the backslash (`\\`), and control characters U+0000–U+001F (always as `\u00XX` with lowercase hex); every other Unicode code point is written literally.
+
+The SHA-256 is computed over exactly those bytes; for an empty store the input is `[]`.
+
+The digest input and both counters are computed from one snapshot under the same commit lock used by local writes, sync-import batches, and repairs, so the response always describes a single commit and never observes half an import batch or a partially applied repair. The request is strictly read-only — it modifies neither memory nor the data file — and its response uses the same explicit `Content-Length` contract as the other endpoints.
+
+The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}`. Extra path segments (for example `/v1/verification/digest/extra`) return HTTP 404 with `{"error":"not_found"}`.
+
+With `--data-file`, the candidate state is rebuilt from the recovered log on startup, so the same state yields the identical response before and after a restart.
+
 ### Resolving conflicts
 
 `POST /v1/states/{key}/resolve` repairs a key that is currently in conflict. The body is a JSON object with exactly these keys:
