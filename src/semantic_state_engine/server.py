@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import stat
@@ -221,6 +222,48 @@ def _non_negative_int(token: str) -> int | None:
 
 
 MAX_BODY_BYTES = 1_048_576
+
+BEARER_SCHEME = "Bearer "
+
+
+class AuthTokenError(Exception):
+    """Raised when ``--auth-token-file`` cannot provide a valid token.
+
+    At startup this means the service refuses to start exactly as it does
+    for a rejected data file: exit code 2 before the listening socket is
+    bound.
+    """
+
+
+def load_auth_token(path: str) -> str:
+    """Read and validate the bearer token file, returning the token.
+
+    The path must identify a readable regular file whose entire content is
+    one non-empty ASCII printable token (bytes 0x21-0x7E) with no
+    whitespace and in particular no trailing newline. A missing,
+    inaccessible, or non-regular target, an empty file, or any byte outside
+    that range raises AuthTokenError. Error messages name only the path and
+    the violation, never the token content.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except OSError as exc:
+        raise AuthTokenError(f"cannot access auth token file {path!r}: {exc}") from exc
+    if not stat.S_ISREG(mode):
+        raise AuthTokenError(f"auth token file is not a regular file: {path!r}")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise AuthTokenError(f"cannot read auth token file {path!r}: {exc}") from exc
+    if not raw:
+        raise AuthTokenError("auth token file must contain a non-empty token")
+    if any(byte < 0x21 or byte > 0x7E for byte in raw):
+        raise AuthTokenError(
+            "auth token must be a single non-empty ASCII printable token "
+            "with no whitespace or newline"
+        )
+    return raw.decode("ascii")
 
 
 def _content_length_token(token: str) -> int | None:
@@ -1323,6 +1366,7 @@ class SemanticStateServer(ThreadingHTTPServer):
         *,
         data_file: str | None = None,
         store: StateStore | None = None,
+        auth_token: str | None = None,
     ) -> None:
         # Build (and thus preflight/recover) the store before binding and
         # listening, so a rejected data file fails startup before any port is
@@ -1330,6 +1374,9 @@ class SemanticStateServer(ThreadingHTTPServer):
         resolved_store = store if store is not None else StateStore(data_file=data_file)
         super().__init__(server_address, handler_class or RequestHandler)
         self.store = resolved_store
+        # None leaves the service anonymous, as before; a non-None token
+        # gates every route except GET /health.
+        self.auth_token = auth_token
 
 
 _FALLBACK_STORE = StateStore()
@@ -1341,6 +1388,38 @@ class RequestHandler(BaseHTTPRequestHandler):
     @property
     def _store(self) -> StateStore:
         return getattr(self.server, "store", _FALLBACK_STORE)
+
+    def _authorized(self) -> bool:
+        """Authenticate a request against the optional bearer token.
+
+        With no configured token every request is anonymous. With a token,
+        exactly one ``Authorization`` header is required whose value is
+        precisely ``Bearer `` followed by the token; the comparison uses the
+        standard library's constant-time comparison. A missing, repeated,
+        malformed, or non-matching header fails.
+        """
+        token = getattr(self.server, "auth_token", None)
+        if token is None:
+            return True
+        values = self.headers.get_all("Authorization")
+        if values is None or len(values) != 1:
+            return False
+        # Compare raw header bytes (headers are latin-1 on the wire) against
+        # the ASCII expected value; constant-time and safe for any header.
+        presented = values[0].encode("latin-1", errors="replace")
+        expected = (BEARER_SCHEME + token).encode("ascii")
+        return hmac.compare_digest(presented, expected)
+
+    def _unauthorized(self) -> None:
+        """Answer 401 without touching the store, files, or the request body."""
+        self.close_connection = True
+        body = json.dumps({"error": "unauthorized"}, separators=(",", ":")).encode("utf-8")
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("WWW-Authenticate", "Bearer")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -1374,6 +1453,9 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path == "/health":
             self._json(HTTPStatus.OK, health_payload())
+            return
+        if not self._authorized():
+            self._unauthorized()
             return
         segments = self._path_segments()
         if len(segments) == 2 and segments[0] == "v1" and segments[1] == "metrics":
@@ -1423,18 +1505,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
-    def _read_bounded_body(self) -> bytes | None:
-        """Read the request body under the shared POST size contract.
+    def _check_content_length(self) -> int | None:
+        """Validate Content-Length under the shared POST size contract.
 
-        Content-Length is validated before anything else: a missing,
-        malformed, or conflicting declaration is answered with HTTP 400 and
-        a declared length over ``MAX_BODY_BYTES`` with HTTP 413 — both
-        before a single body byte is read, so an over-limit declaration is
-        rejected on its declared size alone, however invalid the content
-        would have been. Only when the declared length is within the limit
-        are exactly that many bytes read. Returns the body, or None when
-        the error response has already been sent. Either rejection closes
-        the connection because the unread body can no longer be framed.
+        Content-Length is validated before authentication and before
+        anything else: a missing, malformed, or conflicting declaration is
+        answered with HTTP 400 and a declared length over
+        ``MAX_BODY_BYTES`` with HTTP 413 — both before a single body byte is
+        read, so an over-limit declaration is rejected on its declared size
+        alone, however invalid the content would have been. Returns the
+        declared length, or None when the error response has already been
+        sent. Either rejection closes the connection because the unread body
+        can no longer be framed.
         """
         length = declared_body_length(self.headers)
         if length is None:
@@ -1444,6 +1526,25 @@ class RequestHandler(BaseHTTPRequestHandler):
         if length > MAX_BODY_BYTES:
             self.close_connection = True
             self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "payload_too_large"})
+            return None
+        return length
+
+    def _read_bounded_body(self) -> bytes | None:
+        """Validate Content-Length, authenticate, then read the POST body.
+
+        Content-Length's 400/413 take precedence over authentication, so the
+        size contract is identical whether or not a token is configured. A
+        request with a legal length that fails authentication is answered
+        with HTTP 401 without reading a single body byte; the connection is
+        closed because the unread body can no longer be framed. Only after
+        authentication are exactly the declared bytes read. Returns the body,
+        or None when an error response has already been sent.
+        """
+        length = self._check_content_length()
+        if length is None:
+            return None
+        if not self._authorized():
+            self._unauthorized()
             return None
         return self.rfile.read(length) if length > 0 else b""
 
@@ -1591,6 +1692,20 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        # With a token configured, the four POST endpoints keep Content-
+        # Length's 400/413 ahead of authentication, and authentication ahead
+        # of route matching (so unknown routes cannot be reached unauthenticated).
+        # The length check is header-only and reads no body; applying it here,
+        # before the route match, is what lets an existing endpoint's size
+        # error take precedence without matching the route first. With no
+        # token configured this step is skipped, preserving the prior
+        # route-first ordering exactly.
+        if getattr(self.server, "auth_token", None) is not None:
+            if self._check_content_length() is None:
+                return
+            if not self._authorized():
+                self._unauthorized()
+                return
         matched, checkpoint_peer = self._checkpoint_route()
         if matched:
             self._handle_checkpoint_post(checkpoint_peer)
@@ -1661,7 +1776,25 @@ def main(argv: list[str] | None = None) -> None:
             "recover them on startup; without it the service stays purely in memory"
         ),
     )
+    parser.add_argument(
+        "--auth-token-file",
+        default=None,
+        help=(
+            "optional path to a readable regular file holding exactly one "
+            "non-empty ASCII printable bearer token (no whitespace or trailing "
+            "newline); when given, every route except GET /health requires "
+            "'Authorization: Bearer <token>' and an invalid file refuses startup"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    auth_token: str | None = None
+    if args.auth_token_file is not None:
+        try:
+            auth_token = load_auth_token(args.auth_token_file)
+        except AuthTokenError as exc:
+            print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
 
     try:
         store = StateStore(data_file=args.data_file)
@@ -1669,7 +1802,9 @@ def main(argv: list[str] | None = None) -> None:
         print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    server = SemanticStateServer((args.host, args.port), store=store)
+    server = SemanticStateServer(
+        (args.host, args.port), store=store, auth_token=auth_token
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

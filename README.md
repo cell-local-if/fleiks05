@@ -30,6 +30,22 @@ All four POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/s
 - When the declared length is within the limit, exactly that many bytes are read and the endpoint's existing JSON and field validation, status codes, batch atomicity, idempotency, and persistence-failure semantics apply unchanged.
 - A rejected request (400 or 413) adds no operation, candidate, checkpoint, or audit record and creates no temporary persistence file; memory and the data file are exactly as they were before the request.
 
+### Optional bearer token authentication
+
+The service stays anonymous by default, and the interfaces, status codes, persistence, and request-size semantics documented here are unchanged when authentication is not enabled. To require authentication, pass `--auth-token-file PATH`:
+
+```bash
+printf '%s' 'a-long-random-token' > ./var/auth.token
+PYTHONPATH=src python3 -m semantic_state_engine.server --auth-token-file ./var/auth.token
+```
+
+- The file is read once, **before the service listens**. It must be a readable **regular file** whose entire content is exactly one **non-empty ASCII printable token** — bytes `0x21`–`0x7E` only, so no spaces, tabs, or other whitespace and no trailing newline (`printf` rather than `echo` is the safe way to create it). A missing or unreadable path, a non-regular target (for example a directory or named pipe), an empty file, or any invalid byte makes startup fail with exit code 2, with no port bound. The failure message reports the path and the violation, never the token.
+- `GET /health` stays **anonymous** so liveness checks need no secret. Every other route — all existing endpoints **and unknown routes** — requires authentication, checked before route matching, query parsing, the commit lock, any state read, any data-file access, and (for POSTs) before the body is read.
+- A request must carry **exactly one** `Authorization` header whose value is precisely `Bearer`, a single space, and the token (`Authorization: Bearer <token>`). A missing header, a repeated header, a wrong scheme or spacing, or a non-matching token returns HTTP 401 with `{"error":"unauthorized"}` and a `WWW-Authenticate: Bearer` header. The token is compared with the standard library's constant-time comparison (`hmac.compare_digest`).
+- A 401 leaks nothing: it does not print the token, create a temporary file, or change memory, logs, checkpoints, audit streams, or the data file.
+- On the four POST endpoints, `Content-Length` is still validated first, so its **400/413 takes precedence over 401** even with authentication enabled. When the declared length is legal but the request is unauthorized, the body is **not read** and the connection is closed (the unread bytes can no longer be framed). After a successful authentication every success, 400, 404, 409, 500, paging, digest, idempotency, concurrency, and recovery behavior is exactly as documented.
+- Authentication configuration is process-local and is never written to the `--data-file` state document: restarting with or without `--auth-token-file` changes only whether requests must present a token, never the persisted operations or checkpoints.
+
 ### Local persistence and recovery (optional)
 
 The service is purely in memory by default. Pass `--data-file PATH` to persist every accepted operation to a file and recover it on startup:
