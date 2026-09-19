@@ -198,6 +198,175 @@ def _fsync_directory(directory: str) -> None:
         os.close(fd)
 
 
+def _fsync_directory_required(directory: str) -> None:
+    """fsync a directory or raise PersistenceError; used by the startup probe."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError as exc:
+        raise PersistenceError(f"cannot open directory for fsync {directory!r}: {exc}") from exc
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise PersistenceError(f"cannot fsync directory {directory!r}: {exc}") from exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# Probe names used by the startup atomic-commit preflight. They live only in
+# the data file's parent directory, carry an exclusive prefix, the owning
+# process id, and a random component claimed via mkstemp; they are always
+# removed before preflight returns.
+_PREFLIGHT_PAYLOAD = b"semantic-state-engine preflight probe\n"
+_PREFLIGHT_SUFFIXES = (".src.tmp", ".dst.tmp")
+
+
+def _preflight_name_prefix(data_path_abs: str) -> str:
+    return f".sestate-preflight-{os.path.basename(data_path_abs)}."
+
+
+def _preflight_probe_paths(directory: str, scan_prefix: str) -> tuple[int, str, str]:
+    """Create the source probe and derive the target probe path.
+
+    mkstemp claims an exclusive random name (O_EXCL) so concurrent startups
+    using the same directory never collide or reap one another's probes. The
+    generated name keeps the shared scan prefix followed by the owning pid,
+    so a later startup can attribute leftovers:
+    ``<scan_prefix><pid>.<random>.src.tmp``.
+    """
+    fd, source = tempfile.mkstemp(
+        dir=directory,
+        prefix=f"{scan_prefix}{os.getpid()}.",
+        suffix=".src.tmp",
+    )
+    target = source[: -len(".src.tmp")] + ".dst.tmp"
+    return fd, source, target
+
+
+def _preflight_owner_is_dead(name: str, prefix: str) -> bool:
+    """Return True for probes left by a process that no longer exists.
+
+    Probe names end in ``<pid>.<random>.(src|dst).tmp`` after the shared
+    prefix. Entries we cannot attribute (unknown shape, a live pid, a pid we
+    cannot signal) are never treated as reclaimable.
+    """
+    remainder = name[len(prefix) :]
+    pid_token, _, rest = remainder.partition(".")
+    if not pid_token.isdigit() or "." not in rest:
+        return False
+    if not rest.endswith(_PREFLIGHT_SUFFIXES):
+        return False
+    pid = int(pid_token)
+    if pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        # The process exists; the probe may still be live.
+        return False
+    except OSError:
+        return False
+    return False
+
+
+def _cleanup_stale_probes(directory: str, prefix: str) -> None:
+    """Remove probes abandoned by earlier failed attempts of this data path."""
+    try:
+        names = os.listdir(directory)
+    except OSError as exc:
+        raise PersistenceError(f"cannot inspect directory {directory!r}: {exc}") from exc
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith(".tmp")):
+            continue
+        if not _preflight_owner_is_dead(name, prefix):
+            continue
+        try:
+            os.unlink(os.path.join(directory, name))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # A foreign-owned or locked leftover is outside this preflight's
+            # scope (it cannot block our uniquely named probes); leave it.
+            pass
+
+
+def _unlink_quiet(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Best effort while unwinding a failed preflight; the original
+        # failure is what must reach the caller.
+        pass
+
+
+def preflight_data_file_directory(path: str) -> None:
+    """Probe the parent directory for the atomic-commit capability.
+
+    Verifies, entirely with two probe files in the parent directory, that
+    the service can exclusively create a named file, write and fsync it, and
+    atomically replace it over another name (``os.replace``) followed by a
+    directory fsync. Both probes are removed afterwards, together with probes
+    abandoned by an earlier failed attempt whose owning process is gone.
+
+    The target data file itself is never opened for writing, truncated,
+    renamed, or replaced. Any failure raises PersistenceError so the caller
+    can refuse to start before it begins listening.
+    """
+    data_path = os.path.abspath(path)
+    directory = os.path.dirname(data_path)
+    if not os.path.isdir(directory):
+        raise PersistenceError(f"data file parent directory does not exist: {directory!r}")
+
+    prefix = _preflight_name_prefix(data_path)
+    _cleanup_stale_probes(directory, prefix)
+
+    source = target = ""
+    try:
+        try:
+            fd, source, target = _preflight_probe_paths(directory, prefix)
+        except OSError as exc:
+            raise PersistenceError(
+                f"cannot create preflight probe in {directory!r}: {exc}"
+            ) from exc
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(_PREFLIGHT_PAYLOAD)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            _unlink_quiet(source)
+            raise
+        try:
+            os.replace(source, target)
+        except BaseException:
+            _unlink_quiet(source)
+            _unlink_quiet(target)
+            raise
+        try:
+            _fsync_directory_required(directory)
+            with open(target, "rb") as handle:
+                committed = handle.read()
+            if committed != _PREFLIGHT_PAYLOAD:
+                raise PersistenceError(
+                    f"atomic replace probe in {directory!r} did not preserve its contents"
+                )
+        finally:
+            _unlink_quiet(target)
+            _fsync_directory(directory)
+    except PersistenceError:
+        raise
+    except OSError as exc:
+        raise PersistenceError(
+            f"startup atomic-commit preflight failed in {directory!r}: {exc}"
+        ) from exc
+
+
 class StateStore:
     """Concurrency-safe store of versioned candidates per key.
 
@@ -215,14 +384,19 @@ class StateStore:
         self._data_file: str | None = None
         if data_file is not None:
             path = os.path.abspath(data_file)
+            # Probe directory-level atomic commit first; an existing data
+            # file is never touched by the probe and is opened only for
+            # reading afterwards.
+            preflight_data_file_directory(path)
             records = ensure_data_file(path)
             with self._lock:
                 for replica_id, operation in records:
                     self._commit_locked(replica_id, operation)
                 self._data_file = path
                 if not records and not os.path.exists(path):
-                    # Create the store up front so an unwritable target is a
-                    # startup failure rather than a failure of the first write.
+                    # The target is missing and the preflight proved the
+                    # directory supports atomic commits; create the store up
+                    # front so its first state is a durable empty log.
                     self._persist_locked()
 
     @staticmethod
@@ -372,8 +546,12 @@ class SemanticStateServer(ThreadingHTTPServer):
         data_file: str | None = None,
         store: StateStore | None = None,
     ) -> None:
+        # Build (and thus preflight/recover) the store before binding and
+        # listening, so a rejected data file fails startup before any port is
+        # open rather than surfacing on the first accepted write.
+        resolved_store = store if store is not None else StateStore(data_file=data_file)
         super().__init__(server_address, handler_class or RequestHandler)
-        self.store = store if store is not None else StateStore(data_file=data_file)
+        self.store = resolved_store
 
 
 _FALLBACK_STORE = StateStore()
