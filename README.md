@@ -41,8 +41,10 @@ PYTHONPATH=src python3 -m semantic_state_engine.server --data-file ./var/state.j
 The data file is a single UTF-8 JSON document, e.g.:
 
 ```json
-{"version":1,"operations":[{"replicaId":"r1","operation":{"clock":{"r1":1},"key":"color","operationId":"op-1","value":"blue"}}]}
+{"version":1,"operations":[{"replicaId":"r1","operation":{"clock":{"r1":1},"key":"color","operationId":"op-1","value":"blue"}}],"checkpoints":[{"peerId":"peer-a","cursor":1}]}
 ```
+
+`checkpoints` holds the peer-consumption cursors described below; files written before checkpoints existed carry only `version` and `operations` and recover with an empty checkpoint table.
 
 ### Writing operations
 
@@ -139,6 +141,26 @@ Two additional endpoints stream the accepted-operation log between replicas. The
 Imports share the single commit order with local `POST /v1/replicas/...` writes: an import batch is processed as one indivisible unit, so a concurrent state read never sees half a batch, and records from local writes and imports interleave in exactly one global order in the export.
 
 With `--data-file`, all new operations of a batch are written to the file in one atomic commit before the success response; a durable failure returns HTTP 500 `{"error":"internal_error"}` and leaves memory, the identity index, and the file exactly as they were before the batch (the request can be retried). Pure-replay batches need no write and still succeed. After a restart the export order, cursor resume, replay `200`, and conflict `409` are identical to a process that never restarted.
+
+### Peer checkpoints
+
+A sending peer can record how far it has consumed this replica's accepted-operation log, so it can resume after a restart without re-exporting the whole log. Checkpoints live next to the log but are not operations.
+
+`POST /v1/sync/peers/{peerId}/checkpoint` registers or advances a peer's cursor. The body must be a JSON object whose only key is `cursor`:
+
+```json
+{"cursor":7}
+```
+
+- `peerId` must be a non-empty path segment. `cursor` must be a non-boolean, non-negative integer no greater than the accepted-log length at validation time — a cursor can never point at records that were not accepted. Any violation (malformed JSON, extra keys, a boolean/string/negative cursor, or a cursor past the log) returns HTTP 400 `{"error":"invalid_request"}`.
+- First registration, an identical replay, and an advance all return HTTP 200 with `{"peerId","cursor"}`.
+- A cursor below the stored one returns HTTP 409 `{"error":"checkpoint_conflict"}`; the stored checkpoint never regresses.
+
+`GET /v1/sync/peers/{peerId}/checkpoint` returns the registered `{"peerId","cursor"}` object, or HTTP 404 `{"error":"not_found"}` when the peer has none. The query accepts no parameters (any parameter returns HTTP 400 `{"error":"invalid_request"}`), and unknown route shapes — an empty peer segment or extra path segments — return HTTP 404.
+
+Checkpoint validation, persistence, and visibility share the single commit lock with local writes, sync-import batches, and resolutions: the check against the accepted-log length, the durable write, and the visible update are one commit, and a read never observes half a batch. A checkpoint is not an operation — it appears in neither the accepted log, the sync export, the per-key audit, the candidate state, nor the metrics counters.
+
+With `--data-file`, a new or advanced checkpoint is atomically committed to the data file (in the same document as the operation log) before the 200 response; a durable failure returns HTTP 500 `{"error":"internal_error"}` and leaves memory and the file exactly as they were (the request can be retried). Identical replays and rejected regressions need no write. A `version: 1` data file without a `checkpoints` member recovers with no checkpoints; once registered, checkpoints survive restarts alongside the operation log, and a stored cursor beyond the recovered log is corruption that refuses startup.
 
 ### Per-key operation audit
 
