@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import stat
@@ -19,6 +20,30 @@ DATA_FORMAT_VERSION = 1
 
 def health_payload() -> dict[str, str]:
     return {"service": "semantic-state-engine", "status": "ok"}
+
+
+def canonical_digest_json(value: Any) -> str:
+    """Encode ``value`` in the canonical JSON form used as digest input.
+
+    The form is compact (no whitespace outside strings); object members
+    appear in the caller-supplied order; strings escape only the quotation
+    mark, the reverse solidus, and control characters, and every other
+    Unicode code point is written as-is.
+    """
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        raise TypeError("booleans are not part of the digest input")
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ",".join(canonical_digest_json(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            canonical_digest_json(member) + ":" + canonical_digest_json(item)
+            for member, item in value.items()
+        ) + "}"
+    raise TypeError(f"unsupported digest input type: {type(value)!r}")
 
 
 def clock_dominates(clock_a: dict[str, int], clock_b: dict[str, int]) -> bool:
@@ -945,6 +970,63 @@ class StateStore:
                 "replicas": len(replicas),
             }
 
+    def get_verification_digest(self) -> dict[str, Any]:
+        """Return a read-only convergence digest of the current candidates.
+
+        The digest input is a compact UTF-8 JSON array with one entry per
+        key, ordered by key: ``{"key":K,"candidates":C}`` where ``C`` is
+        ordered by ``(replicaId, operationId)`` and each candidate carries
+        exactly ``value``, ``clock`` (components ordered by name),
+        ``replicaId``, and ``operationId`` in that field order. The SHA-256
+        of that byte sequence is reported as 64 lowercase hex characters
+        alongside the candidate counts. Only current candidates are covered
+        — the accepted-operation log, stale writes that added no candidate,
+        and checkpoints never contribute.
+
+        The digest input and the counts are computed from one snapshot
+        under the same commit lock used by local writes, sync imports, and
+        repairs, so the response always describes a single commit and never
+        observes half an import batch or a partially applied repair. The
+        read mutates neither memory nor the data file, and with
+        ``--data-file`` recovery rebuilds identical candidates, so the same
+        state yields the same digest before and after a restart.
+        """
+        with self._lock:
+            entries: list[dict[str, Any]] = []
+            candidate_versions = 0
+            for key in sorted(self._candidates):
+                ordered = sorted(
+                    self._candidates[key],
+                    key=lambda c: (c["replicaId"], c["operationId"]),
+                )
+                candidate_versions += len(ordered)
+                entries.append(
+                    {
+                        "key": key,
+                        "candidates": [
+                            {
+                                "value": candidate["value"],
+                                "clock": {
+                                    name: candidate["clock"][name]
+                                    for name in sorted(candidate["clock"])
+                                },
+                                "replicaId": candidate["replicaId"],
+                                "operationId": candidate["operationId"],
+                            }
+                            for candidate in ordered
+                        ],
+                    }
+                )
+            digest = hashlib.sha256(
+                canonical_digest_json(entries).encode("utf-8")
+            ).hexdigest()
+            return {
+                "algorithm": "sha256",
+                "digest": digest,
+                "keys": len(entries),
+                "candidateVersions": candidate_versions,
+            }
+
     def import_operations(
         self, records: list[tuple[str, dict[str, Any]]]
     ) -> tuple[HTTPStatus, int, int]:
@@ -1170,6 +1252,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         if len(segments) == 2 and segments[0] == "v1" and segments[1] == "metrics":
             self._handle_metrics_get()
             return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "verification"
+            and segments[2] == "digest"
+        ):
+            self._handle_verification_digest_get()
+            return
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
@@ -1241,6 +1331,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         self._json(HTTPStatus.OK, self._store.get_metrics())
+
+    def _handle_verification_digest_get(self) -> None:
+        # The digest route accepts no query parameters, exactly like the
+        # metrics route, so it reuses the same no-parameter validation.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json(HTTPStatus.OK, self._store.get_verification_digest())
 
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)

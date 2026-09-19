@@ -93,6 +93,21 @@ All six counters are computed from one snapshot under the same commit lock used 
 
 With `--data-file`, the counters are rebuilt from the recovered log on startup, so after a restart they are identical to those reported just before the restart.
 
+### Replica-convergence verification digest
+
+`GET /v1/verification/digest` returns a read-only SHA-256 digest of the current candidate state, so two replicas can check whether they have converged without streaming the full operation log:
+
+```json
+{"algorithm":"sha256","candidateVersions":2,"digest":"9f2c…​(64 hex)","keys":1}
+```
+
+- The response is a UTF-8 JSON object with exactly four fields: `algorithm` (always `"sha256"`), `digest` (64 lowercase hexadecimal characters), and `keys` / `candidateVersions` (non-negative counts of the keys currently holding candidates and of the candidates across them).
+- The digest input is a compact UTF-8 JSON array with one entry per key, ordered by key: `{"key":K,"candidates":C}`, where `C` is ordered by `(replicaId, operationId)` ascending and each candidate carries exactly `value`, `clock`, `replicaId`, `operationId` in that field order, with the clock's component names ordered lexicographically. Objects contain no whitespace; strings escape only the quotation mark, the reverse solidus, and control characters — every other Unicode code point is written as-is. `digest` is the SHA-256 of that byte sequence.
+- Only current candidates are covered: the accepted-operation log, stale writes that added no candidate, and checkpoints never contribute to the digest. An empty store digests the empty array `[]`.
+- The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}`. Extra path segments (for example `/v1/verification/digest/extra`) return HTTP 404 with `{"error":"not_found"}`.
+
+The digest input and the counts are computed from one snapshot under the same commit lock used by local writes, sync-import batches, and repairs, so the response always describes a single commit and never observes half an import batch or a partially applied repair. The request is strictly read-only — it modifies neither memory nor the data file — and with `--data-file` recovery rebuilds identical candidates, so the same state yields the same digest before and after a restart.
+
 ### Resolving conflicts
 
 `POST /v1/states/{key}/resolve` repairs a key that is currently in conflict. The body is a JSON object with exactly these keys:
