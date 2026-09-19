@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -12,9 +13,94 @@ import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 DATA_FORMAT_VERSION = 1
+
+SYNC_DEFAULT_LIMIT = 100
+SYNC_MAX_LIMIT = 100
+SYNC_MAX_BATCH = 100
+
+
+class InvalidSyncRequest(ValueError):
+    """A malformed sync request: bad query parameters or request body."""
+
+
+def parse_sync_query(query: str) -> tuple[int, int]:
+    """Parse the ``after``/``limit`` query string for the sync export.
+
+    ``after`` is a skipped-record count (default 0); ``limit`` defaults to
+    100 and must be in 1-100. Negative values, non-integer syntax, repeated
+    parameters, or any unknown parameter raise InvalidSyncRequest. Bounds on
+    ``after`` relative to the current log are checked later against the
+    store, since they depend on the snapshot.
+    """
+    pairs = parse_qsl(query, keep_blank_values=True)
+    values: dict[str, str] = {}
+    for name, value in pairs:
+        if name in values:
+            raise InvalidSyncRequest(f"query parameter {name!r} repeated")
+        values[name] = value
+    unknown = values.keys() - {"after", "limit"}
+    if unknown:
+        raise InvalidSyncRequest(f"unknown query parameter {sorted(unknown)[0]!r}")
+
+    def parse_non_negative_int(name: str, default: int) -> int:
+        raw = values.get(name)
+        if raw is None:
+            return default
+        if not re.fullmatch(r"[0-9]+", raw):
+            raise InvalidSyncRequest(f"query parameter {name!r} must be a non-negative integer")
+        return int(raw)
+
+    after = parse_non_negative_int("after", 0)
+    limit = parse_non_negative_int("limit", SYNC_DEFAULT_LIMIT)
+    if limit < 1 or limit > SYNC_MAX_LIMIT:
+        raise InvalidSyncRequest("limit must be between 1 and 100")
+    return after, limit
+
+
+def parse_sync_batch(raw: bytes | str | dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Validate a sync-import request body.
+
+    Accepts a JSON object with an ``operations`` list of 1-100 items; each
+    item must be an object with exactly ``replicaId`` and ``operation``, the
+    replica id a non-empty string and the operation satisfying the existing
+    operation constraints (its clock must contain its own replica id).
+    Returns the normalized ``(replica_id, operation)`` items in order. Raises
+    InvalidSyncRequest on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise InvalidSyncRequest("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            payload: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise InvalidSyncRequest("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or set(payload.keys()) != {"operations"}:
+        raise InvalidSyncRequest("body must be an object with only operations")
+    items_raw = payload["operations"]
+    if not isinstance(items_raw, list) or not (1 <= len(items_raw) <= SYNC_MAX_BATCH):
+        raise InvalidSyncRequest("operations must be a list of 1-100 items")
+
+    items: list[tuple[str, dict[str, Any]]] = []
+    for entry in items_raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {"replicaId", "operation"}:
+            raise InvalidSyncRequest("each item must have exactly replicaId and operation")
+        replica_id = entry["replicaId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise InvalidSyncRequest("replicaId must be a non-empty string")
+        try:
+            operation = parse_operation_payload(entry["operation"], replica_id)
+        except ValueError as exc:
+            raise InvalidSyncRequest(str(exc)) from exc
+        items.append((replica_id, operation))
+    return items
 
 
 def health_payload() -> dict[str, str]:
@@ -367,6 +453,19 @@ def preflight_data_file_directory(path: str) -> None:
         ) from exc
 
 
+class SyncConflict(Exception):
+    """A sync batch re-uses a known identity with different content.
+
+    Carries the zero-based index of the offending item so callers never
+    commit any of the batch: validation/conflict failures leave memory, the
+    identity index, and the data file exactly as they were.
+    """
+
+    def __init__(self, index: int) -> None:
+        super().__init__(f"operation conflict at batch index {index}")
+        self.index = index
+
+
 class StateStore:
     """Concurrency-safe store of versioned candidates per key.
 
@@ -504,6 +603,101 @@ class StateStore:
             self._candidates[operation["key"]] = next_candidates
             return HTTPStatus.CREATED
 
+    def import_operations(
+        self, items: list[tuple[str, dict[str, Any]]]
+    ) -> tuple[int, int]:
+        """Atomically import a validated sync batch in commit order.
+
+        Returns ``(accepted, replayed)``. Items are classified in order with
+        the same write semantics as local requests: an unseen identity is
+        accepted (stale writes included), a known identical operation is a
+        replay, and a known identity with different content raises
+        SyncConflict. Every failure (including a conflict at a later item or
+        a durable-write error) commits nothing. All accepted items form one
+        commit: with a data file the whole new log is persisted before any
+        memory structure changes, so concurrent readers never see half a
+        batch and a failed write leaves memory, the identity index, and the
+        file exactly as they were.
+        """
+        with self._lock:
+            # Classify first against the committed index and then against
+            # identities staged earlier in this same batch, so the batch can
+            # never persist a duplicate identity (which the strict loader
+            # would reject on restart).
+            staged: list[tuple[str, dict[str, Any]]] = []
+            pending: dict[tuple[str, str], dict[str, Any]] = {}
+            accepted = 0
+            replayed = 0
+            for index, (replica_id, operation) in enumerate(items):
+                identity = (replica_id, operation["operationId"])
+                seen = self._operations.get(identity)
+                if seen is None:
+                    seen = pending.get(identity)
+                if seen is not None:
+                    if seen == operation:
+                        replayed += 1
+                        continue
+                    raise SyncConflict(index)
+                pending[identity] = operation
+                staged.append((replica_id, operation))
+                accepted += 1
+
+            if not staged:
+                return accepted, replayed
+
+            # Replay the candidate computations in import order onto scratch
+            # per-key lists; nothing visible changes until the commit point.
+            candidate_updates: dict[str, list[dict[str, Any]]] = {}
+            for replica_id, operation in staged:
+                key = operation["key"]
+                current = candidate_updates.get(key, self._candidates.get(key, []))
+                candidate_updates[key] = self._next_candidates(
+                    current, replica_id, operation
+                )
+
+            start = len(self._accepted)
+            self._accepted.extend(staged)
+            if self._data_file is not None:
+                # The atomic rename is the single commit point: only after it
+                # succeeds do the index and candidate view move to the batch.
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    del self._accepted[start:]
+                    raise
+            for replica_id, operation in staged:
+                self._operations[(replica_id, operation["operationId"])] = operation
+            self._candidates.update(candidate_updates)
+            return accepted, replayed
+
+    def get_operations_page(
+        self, after: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        """Return one snapshot page of the accepted-operation log.
+
+        The page is the contiguous slice ``[after:after+limit]`` of the log in
+        commit order, taken under the same lock that commits local writes and
+        sync imports, so concurrent commits never interleave with or
+        invalidate it. ``after`` is a number of already skipped records; the
+        returned ``next_cursor`` is the skipped count after this page and
+        ``has_more`` reports remaining records. Raises ValueError when
+        ``after`` is past the end of the log.
+        """
+        with self._lock:
+            total = len(self._accepted)
+            if after < 0 or after > total:
+                raise ValueError("after is out of range")
+            page = self._accepted[after : after + limit]
+            records = [
+                {
+                    "replicaId": replica_id,
+                    "operation": {**operation, "clock": dict(operation["clock"])},
+                }
+                for replica_id, operation in page
+            ]
+        next_cursor = after + len(records)
+        return records, next_cursor, next_cursor < total
+
     def get_state(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
         with self._lock:
             candidates = list(self._candidates.get(key, []))
@@ -537,6 +731,10 @@ class SemanticStateServer(ThreadingHTTPServer):
     """Threading HTTP server carrying its own StateStore."""
 
     daemon_threads = True
+    # The default listen backlog (5) can reject concurrent bursts of sync
+    # imports and reads with ECONNREFUSED; accept them and let the handler
+    # threads serialize through the store lock.
+    request_queue_size = 128
 
     def __init__(
         self,
@@ -580,12 +778,47 @@ class RequestHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._json(HTTPStatus.OK, health_payload())
             return
-        segments = self._path_segments()
+        split = urlsplit(self.path)
+        segments = [unquote(segment) for segment in split.path.split("/") if segment != ""]
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
             return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "sync"
+            and segments[2] == "operations"
+        ):
+            try:
+                after, limit = parse_sync_query(split.query)
+            except InvalidSyncRequest:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            try:
+                operations, next_cursor, has_more = self._store.get_operations_page(
+                    after, limit
+                )
+            except ValueError:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            self._json(
+                HTTPStatus.OK,
+                {
+                    "operations": operations,
+                    "nextCursor": next_cursor,
+                    "hasMore": has_more,
+                },
+            )
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def _read_body(self) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return b""
+        return self.rfile.read(length) if length > 0 else b""
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         segments = self._path_segments()
@@ -596,11 +829,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[3] == "operations"
         ):
             replica_id = segments[2]
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                length = 0
-            raw = self.rfile.read(length) if length > 0 else b""
+            raw = self._read_body()
             try:
                 operation = parse_operation_payload(raw, replica_id)
             except ValueError:
@@ -621,6 +850,35 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "key": operation["key"],
             }
             self._json(status, payload)
+            return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "sync"
+            and segments[2] == "operations"
+        ):
+            try:
+                items = parse_sync_batch(self._read_body())
+            except InvalidSyncRequest:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            try:
+                accepted, replayed = self._store.import_operations(items)
+            except SyncConflict:
+                self._json(HTTPStatus.CONFLICT, {"error": "operation_conflict"})
+                return
+            except PersistenceError:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+                return
+            created = accepted > 0
+            self._json(
+                HTTPStatus.CREATED if created else HTTPStatus.OK,
+                {
+                    "status": "created" if created else "ok",
+                    "accepted": accepted,
+                    "replayed": replayed,
+                },
+            )
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
