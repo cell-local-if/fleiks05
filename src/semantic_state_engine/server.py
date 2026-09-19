@@ -219,13 +219,14 @@ def _non_negative_int(token: str) -> int | None:
     return int(token)
 
 
-def parse_sync_query(query: str) -> tuple[int, int] | None:
-    """Validate the sync-export query string.
+def parse_paging_query(query: str) -> tuple[int, int] | None:
+    """Validate an ``after``/``limit`` paging query string.
 
     Accepts only ``after`` (default 0) and ``limit`` (default 100, 1-100),
-    each non-negative integers with no repeats. Unknown parameters, malformed
-    or negative values, and out-of-range limits return None. Bounds on
-    ``after`` against the log length are checked by the store.
+    each non-negative ASCII decimal integers with no repeats. Unknown
+    parameters, malformed or negative values, and out-of-range limits return
+    None. The sync-export and key-audit streams share these rules; bounds on
+    ``after`` against the stream length are checked by the store.
     """
     parsed = parse_qs(query, keep_blank_values=True)
     if any(len(values) != 1 for values in parsed.values()):
@@ -246,6 +247,15 @@ def parse_sync_query(query: str) -> tuple[int, int] | None:
             return None
         limit = limit_value
     return after, limit
+
+
+def parse_sync_query(query: str) -> tuple[int, int] | None:
+    """Validate the sync-export query string.
+
+    Delegates to :func:`parse_paging_query`; kept as a named entry point for
+    the sync route.
+    """
+    return parse_paging_query(query)
 
 
 class PersistenceError(Exception):
@@ -760,6 +770,39 @@ class StateStore:
         next_cursor = after + len(page)
         return page, next_cursor, next_cursor < total
 
+    def get_key_operations(
+        self, key: str, after: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        """Return one page of one key's accepted operations from one snapshot.
+
+        The audit stream is the shared accepted-operation log filtered to
+        records whose ``operation.key`` equals ``key``, kept in global commit
+        order. It therefore includes stale writes and resolutions accepted
+        via ``/resolve`` (both are ordinary committed operations) and excludes
+        other keys, replays, conflicts, and uncommitted requests.
+
+        ``after`` is the number of this key's records already skipped (a
+        per-key 0-based cursor) and ``limit`` the page size. The filtered
+        list, the slice, the returned cursor, and ``has_more`` are all
+        computed against the same snapshot under the commit lock, so pages
+        interleave cleanly with concurrent commits and never observe half an
+        import batch. Returns ``(records, next_cursor, has_more)`` where
+        ``next_cursor`` is the number of the key's records skipped after this
+        page. Raises ValueError when ``after`` is past the key's record count.
+        """
+        with self._lock:
+            key_log = [
+                {"replicaId": replica_id, "operation": operation}
+                for replica_id, operation in self._accepted
+                if operation["key"] == key
+            ]
+            total = len(key_log)
+            if after > total:
+                raise ValueError("after is past the end of the key's audit log")
+            page = key_log[after : after + limit]
+        next_cursor = after + len(page)
+        return page, next_cursor, next_cursor < total
+
     def import_operations(
         self, records: list[tuple[str, dict[str, Any]]]
     ) -> tuple[HTTPStatus, int, int]:
@@ -912,6 +955,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_sync_get()
             return
+        if (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "audit"
+            and segments[2] == "keys"
+            and segments[4] == "operations"
+        ):
+            self._handle_audit_get(segments[3])
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def _handle_sync_get(self) -> None:
@@ -922,6 +974,22 @@ class RequestHandler(BaseHTTPRequestHandler):
         after, limit = params
         try:
             page, next_cursor, has_more = self._store.get_sync_operations(after, limit)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json(
+            HTTPStatus.OK,
+            {"operations": page, "nextCursor": next_cursor, "hasMore": has_more},
+        )
+
+    def _handle_audit_get(self, key: str) -> None:
+        params = parse_paging_query(urlsplit(self.path).query)
+        if params is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        after, limit = params
+        try:
+            page, next_cursor, has_more = self._store.get_key_operations(key, after, limit)
         except ValueError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
