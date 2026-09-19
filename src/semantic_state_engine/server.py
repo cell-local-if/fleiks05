@@ -12,7 +12,7 @@ import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 DATA_FORMAT_VERSION = 1
 
@@ -84,6 +84,92 @@ def parse_operation_payload(raw: bytes | str | dict[str, Any], replica_id: str) 
         "value": payload["value"],
         "clock": dict(clock),
     }
+
+
+SYNC_BATCH_MIN = 1
+SYNC_BATCH_MAX = 100
+SYNC_DEFAULT_LIMIT = 100
+
+
+def parse_sync_batch(raw: bytes | str | dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Parse and validate a sync-import batch.
+
+    The body must be a JSON object whose only key is ``operations`` holding
+    between 1 and 100 records; each record must contain exactly ``replicaId``
+    and ``operation`` and satisfy the live write constraints. Returns the
+    records in request order. Raises ValueError on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            document: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        document = raw
+    if not isinstance(document, dict) or set(document.keys()) != {"operations"}:
+        raise ValueError("body must be an object with only operations")
+    records_raw = document["operations"]
+    if not isinstance(records_raw, list) or not (SYNC_BATCH_MIN <= len(records_raw) <= SYNC_BATCH_MAX):
+        raise ValueError("operations must be a list of 1-100 records")
+
+    records: list[tuple[str, dict[str, Any]]] = []
+    for entry in records_raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {"replicaId", "operation"}:
+            raise ValueError("each record must have only replicaId and operation")
+        replica_id = entry["replicaId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise ValueError("replicaId must be a non-empty string")
+        try:
+            operation = parse_operation_payload(entry["operation"], replica_id)
+        except ValueError as exc:
+            raise ValueError(f"invalid operation: {exc}") from exc
+        records.append((replica_id, operation))
+    return records
+
+
+def _non_negative_int(token: str) -> int | None:
+    """Parse a base-10 non-negative integer token, or return None.
+
+    Only ASCII decimal digits are accepted, which rejects signs, decimals,
+    whitespace, blanks, and non-ASCII numerals.
+    """
+    if not token or any(ch < "0" or ch > "9" for ch in token):
+        return None
+    return int(token)
+
+
+def parse_sync_query(query: str) -> tuple[int, int] | None:
+    """Validate the sync-export query string.
+
+    Accepts only ``after`` (default 0) and ``limit`` (default 100, 1-100),
+    each non-negative integers with no repeats. Unknown parameters, malformed
+    or negative values, and out-of-range limits return None. Bounds on
+    ``after`` against the log length are checked by the store.
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    allowed = {"after", "limit"}
+    if not set(parsed) <= allowed:
+        return None
+    after = 0
+    limit = SYNC_DEFAULT_LIMIT
+    if "after" in parsed:
+        after_value = _non_negative_int(parsed["after"][0])
+        if after_value is None:
+            return None
+        after = after_value
+    if "limit" in parsed:
+        limit_value = _non_negative_int(parsed["limit"][0])
+        if limit_value is None or not (1 <= limit_value <= SYNC_BATCH_MAX):
+            return None
+        limit = limit_value
+    return after, limit
 
 
 class PersistenceError(Exception):
@@ -504,6 +590,92 @@ class StateStore:
             self._candidates[operation["key"]] = next_candidates
             return HTTPStatus.CREATED
 
+    def get_sync_operations(
+        self, after: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        """Return one page of the accepted-operation log from a single snapshot.
+
+        ``after`` is the number of records already skipped (a 0-based cursor)
+        and ``limit`` the page size. The slice, the returned cursor, and
+        ``has_more`` are all computed against the same snapshot under the
+        commit lock, so pages interleave cleanly with concurrent commits.
+        Returns ``(records, next_cursor, has_more)`` where ``next_cursor`` is
+        the number of records skipped after this page.
+        """
+        with self._lock:
+            total = len(self._accepted)
+            if after > total:
+                raise ValueError("after is past the end of the operation log")
+            page = [
+                {"replicaId": replica_id, "operation": operation}
+                for replica_id, operation in self._accepted[after : after + limit]
+            ]
+        next_cursor = after + len(page)
+        return page, next_cursor, next_cursor < total
+
+    def import_operations(
+        self, records: list[tuple[str, dict[str, Any]]]
+    ) -> tuple[HTTPStatus, int, int]:
+        """Import already-validated records sequentially as one atomic batch.
+
+        Records share the single commit order with local writes: the whole
+        batch is processed under one lock hold, so concurrent readers never
+        observe half a batch. Unknown identities are accepted with the same
+        write semantics as local requests; known identities with identical
+        content are replays, while a known identity with different content is
+        a conflict and changes nothing (memory, identity index, and data file
+        all stay as they were). With a data file, all new operations are
+        persisted in one atomic commit before memory becomes visible.
+
+        Returns ``(status, accepted, replayed)``: 201 when at least one new
+        operation was committed, 200 when every record was a replay, 409 when
+        any record conflicts (the batch is untouched).
+        """
+        with self._lock:
+            # Dry-run against the committed identities plus this batch. This
+            # both validates the whole batch and fixes its commit segment
+            # before anything is persisted or made visible.
+            staged = dict(self._operations)
+            new_records: list[tuple[str, dict[str, Any]]] = []
+            accepted = 0
+            replayed = 0
+            for replica_id, operation in records:
+                identity = (replica_id, operation["operationId"])
+                seen = staged.get(identity)
+                if seen is None:
+                    staged[identity] = operation
+                    new_records.append((replica_id, operation))
+                    accepted += 1
+                elif seen == operation:
+                    replayed += 1
+                else:
+                    return HTTPStatus.CONFLICT, 0, 0
+
+            if not new_records:
+                return HTTPStatus.OK, accepted, replayed
+
+            # Commit the new operations together. The atomic rename is the
+            # single durable commit point; memory and the identity index move
+            # only after it succeeds, so a failed durable commit leaves
+            # everything exactly as it was before the batch.
+            if self._data_file is not None:
+                previous_length = len(self._accepted)
+                self._accepted.extend(new_records)
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    del self._accepted[previous_length:]
+                    raise
+            else:
+                self._accepted.extend(new_records)
+            for replica_id, operation in new_records:
+                self._operations[(replica_id, operation["operationId"])] = operation
+                key = operation["key"]
+                self._candidates[key] = self._next_candidates(
+                    self._candidates.get(key, []), replica_id, operation
+                )
+            return HTTPStatus.CREATED, accepted, replayed
+
     def get_state(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
         with self._lock:
             candidates = list(self._candidates.get(key, []))
@@ -585,7 +757,59 @@ class RequestHandler(BaseHTTPRequestHandler):
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
             return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "sync"
+            and segments[2] == "operations"
+        ):
+            self._handle_sync_get()
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def _handle_sync_get(self) -> None:
+        params = parse_sync_query(urlsplit(self.path).query)
+        if params is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        after, limit = params
+        try:
+            page, next_cursor, has_more = self._store.get_sync_operations(after, limit)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json(
+            HTTPStatus.OK,
+            {"operations": page, "nextCursor": next_cursor, "hasMore": has_more},
+        )
+
+    def _handle_sync_post(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            records = parse_sync_batch(raw)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status, accepted, replayed = self._store.import_operations(records)
+        except PersistenceError:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json(status, {"error": "operation_conflict"})
+            return
+        self._json(
+            status,
+            {
+                "status": "created" if status is HTTPStatus.CREATED else "ok",
+                "accepted": accepted,
+                "replayed": replayed,
+            },
+        )
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         segments = self._path_segments()
@@ -621,6 +845,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "key": operation["key"],
             }
             self._json(status, payload)
+            return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "sync"
+            and segments[2] == "operations"
+        ):
+            self._handle_sync_post()
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
