@@ -40,6 +40,20 @@ def clock_dominates(clock_a: dict[str, int], clock_b: dict[str, int]) -> bool:
     return strictly_greater
 
 
+def _validate_clock(clock: Any, replica_id: str) -> dict[str, int]:
+    """Validate a vector clock for ``replica_id`` and return a clean copy."""
+    if not isinstance(clock, dict) or not clock:
+        raise ValueError("clock must be a non-empty object")
+    for component, tick in clock.items():
+        if not isinstance(component, str) or component == "":
+            raise ValueError("clock components must be non-empty strings")
+        if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
+            raise ValueError("clock values must be non-negative integers")
+    if replica_id not in clock:
+        raise ValueError("clock must contain the replica id")
+    return dict(clock)
+
+
 def parse_operation_payload(raw: bytes | str | dict[str, Any], replica_id: str) -> dict[str, Any]:
     """Parse and validate an operation payload for ``replica_id``.
 
@@ -67,22 +81,84 @@ def parse_operation_payload(raw: bytes | str | dict[str, Any], replica_id: str) 
         if not isinstance(value, str) or value == "":
             raise ValueError(f"{field} must be a non-empty string")
 
-    clock = payload.get("clock")
-    if not isinstance(clock, dict) or not clock:
-        raise ValueError("clock must be a non-empty object")
-    for component, tick in clock.items():
-        if not isinstance(component, str) or component == "":
-            raise ValueError("clock components must be non-empty strings")
-        if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
-            raise ValueError("clock values must be non-negative integers")
-    if replica_id not in clock:
-        raise ValueError("clock must contain the replica id")
+    clock = _validate_clock(payload.get("clock"), replica_id)
 
     return {
         "operationId": payload["operationId"],
         "key": payload["key"],
         "value": payload["value"],
         "clock": dict(clock),
+    }
+
+
+def parse_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
+    """Parse and validate a conflict-resolution request body.
+
+    The body must be a JSON object with exactly ``replicaId``,
+    ``operationId``, ``value``, ``clock``, and ``candidates``. The first
+    four follow the live operation constraints (the key comes from the
+    request path); ``candidates`` is a non-empty list of distinct
+    ``{"replicaId", "operationId"}`` identities. Returns a normalized
+    resolution dict. Raises ValueError on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            payload: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or set(payload.keys()) != {
+        "replicaId",
+        "operationId",
+        "value",
+        "clock",
+        "candidates",
+    }:
+        raise ValueError(
+            "payload must be an object with only replicaId, operationId, value, clock, candidates"
+        )
+
+    replica_id = payload["replicaId"]
+    if not isinstance(replica_id, str) or replica_id == "":
+        raise ValueError("replicaId must be a non-empty string")
+    for field in ("operationId", "value"):
+        value = payload.get(field)
+        if not isinstance(value, str) or value == "":
+            raise ValueError(f"{field} must be a non-empty string")
+    clock = _validate_clock(payload.get("clock"), replica_id)
+
+    candidates_raw = payload["candidates"]
+    if not isinstance(candidates_raw, list) or not candidates_raw:
+        raise ValueError("candidates must be a non-empty list")
+    candidates: list[dict[str, str]] = []
+    identities: set[tuple[str, str]] = set()
+    for entry in candidates_raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {"replicaId", "operationId"}:
+            raise ValueError("each candidate must have only replicaId and operationId")
+        candidate_replica = entry["replicaId"]
+        candidate_operation = entry["operationId"]
+        if not isinstance(candidate_replica, str) or candidate_replica == "":
+            raise ValueError("candidate replicaId must be a non-empty string")
+        if not isinstance(candidate_operation, str) or candidate_operation == "":
+            raise ValueError("candidate operationId must be a non-empty string")
+        identity = (candidate_replica, candidate_operation)
+        if identity in identities:
+            raise ValueError(f"duplicate candidate {identity!r}")
+        identities.add(identity)
+        candidates.append({"replicaId": candidate_replica, "operationId": candidate_operation})
+
+    return {
+        "replicaId": replica_id,
+        "operationId": payload["operationId"],
+        "value": payload["value"],
+        "clock": clock,
+        "candidates": candidates,
     }
 
 
@@ -590,6 +666,77 @@ class StateStore:
             self._candidates[operation["key"]] = next_candidates
             return HTTPStatus.CREATED
 
+    def apply_resolution(self, key: str, resolution: dict[str, Any]) -> tuple[HTTPStatus, str | None]:
+        """Apply a validated conflict resolution for ``key``.
+
+        A resolution commits as an ordinary operation in the shared commit
+        order: because its clock dominates every current candidate, the
+        normal candidate semantics atomically clear the dominated candidates
+        and leave the resolution value as the only version. The operation
+        therefore flows through sync export/import and the data file exactly
+        like a local write.
+
+        Returns ``(status, error)``: 201/200 with ``error=None`` on
+        commit/replay, or 409 with ``"operation_conflict"`` (known identity,
+        different content) or ``"resolution_conflict"`` (missing key, key not
+        in conflict, or candidate-set mismatch). Raises ValueError when a
+        candidate identity is unknown or the clock does not dominate every
+        candidate; raises PersistenceError when the durable commit fails, in
+        which case memory, the identity index, and the file are unchanged.
+        """
+        replica_id = resolution["replicaId"]
+        operation = {
+            "operationId": resolution["operationId"],
+            "key": key,
+            "value": resolution["value"],
+            "clock": resolution["clock"],
+        }
+        with self._lock:
+            identity = (replica_id, operation["operationId"])
+            seen = self._operations.get(identity)
+            if seen is not None:
+                if seen == operation:
+                    return HTTPStatus.OK, None
+                return HTTPStatus.CONFLICT, "operation_conflict"
+
+            # Every listed candidate must name a known operation, and the
+            # resolution clock must dominate each candidate's clock.
+            for candidate in resolution["candidates"]:
+                candidate_identity = (candidate["replicaId"], candidate["operationId"])
+                known = self._operations.get(candidate_identity)
+                if known is None:
+                    raise ValueError(f"unknown candidate identity {candidate_identity!r}")
+                if not clock_dominates(operation["clock"], known["clock"]):
+                    raise ValueError("clock does not dominate every candidate")
+
+            current = self._candidates.get(key, [])
+            if not current:
+                return HTTPStatus.CONFLICT, "resolution_conflict"
+            if all(c["value"] == current[0]["value"] for c in current):
+                return HTTPStatus.CONFLICT, "resolution_conflict"
+            current_identities = {(c["replicaId"], c["operationId"]) for c in current}
+            requested_identities = {
+                (c["replicaId"], c["operationId"]) for c in resolution["candidates"]
+            }
+            if current_identities != requested_identities:
+                return HTTPStatus.CONFLICT, "resolution_conflict"
+
+            next_candidates = self._next_candidates(current, replica_id, operation)
+            if self._data_file is not None:
+                # Same commit discipline as local writes: the atomic rename
+                # is the single commit point, and memory moves only after it.
+                self._accepted.append((replica_id, operation))
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    self._accepted.pop()
+                    raise
+            else:
+                self._accepted.append((replica_id, operation))
+            self._operations[identity] = operation
+            self._candidates[key] = next_candidates
+            return HTTPStatus.CREATED, None
+
     def get_sync_operations(
         self, after: int, limit: int
     ) -> tuple[list[dict[str, Any]], int, bool]:
@@ -811,6 +958,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_resolve_post(self, key: str) -> None:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            resolution = parse_resolve_payload(raw)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status, error = self._store.apply_resolution(key, resolution)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        except PersistenceError:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json(status, {"error": error})
+            return
+        self._json(
+            status,
+            {
+                "status": "created" if status is HTTPStatus.CREATED else "ok",
+                "key": key,
+                "replicaId": resolution["replicaId"],
+                "operationId": resolution["operationId"],
+            },
+        )
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         segments = self._path_segments()
         if (
@@ -845,6 +1024,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "key": operation["key"],
             }
             self._json(status, payload)
+            return
+        if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "states"
+            and segments[3] == "resolve"
+        ):
+            self._handle_resolve_post(segments[2])
             return
         if (
             len(segments) == 3
