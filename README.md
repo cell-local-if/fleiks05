@@ -20,6 +20,16 @@ PYTHONPATH=src python3 -m semantic_state_engine.server --host 127.0.0.1 --port 8
 
 Unknown routes return HTTP 404 with `{"error":"not_found"}`. Responses use UTF-8 JSON and include an explicit content length.
 
+### Request body limits
+
+All four POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/sync/peers/{peerId}/checkpoint`) share one body-size contract:
+
+- The request body is limited to **1,048,576 raw UTF-8 bytes** (1 MiB). A body whose declared length is exactly the limit is processed by the normal endpoint semantics.
+- `Content-Length` is required and validated before anything else. It must be a plain ASCII decimal integer: a missing header, an empty value, a sign, whitespace, a negative number, non-ASCII digits, or multiple headers declaring conflicting lengths all return HTTP 400 with `{"error":"invalid_request"}` — the request is never treated as having an empty body. (Multiple headers are accepted only when every occurrence declares the same length.)
+- A declared length over the limit returns HTTP 413 with `{"error":"payload_too_large"}` **before the body is read**, before JSON parsing, and before the commit lock or any memory/data-file state is touched — an over-limit declaration is rejected on its size alone, even when the content would also have been invalid.
+- When the declared length is within the limit, exactly that many bytes are read and the endpoint's existing JSON and field validation, status codes, batch atomicity, idempotency, and persistence-failure semantics apply unchanged.
+- A rejected request (400 or 413) adds no operation, candidate, checkpoint, or audit record and creates no temporary persistence file; memory and the data file are exactly as they were before the request.
+
 ### Local persistence and recovery (optional)
 
 The service is purely in memory by default. Pass `--data-file PATH` to persist every accepted operation to a file and recover it on startup:
