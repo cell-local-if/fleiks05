@@ -22,7 +22,7 @@ Unknown routes return HTTP 404 with `{"error":"not_found"}`. Responses use UTF-8
 
 ### Request body limits
 
-All four POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/sync/peers/{peerId}/checkpoint`) share one body-size contract:
+All five POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/sync/peers/{peerId}/checkpoint`) share one body-size contract:
 
 - The request body is limited to **1,048,576 raw UTF-8 bytes** (1 MiB). A body whose declared length is exactly the limit is processed by the normal endpoint semantics.
 - `Content-Length` is required and validated before anything else. It must be a plain ASCII decimal integer: a missing header, an empty value, a sign, whitespace, a negative number, non-ASCII digits, or multiple headers declaring conflicting lengths all return HTTP 400 with `{"error":"invalid_request"}` — the request is never treated as having an empty body. (Multiple headers are accepted only when every occurrence declares the same length.)
@@ -69,7 +69,7 @@ PYTHONPATH=src python3 -m semantic_state_engine.server --auth-token-file ./var/t
 - The token file is read and validated **before the service begins listening**. It must be a readable regular file whose entire content is exactly one non-empty ASCII printable token — no whitespace, no newlines, nothing before or after it. A missing, unreadable, or non-regular target (for example a directory) and any format violation make startup fail with exit code 2, exactly like a rejected data file: no port is bound and the token is never printed.
 - `GET /health` stays anonymous. Every other route — known or unknown, GET or POST — requires the request to carry **exactly one** `Authorization` header whose value is exactly `Bearer ` (one space) followed by the token. A missing, duplicated, or malformed header and any token mismatch return HTTP 401 with `{"error":"unauthorized"}` and a `WWW-Authenticate: Bearer` response header — before route matching, query parsing, the commit lock, any state read, any data-file access, and any POST body read. The comparison uses the standard library's constant-time primitive.
 - A rejected request changes nothing: it creates no temporary file and leaves memory, logs, checkpoints, audit streams, and the data file exactly as they were; the token is never leaked in responses or logs.
-- The four POST endpoints keep their Content-Length priority: a missing/malformed declaration still returns 400 and an over-limit declaration still returns 413 **before** authentication is checked. When the declared length is valid but the request is unauthorized, the 401 is sent **without reading the body** and the connection is closed.
+- The five POST endpoints keep their Content-Length priority: a missing/malformed declaration still returns 400 and an over-limit declaration still returns 413 **before** authentication is checked. When the declared length is valid but the request is unauthorized, the 401 is sent **without reading the body** and the connection is closed.
 - Once a request is authenticated, every existing behavior — success codes, 400/404/409/500, paging, digests, idempotency, concurrency, and recovery — is exactly as documented for the anonymous service.
 - The authentication configuration is never written to the data file: a `--data-file` restart recovers only operations and checkpoints, and the token is supplied again (or not) via the command line on each start.
 
@@ -166,6 +166,27 @@ A resolution commits only when the key is currently in conflict, the listed set 
 - The same `(replicaId, operationId)` replayed with identical content: HTTP 200 with `"status":"ok"` and no new log record; with different content: HTTP 409 with `{"error":"operation_conflict"}`; nothing changes.
 - With `--data-file`, the resolution is committed durably before the 201 response; a durable failure returns HTTP 500 `{"error":"internal_error"}` and leaves memory, the identity index, and the file exactly as they were (the request can be retried).
 
+### Deterministic automatic conflict resolution
+
+`POST /v1/states/{key}/resolve/auto` resolves a conflict without the caller naming a value or candidate set. The body is a JSON object with exactly these keys:
+
+```json
+{"replicaId":"r3","operationId":"auto-fix-1","clock":{"r1":1,"r2":1,"r3":1},"policy":"lowest_identity"}
+```
+
+- `replicaId`, `operationId`, `clock` follow the same constraints as a manual resolution (the key comes from the path; the clock must contain `replicaId`).
+- `policy` must be the literal string `"lowest_identity"`. Any other shape, field, or value is HTTP 400 `{"error":"invalid_request"}`.
+- There is no `value` and no `candidates` list: both are determined by the server from the key's current candidates.
+
+The request commits only when the key currently holds different value candidates. The resolution value is then chosen deterministically as the value of the current candidate with the lexicographically smallest `(replicaId, operationId)` (ties on value do not matter — the minimum identity is unique), and the request clock must dominate **every** current candidate. The resolution is accepted atomically as one operation in the shared commit order, exactly like a manual resolution: the dominated candidates are cleared and the chosen value becomes the only version. Because it is an ordinary accepted operation, it is exported by `GET /v1/sync/operations` (as the chosen `value` together with the request's `replicaId`/`operationId`/`clock`), imported by `POST /v1/sync/operations`, appears in the key's audit stream and audit digest, counts in every metrics counter under the initiating replica, is persisted to `--data-file`, and is recovered on restart.
+
+- Success: HTTP 201 with `{"status":"created","key","replicaId","operationId","value","policy"}`, where `value` is the chosen candidate's value and `policy` is `"lowest_identity"`.
+- A malformed body or a clock that is invalid or does not dominate every current candidate: HTTP 400 with `{"error":"invalid_request"}`; nothing changes.
+- The key does not exist, its candidates all already agree on one value, or the candidate set moved between validation and commit: HTTP 409 with `{"error":"resolution_conflict"}`; nothing changes.
+- The same `(replicaId, operationId)` replayed with the same identity content is HTTP 200 with `{"status":"ok","key","replicaId","operationId","value","policy"}` and appends no log record (the deterministic value is reported back); a known identity with different content is HTTP 409 with `{"error":"operation_conflict"}`. Identity replay is answered from the committed operation, so replaying after the key has moved on neither re-resolves nor appends.
+- Automatic and manual resolutions share one identity space with ordinary writes: a `(replicaId, operationId)` already used by a write or a manual resolution replays/conflicts by the same rules.
+- With `--data-file`, the operation is persisted (write temp file → fsync → rename → fsync directory) before the 201 response; a durable failure returns HTTP 500 `{"error":"internal_error"}` and leaves memory, the identity index, and the file exactly as they were (the request can be retried). After a restart the chosen value, replay `200`, and conflict `409` are identical to a process that never restarted.
+
 ### Incremental sync between replicas
 
 Two additional endpoints stream the accepted-operation log between replicas. The existing endpoints, payloads, and status codes are unchanged; a sync record is simply the path `replicaId` paired with an otherwise ordinary `operation`.
@@ -225,7 +246,7 @@ With `--data-file`, a new or advanced checkpoint is written to the data file in 
 The stream contains every first-accepted operation for the key, including:
 
 - stale writes whose clock was already dominated and therefore added no candidate, and
-- conflict repairs accepted through `POST /v1/states/{key}/resolve`.
+- conflict repairs accepted through `POST /v1/states/{key}/resolve` or `POST /v1/states/{key}/resolve/auto`.
 
 It never contains operations for other keys, identical replays (`200`), conflicting or malformed requests (`409`/`400`), or uncommitted requests.
 
@@ -249,7 +270,7 @@ With `--data-file`, the audit reads exactly the same durable log that sync expor
 - `digest` is the 64-character lowercase hexadecimal SHA-256 of the canonical audit-stream bytes described below.
 - `operations` is the number of accepted operations for the key — the length of the stream returned by `GET /v1/audit/keys/{key}/operations` (counting every page).
 
-The digest covers the key's **entire audit stream** in global commit order: every first-accepted operation for the key, including stale writes whose clock was already dominated (and which therefore added no candidate) and conflict repairs accepted through `POST /v1/states/{key}/resolve`. It never covers operations for other keys, identical replays (`200`), conflicting or malformed requests (`409`/`400`), or operations whose durable commit failed. A key with no history hashes the empty stream.
+The digest covers the key's **entire audit stream** in global commit order: every first-accepted operation for the key, including stale writes whose clock was already dominated (and which therefore added no candidate) and conflict repairs accepted through `POST /v1/states/{key}/resolve` or its deterministic variant `POST /v1/states/{key}/resolve/auto`. It never covers operations for other keys, identical replays (`200`), conflicting or malformed requests (`409`/`400`), or operations whose durable commit failed. A key with no history hashes the empty stream.
 
 The hash input is a compact UTF-8 JSON array with one element per accepted operation for the key, in global commit order:
 
