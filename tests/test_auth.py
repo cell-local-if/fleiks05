@@ -23,8 +23,9 @@ AUTH_HEADER = f"Bearer {TOKEN}"
 OP_PATH = "/v1/replicas/r1/operations"
 SYNC_PATH = "/v1/sync/operations"
 RESOLVE_PATH = "/v1/states/k/resolve"
+RESOLVE_AUTO_PATH = "/v1/states/k/resolve/auto"
 CHECKPOINT_PATH = "/v1/sync/peers/peer-a/checkpoint"
-ALL_POST_PATHS = (OP_PATH, SYNC_PATH, RESOLVE_PATH, CHECKPOINT_PATH)
+ALL_POST_PATHS = (OP_PATH, SYNC_PATH, RESOLVE_PATH, RESOLVE_AUTO_PATH, CHECKPOINT_PATH)
 
 OVER_LIMIT = str(MAX_BODY_BYTES + 1)
 

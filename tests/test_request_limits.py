@@ -16,8 +16,9 @@ from semantic_state_engine.server import (
 OP_PATH = "/v1/replicas/r1/operations"
 SYNC_PATH = "/v1/sync/operations"
 RESOLVE_PATH = "/v1/states/k/resolve"
+RESOLVE_AUTO_PATH = "/v1/states/k/resolve/auto"
 CHECKPOINT_PATH = "/v1/sync/peers/peer-a/checkpoint"
-ALL_POST_PATHS = (OP_PATH, SYNC_PATH, RESOLVE_PATH, CHECKPOINT_PATH)
+ALL_POST_PATHS = (OP_PATH, SYNC_PATH, RESOLVE_PATH, RESOLVE_AUTO_PATH, CHECKPOINT_PATH)
 
 OVER_LIMIT = str(MAX_BODY_BYTES + 1)
 
@@ -80,7 +81,7 @@ class RequestLimitTests(unittest.TestCase):
             OP_PATH, {"operationId": op_id, "key": key, "value": value, "clock": clock}
         )
 
-    # -- Content-Length validation, uniform across all four POST endpoints --
+    # -- Content-Length validation, uniform across all five POST endpoints --
 
     def test_missing_content_length_is_400_on_all_post_endpoints(self) -> None:
         for path in ALL_POST_PATHS:

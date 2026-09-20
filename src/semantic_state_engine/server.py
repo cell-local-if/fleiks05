@@ -164,6 +164,59 @@ def parse_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
     }
 
 
+AUTO_RESOLVE_POLICY = "lowest_identity"
+
+
+def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
+    """Parse and validate an automatic conflict-resolution request body.
+
+    The body must be a JSON object with exactly ``replicaId``,
+    ``operationId``, ``clock``, and ``policy`` (the resolved value is chosen
+    by the server, and the key comes from the request path). The identity
+    and clock fields follow the live operation constraints, and ``policy``
+    must be ``"lowest_identity"``, the only supported policy. Returns a
+    normalized dict. Raises ValueError on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            payload: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or set(payload.keys()) != {
+        "replicaId",
+        "operationId",
+        "clock",
+        "policy",
+    }:
+        raise ValueError(
+            "payload must be an object with only replicaId, operationId, clock, policy"
+        )
+
+    replica_id = payload["replicaId"]
+    if not isinstance(replica_id, str) or replica_id == "":
+        raise ValueError("replicaId must be a non-empty string")
+    operation_id = payload["operationId"]
+    if not isinstance(operation_id, str) or operation_id == "":
+        raise ValueError("operationId must be a non-empty string")
+    if payload["policy"] != AUTO_RESOLVE_POLICY:
+        raise ValueError(f"policy must be {AUTO_RESOLVE_POLICY!r}")
+    clock = _validate_clock(payload.get("clock"), replica_id)
+
+    return {
+        "replicaId": replica_id,
+        "operationId": operation_id,
+        "clock": clock,
+        "policy": AUTO_RESOLVE_POLICY,
+    }
+
+
 SYNC_BATCH_MIN = 1
 SYNC_BATCH_MAX = 100
 SYNC_DEFAULT_LIMIT = 100
@@ -1028,6 +1081,80 @@ class StateStore:
             self._candidates[key] = next_candidates
             return HTTPStatus.CREATED, None
 
+    def apply_auto_resolution(
+        self, key: str, request: dict[str, Any]
+    ) -> tuple[HTTPStatus, str | None, str | None]:
+        """Deterministically repair a conflicting ``key`` without a client value.
+
+        The only policy is ``lowest_identity``: when the key currently holds
+        candidates with distinct values, the winning value is copied from the
+        candidate with the lexicographically smallest
+        ``(replicaId, operationId)``. The resolution then commits exactly like
+        :meth:`apply_resolution` — an ordinary operation whose clock dominates
+        every current candidate, so the normal candidate semantics clear them
+        atomically and leave the chosen value as the only version. It therefore
+        flows through sync export/import, the audit, metrics, the verification
+        digest, and the data file exactly like a local write or a manual repair.
+
+        Returns ``(status, error, value)``: 201/200 with ``error=None`` and the
+        resolved ``value`` on commit/replay, or 409 with ``"operation_conflict"``
+        (known identity, different content) or ``"resolution_conflict"``
+        (missing key or key not currently in conflict between distinct values).
+        Raises ValueError when the clock does not dominate every current
+        candidate; raises PersistenceError when the durable commit fails, in
+        which case memory, the identity index, and the file are unchanged.
+        """
+        replica_id = request["replicaId"]
+        operation_id = request["operationId"]
+        with self._lock:
+            identity = (replica_id, operation_id)
+            seen = self._operations.get(identity)
+            if seen is not None:
+                # The value is server-derived rather than request content, so
+                # an identical replay is the same identity on the same key
+                # with the same clock; any other content is a conflict.
+                if seen["key"] == key and seen["clock"] == request["clock"]:
+                    return HTTPStatus.OK, None, seen["value"]
+                return HTTPStatus.CONFLICT, "operation_conflict", None
+
+            current = self._candidates.get(key, [])
+
+            # Validation precedes the conflict-state precondition, exactly as
+            # for a manual repair: the request clock must dominate every
+            # current candidate before the request is applicable at all.
+            for candidate in current:
+                if not clock_dominates(request["clock"], candidate["clock"]):
+                    raise ValueError("clock does not dominate every candidate")
+
+            # The policy is meaningful only while distinct values compete.
+            if not current or not any(c["value"] != current[0]["value"] for c in current):
+                return HTTPStatus.CONFLICT, "resolution_conflict", None
+
+            chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+            operation = {
+                "operationId": operation_id,
+                "key": key,
+                "value": chosen["value"],
+                "clock": request["clock"],
+            }
+
+            next_candidates = self._next_candidates(current, replica_id, operation)
+            if self._data_file is not None:
+                # Same commit discipline as local writes and manual repairs:
+                # the atomic rename is the single commit point, and memory
+                # moves only after it.
+                self._accepted.append((replica_id, operation))
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    self._accepted.pop()
+                    raise
+            else:
+                self._accepted.append((replica_id, operation))
+            self._operations[identity] = operation
+            self._candidates[key] = next_candidates
+            return HTTPStatus.CREATED, None, chosen["value"]
+
     def get_sync_operations(
         self, after: int, limit: int
     ) -> tuple[list[dict[str, Any]], int, bool]:
@@ -1684,6 +1811,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_resolve_auto_post(self, key: str) -> None:
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            request = parse_auto_resolve_payload(raw)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status, error, value = self._store.apply_auto_resolution(key, request)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        except PersistenceError:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json(status, {"error": error})
+            return
+        self._json(
+            status,
+            {
+                "status": "created" if status is HTTPStatus.CREATED else "ok",
+                "key": key,
+                "replicaId": request["replicaId"],
+                "operationId": request["operationId"],
+                "value": value,
+                "policy": request["policy"],
+            },
+        )
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
         segments = self._path_segments()
@@ -1699,14 +1858,27 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "states"
             and segments[3] == "resolve"
         )
+        is_resolve_auto_post = (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "states"
+            and segments[3] == "resolve"
+            and segments[4] == "auto"
+        )
         is_sync_post = (
             len(segments) == 3
             and segments[0] == "v1"
             and segments[1] == "sync"
             and segments[2] == "operations"
         )
-        if matched or is_operation_post or is_resolve_post or is_sync_post:
-            # On the four POST endpoints the Content-Length contract keeps
+        if (
+            matched
+            or is_operation_post
+            or is_resolve_post
+            or is_resolve_auto_post
+            or is_sync_post
+        ):
+            # On the five POST endpoints the Content-Length contract keeps
             # its priority: a 400/413 is answered before authentication.
             # Authentication then runs before the body is read, the commit
             # lock is taken, or any state or data file is touched; an
@@ -1753,6 +1925,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_resolve_post:
             self._handle_resolve_post(segments[2])
+            return
+        if is_resolve_auto_post:
+            self._handle_resolve_auto_post(segments[2])
             return
         self._handle_sync_post()
 
