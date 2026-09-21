@@ -465,7 +465,10 @@ class AuthPersistenceTests(unittest.TestCase):
         self.assertEqual(status, 201)
         with open(self.data_path, "rb") as handle:
             document = json.loads(handle.read().decode("utf-8"))
-        self.assertLessEqual(set(document.keys()), {"version", "operations", "checkpoints"})
+        self.assertLessEqual(
+            set(document.keys()),
+            {"version", "operations", "checkpoints", "autoResolutions"},
+        )
         self.assertNotIn(TOKEN, json.dumps(document))
 
     def test_restart_recovers_state_and_still_requires_auth(self) -> None:
