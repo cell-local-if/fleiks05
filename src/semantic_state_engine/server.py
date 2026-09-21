@@ -164,15 +164,19 @@ def parse_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
     }
 
 
+AUTO_RESOLVE_POLICIES = ("lowest_identity", "highest_identity")
+
+
 def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
     """Parse and validate an automatic conflict-resolution request body.
 
     The body must be a JSON object with exactly ``replicaId``,
     ``operationId``, ``clock``, and ``policy``. The first three follow the
     live resolution constraints (the key and the chosen value come from the
-    server: the value is taken from the current candidate with the smallest
-    ``(replicaId, operationId)``); ``policy`` must be the literal string
-    ``"lowest_identity"``. Returns a normalized request dict. Raises
+    server: the value is taken from a current candidate selected by
+    ``policy``); ``policy`` must be one of ``"lowest_identity"`` (candidate
+    with the smallest ``(replicaId, operationId)``) or ``"highest_identity"``
+    (candidate with the largest). Returns a normalized request dict. Raises
     ValueError on any violation.
     """
     if isinstance(raw, (bytes, bytearray)):
@@ -204,14 +208,15 @@ def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, A
     if not isinstance(operation_id, str) or operation_id == "":
         raise ValueError("operationId must be a non-empty string")
     clock = _validate_clock(payload.get("clock"), replica_id)
-    if payload["policy"] != "lowest_identity":
-        raise ValueError("policy must be 'lowest_identity'")
+    policy = payload["policy"]
+    if policy not in AUTO_RESOLVE_POLICIES:
+        raise ValueError("policy must be 'lowest_identity' or 'highest_identity'")
 
     return {
         "replicaId": replica_id,
         "operationId": operation_id,
         "clock": clock,
-        "policy": "lowest_identity",
+        "policy": policy,
     }
 
 
@@ -596,16 +601,66 @@ def _validate_stored_checkpoints(
     return checkpoints
 
 
+def _validate_stored_policies(
+    document: Any, identities: set[tuple[str, str]]
+) -> dict[tuple[str, str], str]:
+    """Validate the optional ``policies`` section of a data file.
+
+    Returns a clean ``{(replicaId, operationId): policy}`` mapping. The
+    section is optional (a version:1 file written before automatic
+    resolutions recorded their policy simply has none); when present it must
+    be a list of ``{"replicaId", "operationId", "policy"}`` records with a
+    known policy string, one per identity, and every identity must name an
+    accepted operation, since a policy binding is committed atomically
+    together with its operation.
+    """
+    if "policies" not in document:
+        return {}
+    raw = document["policies"]
+    if not isinstance(raw, list):
+        raise PersistenceError("data file policies must be a list")
+    policies: dict[tuple[str, str], str] = {}
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {
+            "replicaId",
+            "operationId",
+            "policy",
+        }:
+            raise PersistenceError(
+                "each policy record must be an object with replicaId, operationId, policy"
+            )
+        replica_id = entry["replicaId"]
+        operation_id = entry["operationId"]
+        policy = entry["policy"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise PersistenceError("policy replicaId must be a non-empty string")
+        if not isinstance(operation_id, str) or operation_id == "":
+            raise PersistenceError("policy operationId must be a non-empty string")
+        if policy not in AUTO_RESOLVE_POLICIES:
+            raise PersistenceError(f"unknown stored policy: {policy!r}")
+        identity = (replica_id, operation_id)
+        if identity in policies:
+            raise PersistenceError(f"duplicate policy binding {identity!r} in data file")
+        if identity not in identities:
+            raise PersistenceError(
+                f"policy binding {identity!r} names no accepted operation"
+            )
+        policies[identity] = policy
+    return policies
+
+
 def load_data_file_full(
     path: str,
-) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int]]:
+) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int], dict[tuple[str, str], str]]:
     """Read and strictly validate a data file.
 
-    Returns the accepted operations in their original commit order and the
-    persisted ``{peerId: cursor}`` checkpoints (empty for a version:1 file
-    written before checkpoints existed). Raises PersistenceError when the
-    file is missing-readable, not UTF-8 JSON, has an unexpected structure,
-    or contains records or checkpoints violating the live constraints.
+    Returns the accepted operations in their original commit order, the
+    persisted ``{peerId: cursor}`` checkpoints, and the persisted
+    ``{(replicaId, operationId): policy}`` automatic-resolution policy
+    bindings (both empty for a version:1 file written before those sections
+    existed). Raises PersistenceError when the file is missing-readable, not
+    UTF-8 JSON, has an unexpected structure, or contains records, checkpoints,
+    or policy bindings violating the live constraints.
     """
     try:
         with open(path, "rb") as handle:
@@ -623,10 +678,11 @@ def load_data_file_full(
         "version",
         "operations",
         "checkpoints",
+        "policies",
     } or "version" not in document or "operations" not in document:
         raise PersistenceError(
             "data file root must be an object with version and operations "
-            "and optionally checkpoints"
+            "and optionally checkpoints and policies"
         )
     version = document["version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != DATA_FORMAT_VERSION:
@@ -645,28 +701,29 @@ def load_data_file_full(
         identities.add(identity)
         records.append((replica_id, operation))
     checkpoints = _validate_stored_checkpoints(document, len(records))
-    return records, checkpoints
+    policies = _validate_stored_policies(document, identities)
+    return records, checkpoints, policies
 
 
 def load_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
     """Read and strictly validate a data file, returning its operations.
 
     Thin wrapper over :func:`load_data_file_full` for callers that only
-    need the accepted-operation log; persisted checkpoints are validated
-    the same way but not returned.
+    need the accepted-operation log; persisted checkpoints and policy
+    bindings are validated the same way but not returned.
     """
-    records, _ = load_data_file_full(path)
+    records, _, _ = load_data_file_full(path)
     return records
 
 
 def ensure_data_file(
     path: str,
-) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int]]:
+) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int], dict[tuple[str, str], str]]:
     """Validate the data-file location and return its committed state.
 
     A missing target file is accepted (its parent directory must exist and
     be writable); an existing target must be a regular, parseable data
-    file. Returns ``(records, checkpoints)``. Anything else raises
+    file. Returns ``(records, checkpoints, policies)``. Anything else raises
     PersistenceError.
     """
     parent = os.path.dirname(os.path.abspath(path))
@@ -682,7 +739,7 @@ def ensure_data_file(
         if not stat.S_ISREG(mode):
             raise PersistenceError(f"data file path is not a regular file: {path!r}")
         return load_data_file_full(path)
-    return [], {}
+    return [], {}, {}
 
 
 def _fsync_directory(directory: str) -> None:
@@ -883,6 +940,10 @@ class StateStore:
         self._operations: dict[tuple[str, str], dict[str, Any]] = {}
         self._accepted: list[tuple[str, dict[str, Any]]] = []
         self._checkpoints: dict[str, int] = {}
+        # Policy bindings of accepted automatic resolutions, keyed by the
+        # operation identity. An identity absent here (a plain write, a
+        # manual resolution, or an imported operation) carries no policy.
+        self._policies: dict[tuple[str, str], str] = {}
         self._data_file: str | None = None
         if data_file is not None:
             path = os.path.abspath(data_file)
@@ -890,11 +951,12 @@ class StateStore:
             # file is never touched by the probe and is opened only for
             # reading afterwards.
             preflight_data_file_directory(path)
-            records, checkpoints = ensure_data_file(path)
+            records, checkpoints, policies = ensure_data_file(path)
             with self._lock:
                 for replica_id, operation in records:
                     self._commit_locked(replica_id, operation)
                 self._checkpoints = dict(checkpoints)
+                self._policies = dict(policies)
                 self._data_file = path
                 if not records and not os.path.exists(path):
                     # The target is missing and the preflight proved the
@@ -948,6 +1010,17 @@ class StateStore:
                 for replica_id, operation in self._accepted
             ],
             "checkpoints": dict(self._checkpoints),
+            # Policy bindings ride along in commit order, so each binding is
+            # durable in the same atomic commit as its operation.
+            "policies": [
+                {
+                    "replicaId": replica_id,
+                    "operationId": operation["operationId"],
+                    "policy": self._policies[(replica_id, operation["operationId"])],
+                }
+                for replica_id, operation in self._accepted
+                if (replica_id, operation["operationId"]) in self._policies
+            ],
         }
         data = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
         directory = os.path.dirname(self._data_file)
@@ -1082,26 +1155,34 @@ class StateStore:
     def apply_auto_resolution(
         self, key: str, request: dict[str, Any]
     ) -> tuple[HTTPStatus, dict[str, Any] | None, str | None]:
-        """Apply a validated automatic ``lowest_identity`` resolution for ``key``.
+        """Apply a validated automatic resolution for ``key``.
 
         Unlike :meth:`apply_resolution`, neither the value nor the candidate
         set come from the request: the key must currently hold candidates
         with at least two distinct values, and the resolution value is taken
-        deterministically from the current candidate with the smallest
-        ``(replicaId, operationId)``. The request clock must dominate every
-        current candidate. The resolution then commits exactly like a manual
-        resolution — one ordinary operation in the shared commit order, so it
-        flows through sync export/import, the audit streams, the metrics, and
-        the data file identically.
+        deterministically from a current candidate selected by the request
+        policy — the smallest ``(replicaId, operationId)`` for
+        ``lowest_identity``, the largest for ``highest_identity``. The
+        request clock must dominate every current candidate. The resolution
+        then commits exactly like a manual resolution — one ordinary
+        operation in the shared commit order, so it flows through sync
+        export/import, the audit streams, the metrics, and the data file
+        identically.
+
+        The identity is bound to the key, the clock, and the policy: a
+        replay with the same binding is answered from the committed
+        operation, and any difference — including a different policy under
+        an otherwise identical request — is an operation conflict. The
+        binding is persisted atomically with the operation.
 
         Returns ``(status, operation, error)``: 201/200 carry the committed
         (or previously seen) operation and ``error=None``, or 409 carries
-        ``"operation_conflict"`` (known identity, different content) or
+        ``"operation_conflict"`` (known identity, different binding) or
         ``"resolution_conflict"`` (an unseen identity for a missing key or a
         key not currently in value conflict). Raises ValueError when the
         clock does not dominate every candidate; raises PersistenceError when
         the durable commit fails, in which case memory, the identity index,
-        and the file are unchanged.
+        the policy bindings, and the file are unchanged.
         """
         replica_id = request["replicaId"]
         operation = {
@@ -1117,19 +1198,20 @@ class StateStore:
             # Identity replay semantics share the write/manual-resolution
             # rule and take precedence over the live conflict precondition.
             # The request carries no value of its own (the policy derives
-            # it server-side), so identity "content" is just key plus
-            # clock: a replay is answered from the committed operation and
-            # reports the value that was originally chosen, however the
-            # candidate set has moved since. A different key or clock under
-            # the same identity is an operation conflict.
+            # it server-side), so the identity binding is key plus clock
+            # plus policy: a replay of the same binding is answered from
+            # the committed operation and reports the value that was
+            # originally chosen, however the candidate set has moved since.
+            # A different key, clock, or policy under the same identity is
+            # an operation conflict; an identity committed without a policy
+            # binding (a plain write, a manual resolution, or an imported
+            # operation) never matches a policy-carrying request.
             if seen is not None:
-                replayed = {
-                    "operationId": operation["operationId"],
-                    "key": key,
-                    "value": seen["value"],
-                    "clock": operation["clock"],
-                }
-                if seen == replayed:
+                if (
+                    seen["key"] == key
+                    and seen["clock"] == operation["clock"]
+                    and self._policies.get(identity) == request["policy"]
+                ):
                     return HTTPStatus.OK, seen, None
                 return HTTPStatus.CONFLICT, None, "operation_conflict"
 
@@ -1137,9 +1219,12 @@ class StateStore:
             if not current or all(c["value"] == current[0]["value"] for c in current):
                 return HTTPStatus.CONFLICT, None, "resolution_conflict"
 
-            # Deterministic policy: the candidate with the smallest
-            # (replicaId, operationId) supplies the resolution value.
-            chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+            # Deterministic policy: the candidate with the smallest or
+            # largest (replicaId, operationId) supplies the resolution value.
+            if request["policy"] == "highest_identity":
+                chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
+            else:
+                chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
             operation["value"] = chosen["value"]
 
             if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
@@ -1149,15 +1234,19 @@ class StateStore:
             if self._data_file is not None:
                 # Same commit discipline as manual resolutions and writes:
                 # the atomic rename is the single commit point, and memory
-                # moves only after it.
+                # moves only after it. The policy binding is staged together
+                # with the operation so both are durable in one commit.
                 self._accepted.append((replica_id, operation))
+                self._policies[identity] = request["policy"]
                 try:
                     self._persist_locked()
                 except BaseException:
                     self._accepted.pop()
+                    del self._policies[identity]
                     raise
             else:
                 self._accepted.append((replica_id, operation))
+                self._policies[identity] = request["policy"]
             self._operations[identity] = operation
             self._candidates[key] = next_candidates
             return HTTPStatus.CREATED, operation, None

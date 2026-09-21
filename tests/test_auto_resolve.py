@@ -4,7 +4,9 @@ The endpoint is::
 
     POST /v1/states/{key}/resolve/auto
 
-Everything here goes through the real HTTP entry point
+with two policies: ``lowest_identity`` (the value of the candidate with the
+smallest ``(replicaId, operationId)``) and ``highest_identity`` (the
+largest). Everything here goes through the real HTTP entry point
 (``SemanticStateServer`` + a request thread); only the Python standard
 library is used.
 """
@@ -26,6 +28,7 @@ from semantic_state_engine.server import (
     SemanticStateServer,
     StateStore,
     load_data_file,
+    load_data_file_full,
     parse_auto_resolve_payload,
 )
 
@@ -34,12 +37,14 @@ def operation(operation_id: str, key: str, value: str, clock: dict) -> dict:
     return {"operationId": operation_id, "key": key, "value": value, "clock": clock}
 
 
-def auto_request(replica: str, operation_id: str, clock: dict) -> dict:
+def auto_request(
+    replica: str, operation_id: str, clock: dict, policy: str = "lowest_identity"
+) -> dict:
     return {
         "replicaId": replica,
         "operationId": operation_id,
         "clock": clock,
-        "policy": "lowest_identity",
+        "policy": policy,
     }
 
 
@@ -55,6 +60,22 @@ class ParseAutoResolvePayloadTests(unittest.TestCase):
                 "operationId": "fix-1",
                 "clock": {"r1": 1, "r2": 1, "r3": 1},
                 "policy": "lowest_identity",
+            },
+        )
+
+    def test_valid_highest_identity_payload_is_normalized(self) -> None:
+        payload = parse_auto_resolve_payload(
+            json.dumps(
+                auto_request("r3", "fix-1", {"r3": 1}, policy="highest_identity")
+            )
+        )
+        self.assertEqual(
+            payload,
+            {
+                "replicaId": "r3",
+                "operationId": "fix-1",
+                "clock": {"r3": 1},
+                "policy": "highest_identity",
             },
         )
 
@@ -80,8 +101,11 @@ class ParseAutoResolvePayloadTests(unittest.TestCase):
             dict(valid, clock={"r3": -1}),
             dict(valid, clock={"r3": True}),
             dict(valid, policy=""),
-            dict(valid, policy="highest_identity"),
+            dict(valid, policy="lowest"),
+            dict(valid, policy="Lowest_Identity"),
+            dict(valid, policy="highest"),
             dict(valid, policy=42),
+            dict(valid, policy=None),
         ]
         for body in bad_bodies:
             with self.assertRaises(ValueError, msg=repr(body)):
@@ -156,8 +180,10 @@ class HttpServerTestCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(state["status"], "conflict")
 
-    def good_auto_request(self, operation_id: str = "fix-1") -> dict:
-        return auto_request("r3", operation_id, {"r1": 1, "r2": 1, "r3": 1})
+    def good_auto_request(
+        self, operation_id: str = "fix-1", policy: str = "lowest_identity"
+    ) -> dict:
+        return auto_request("r3", operation_id, {"r1": 1, "r2": 1, "r3": 1}, policy)
 
 
 class AutoResolveHappyPathTests(HttpServerTestCase):
@@ -188,6 +214,35 @@ class AutoResolveHappyPathTests(HttpServerTestCase):
             },
         )
 
+    def test_highest_identity_value_is_chosen(self) -> None:
+        self.seed_conflict()
+        status, payload = self.post_auto(
+            "k", self.good_auto_request(policy="highest_identity")
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            payload,
+            {
+                "status": "created",
+                "key": "k",
+                "replicaId": "r3",
+                "operationId": "fix-1",
+                "value": "v2",
+                "policy": "highest_identity",
+            },
+        )
+        status, state = self.get_state("k")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            state,
+            {
+                "key": "k",
+                "value": "v2",
+                "clock": {"r1": 1, "r2": 1, "r3": 1},
+                "status": "resolved",
+            },
+        )
+
     def test_identity_ordering_not_value_ordering_decides(self) -> None:
         # The lexicographically smallest identity carries the
         # lexicographically largest value; its value still wins.
@@ -196,6 +251,16 @@ class AutoResolveHappyPathTests(HttpServerTestCase):
         status, payload = self.post_auto("k", self.good_auto_request())
         self.assertEqual(status, 201)
         self.assertEqual(payload["value"], "zzz")
+        # Under the highest policy the other candidate's value wins, however
+        # the values sort.
+        self.server.store = type(self.server.store)()
+        self.post_operation("r1", operation("o1", "k", "zzz", {"r1": 1}))
+        self.post_operation("r2", operation("o2", "k", "aaa", {"r2": 1}))
+        status, payload = self.post_auto(
+            "k", self.good_auto_request(policy="highest_identity")
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["value"], "aaa")
 
     def test_tuple_ordering_uses_replica_before_operation(self) -> None:
         # ("r1", "zzz") sorts before ("r2", "aaa"): replica id is the first
@@ -205,6 +270,15 @@ class AutoResolveHappyPathTests(HttpServerTestCase):
         status, payload = self.post_auto("k", self.good_auto_request())
         self.assertEqual(status, 201)
         self.assertEqual(payload["value"], "from-r1")
+
+        self.server.store = type(self.server.store)()
+        self.post_operation("r1", operation("zzz", "k", "from-r1", {"r1": 1}))
+        self.post_operation("r2", operation("aaa", "k", "from-r2", {"r2": 1}))
+        status, payload = self.post_auto(
+            "k", self.good_auto_request(policy="highest_identity")
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["value"], "from-r2")
 
     def test_three_candidates_pick_the_minimum(self) -> None:
         self.post_operation("r2", operation("o2", "k", "v2", {"r2": 1}))
@@ -217,6 +291,23 @@ class AutoResolveHappyPathTests(HttpServerTestCase):
         _, state = self.get_state("k")
         self.assertEqual(state["status"], "resolved")
         self.assertEqual(state["value"], "v1")
+
+    def test_three_candidates_pick_the_maximum(self) -> None:
+        self.post_operation("r2", operation("o2", "k", "v2", {"r2": 1}))
+        self.post_operation("r9", operation("o9", "k", "v9", {"r9": 1}))
+        self.post_operation("r1", operation("o1", "k", "v1", {"r1": 1}))
+        body = auto_request(
+            "r3",
+            "fix-1",
+            {"r1": 1, "r2": 1, "r3": 1, "r9": 1},
+            policy="highest_identity",
+        )
+        status, payload = self.post_auto("k", body)
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["value"], "v9")
+        _, state = self.get_state("k")
+        self.assertEqual(state["status"], "resolved")
+        self.assertEqual(state["value"], "v9")
 
 
 class AutoResolveValidationTests(HttpServerTestCase):
@@ -236,6 +327,7 @@ class AutoResolveValidationTests(HttpServerTestCase):
             dict(valid, clock={"r1": 1, "r2": 1, "r3": -1}),
             dict(valid, policy=""),
             dict(valid, policy="lowest-value"),
+            dict(valid, policy="HIGHEST_IDENTITY"),
         ]
         for body in bad_bodies:
             status, payload = self.post_auto("k", body)
@@ -245,29 +337,34 @@ class AutoResolveValidationTests(HttpServerTestCase):
         self.assertEqual(state["status"], "conflict")
 
     def test_clock_not_dominating_candidates_is_400(self) -> None:
-        self.seed_conflict()
-        # Concurrent with the r2 candidate.
-        status, payload = self.post_auto(
-            "k", auto_request("r3", "fix-1", {"r1": 1, "r3": 1})
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(payload, {"error": "invalid_request"})
-        # Strictly weaker than one candidate is rejected too.
-        status, payload = self.post_auto(
-            "k", auto_request("r3", "fix-1", {"r1": 1, "r2": 0, "r3": 1})
-        )
-        self.assertEqual(status, 400)
-        _, state = self.get_state("k")
-        self.assertEqual(state["status"], "conflict")
+        for policy in ("lowest_identity", "highest_identity"):
+            with self.subTest(policy=policy):
+                self.server.store = type(self.server.store)()
+                self.seed_conflict()
+                # Concurrent with the r2 candidate.
+                status, payload = self.post_auto(
+                    "k", auto_request("r3", "fix-1", {"r1": 1, "r3": 1}, policy)
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(payload, {"error": "invalid_request"})
+                # Strictly weaker than one candidate is rejected too.
+                status, payload = self.post_auto(
+                    "k", auto_request("r3", "fix-1", {"r1": 1, "r2": 0, "r3": 1}, policy)
+                )
+                self.assertEqual(status, 400)
+                _, state = self.get_state("k")
+                self.assertEqual(state["status"], "conflict")
 
     def test_new_concurrent_candidate_undominated_is_400(self) -> None:
         self.seed_conflict()
         self.post_operation("r4", operation("o4", "k", "v4", {"r4": 1}))
         # The clock that dominated the original two no longer dominates
-        # every current candidate: invalid, and nothing changes.
-        status, payload = self.post_auto("k", self.good_auto_request())
-        self.assertEqual(status, 400)
-        self.assertEqual(payload, {"error": "invalid_request"})
+        # every current candidate: invalid, and nothing changes — under
+        # either policy.
+        for policy in ("lowest_identity", "highest_identity"):
+            status, payload = self.post_auto("k", self.good_auto_request(policy=policy))
+            self.assertEqual(status, 400, policy)
+            self.assertEqual(payload, {"error": "invalid_request"}, policy)
         _, state = self.get_state("k")
         self.assertEqual(state["status"], "conflict")
         self.assertEqual(len(state["candidates"]), 3)
@@ -287,27 +384,30 @@ class AutoResolveValidationTests(HttpServerTestCase):
 class AutoResolveConflictTests(HttpServerTestCase):
     def test_missing_key_is_409(self) -> None:
         # Even a dominating clock is a resolution conflict when there is no
-        # candidate set at all.
-        status, payload = self.post_auto(
-            "absent", auto_request("r3", "fix-1", {"r3": 1})
-        )
-        self.assertEqual(status, 409)
-        self.assertEqual(payload, {"error": "resolution_conflict"})
+        # candidate set at all — under either policy.
+        for policy in ("lowest_identity", "highest_identity"):
+            status, payload = self.post_auto(
+                "absent", auto_request("r3", f"fix-{policy}", {"r3": 1}, policy)
+            )
+            self.assertEqual(status, 409, policy)
+            self.assertEqual(payload, {"error": "resolution_conflict"}, policy)
 
     def test_unconflicted_key_is_409(self) -> None:
         self.post_operation("r1", operation("o1", "k", "v1", {"r1": 1}))
-        status, payload = self.post_auto(
-            "k", auto_request("r3", "fix-1", {"r1": 2, "r3": 1})
-        )
-        self.assertEqual(status, 409)
-        self.assertEqual(payload, {"error": "resolution_conflict"})
+        for policy in ("lowest_identity", "highest_identity"):
+            status, payload = self.post_auto(
+                "k", auto_request("r3", f"fix-{policy}", {"r1": 2, "r3": 1}, policy)
+            )
+            self.assertEqual(status, 409, policy)
+            self.assertEqual(payload, {"error": "resolution_conflict"}, policy)
 
     def test_same_value_candidates_are_not_a_conflict(self) -> None:
         self.post_operation("r1", operation("o1", "k", "same", {"r1": 1}))
         self.post_operation("r2", operation("o2", "k", "same", {"r2": 1}))
-        status, payload = self.post_auto("k", self.good_auto_request())
-        self.assertEqual(status, 409)
-        self.assertEqual(payload, {"error": "resolution_conflict"})
+        for policy in ("lowest_identity", "highest_identity"):
+            status, payload = self.post_auto("k", self.good_auto_request(policy=policy))
+            self.assertEqual(status, 409, policy)
+            self.assertEqual(payload, {"error": "resolution_conflict"}, policy)
 
     def test_conflict_disappearing_before_commit_is_409(self) -> None:
         self.seed_conflict()
@@ -328,27 +428,30 @@ class AutoResolveConflictTests(HttpServerTestCase):
 
 class AutoResolveIdentityTests(HttpServerTestCase):
     def test_identical_replay_is_200_and_appends_nothing(self) -> None:
-        self.seed_conflict()
-        body = self.good_auto_request()
-        self.assertEqual(self.post_auto("k", body)[0], 201)
-        status, payload = self.post_auto("k", body)
-        self.assertEqual(status, 200)
-        self.assertEqual(
-            payload,
-            {
-                "status": "ok",
-                "key": "k",
-                "replicaId": "r3",
-                "operationId": "fix-1",
-                "value": "v1",
-                "policy": "lowest_identity",
-            },
-        )
-        _, page = self.get_sync()
-        self.assertEqual(
-            [e["operation"]["operationId"] for e in page["operations"]],
-            ["o1", "o2", "fix-1"],
-        )
+        for policy, chosen in (("lowest_identity", "v1"), ("highest_identity", "v2")):
+            with self.subTest(policy=policy):
+                self.server.store = type(self.server.store)()
+                self.seed_conflict()
+                body = self.good_auto_request(policy=policy)
+                self.assertEqual(self.post_auto("k", body)[0], 201)
+                status, payload = self.post_auto("k", body)
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    payload,
+                    {
+                        "status": "ok",
+                        "key": "k",
+                        "replicaId": "r3",
+                        "operationId": "fix-1",
+                        "value": chosen,
+                        "policy": policy,
+                    },
+                )
+                _, page = self.get_sync()
+                self.assertEqual(
+                    [e["operation"]["operationId"] for e in page["operations"]],
+                    ["o1", "o2", "fix-1"],
+                )
 
     def test_replay_after_key_moved_on_still_reports_original_value(self) -> None:
         self.seed_conflict()
@@ -370,16 +473,46 @@ class AutoResolveIdentityTests(HttpServerTestCase):
             ["o1", "o2", "fix-1", "o3"],
         )
 
-    def test_same_identity_different_content_is_409_operation_conflict(self) -> None:
+    def test_same_identity_different_clock_is_409_operation_conflict(self) -> None:
         self.seed_conflict()
         body = self.good_auto_request()
         self.assertEqual(self.post_auto("k", body)[0], 201)
+        # A different clock under the same identity conflicts even though
+        # the policy (and thus the value it would choose) is unchanged.
         tampered = dict(body, clock={"r1": 2, "r2": 1, "r3": 1})
         status, payload = self.post_auto("k", tampered)
         self.assertEqual(status, 409)
         self.assertEqual(payload, {"error": "operation_conflict"})
         _, state = self.get_state("k")
         self.assertEqual(state["value"], "v1")
+
+    def test_same_identity_different_policy_is_409_operation_conflict(self) -> None:
+        # The policy is part of the identity binding: the same key and clock
+        # under the other policy is different content.
+        for committed, replayed in (
+            ("lowest_identity", "highest_identity"),
+            ("highest_identity", "lowest_identity"),
+        ):
+            with self.subTest(committed=committed, replayed=replayed):
+                self.server.store = type(self.server.store)()
+                self.seed_conflict()
+                self.assertEqual(
+                    self.post_auto("k", self.good_auto_request(policy=committed))[0],
+                    201,
+                )
+                status, payload = self.post_auto(
+                    "k", self.good_auto_request(policy=replayed)
+                )
+                self.assertEqual(status, 409)
+                self.assertEqual(payload, {"error": "operation_conflict"})
+                # Nothing was appended and the original resolution stands.
+                _, page = self.get_sync()
+                self.assertEqual(
+                    [e["operation"]["operationId"] for e in page["operations"]],
+                    ["o1", "o2", "fix-1"],
+                )
+                _, state = self.get_state("k")
+                self.assertEqual(state["status"], "resolved")
 
     def test_same_identity_on_another_key_is_409(self) -> None:
         self.seed_conflict("k")
@@ -406,6 +539,21 @@ class AutoResolveIdentityTests(HttpServerTestCase):
         self.assertEqual(status, 409)
         self.assertEqual(payload, {"error": "operation_conflict"})
 
+    def test_plain_write_identity_conflicts_even_with_same_key_and_clock(self) -> None:
+        # A plain write carries no policy binding, so an auto request
+        # reusing its identity never replays — even when key and clock (and
+        # the value the policy would report) all match the write.
+        self.seed_conflict()
+        status, _ = self.post_operation(
+            "r3", operation("fix-1", "k", "v1", {"r1": 1, "r2": 1, "r3": 1})
+        )
+        self.assertEqual(status, 201)
+        status, payload = self.post_auto("k", self.good_auto_request())
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"error": "operation_conflict"})
+        _, state = self.get_state("k")
+        self.assertEqual(state["value"], "v1")
+
 
 class AutoResolveIntegrationTests(HttpServerTestCase):
     def test_resolution_is_exported_with_chosen_value(self) -> None:
@@ -430,15 +578,57 @@ class AutoResolveIntegrationTests(HttpServerTestCase):
             },
         )
 
+    def test_highest_resolution_is_exported_with_chosen_value(self) -> None:
+        self.seed_conflict()
+        self.assertEqual(
+            self.post_auto("k", self.good_auto_request(policy="highest_identity"))[0],
+            201,
+        )
+        _, page = self.get_sync()
+        self.assertEqual(
+            page["operations"][2],
+            {
+                "replicaId": "r3",
+                "operation": {
+                    "operationId": "fix-1",
+                    "key": "k",
+                    "value": "v2",
+                    "clock": {"r1": 1, "r2": 1, "r3": 1},
+                },
+            },
+        )
+
     def test_audit_stream_carries_the_auto_resolution(self) -> None:
         self.seed_conflict()
-        self.assertEqual(self.post_auto("k", self.good_auto_request())[0], 201)
+        self.assertEqual(
+            self.post_auto("k", self.good_auto_request(policy="highest_identity"))[0],
+            201,
+        )
         _, page = self.get_audit("k")
         self.assertEqual(
             [e["operation"]["operationId"] for e in page["operations"]],
             ["o1", "o2", "fix-1"],
         )
-        self.assertEqual(page["operations"][2]["operation"]["value"], "v1")
+        self.assertEqual(page["operations"][2]["operation"]["value"], "v2")
+
+    def test_both_digests_cover_the_auto_resolution(self) -> None:
+        self.seed_conflict()
+        _, digest_before = self.request("GET", "/v1/verification/digest")
+        _, audit_before = self.request("GET", "/v1/audit/keys/k/digest")
+        self.assertEqual(
+            self.post_auto("k", self.good_auto_request(policy="highest_identity"))[0],
+            201,
+        )
+        _, digest_after = self.request("GET", "/v1/verification/digest")
+        _, audit_after = self.request("GET", "/v1/audit/keys/k/digest")
+        # The repair collapsed two candidates into one and extended the
+        # key's audit stream by exactly the accepted operation.
+        self.assertNotEqual(digest_before["digest"], digest_after["digest"])
+        self.assertEqual(digest_after["keys"], 1)
+        self.assertEqual(digest_after["candidateVersions"], 1)
+        self.assertEqual(audit_before["operations"], 2)
+        self.assertEqual(audit_after["operations"], 3)
+        self.assertNotEqual(audit_before["digest"], audit_after["digest"])
 
     def test_metrics_count_the_repair_and_the_resolved_key(self) -> None:
         self.seed_conflict("k")
@@ -469,7 +659,10 @@ class AutoResolveIntegrationTests(HttpServerTestCase):
 
     def test_imported_auto_resolution_resolves_the_same_conflict(self) -> None:
         self.seed_conflict()
-        self.assertEqual(self.post_auto("k", self.good_auto_request())[0], 201)
+        self.assertEqual(
+            self.post_auto("k", self.good_auto_request(policy="highest_identity"))[0],
+            201,
+        )
         _, page = self.get_sync()
 
         other = StateStore()
@@ -484,13 +677,17 @@ class AutoResolveIntegrationTests(HttpServerTestCase):
             state,
             {
                 "key": "k",
-                "value": "v1",
+                "value": "v2",
                 "clock": {"r1": 1, "r2": 1, "r3": 1},
                 "status": "resolved",
             },
         )
 
-    def test_http_import_then_replay_is_200(self) -> None:
+    def test_imported_identity_carries_no_policy_binding(self) -> None:
+        # The policy binding is local to the resolving replica (persisted in
+        # its data file); a sync record is just the operation. Replaying the
+        # auto request on an importing replica therefore conflicts: the
+        # identity is known but its binding (no policy) differs.
         self.seed_conflict()
         self.assertEqual(self.post_auto("k", self.good_auto_request())[0], 201)
         _, page = self.get_sync()
@@ -499,9 +696,75 @@ class AutoResolveIntegrationTests(HttpServerTestCase):
         status, _ = self.request("POST", "/v1/sync/operations", {"operations": page["operations"]})
         self.assertEqual(status, 201)
         status, payload = self.post_auto("k", self.good_auto_request())
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["value"], "v1")
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"error": "operation_conflict"})
+        # The imported resolution itself is untouched.
+        _, state = self.get_state("k")
+        self.assertEqual(state["status"], "resolved")
+        self.assertEqual(state["value"], "v1")
+
+
+class AutoResolveConcurrencyTests(HttpServerTestCase):
+    def run_concurrently(self, bodies: list[dict]) -> list[tuple[int, object]]:
+        results: list[tuple[int, object] | None] = [None] * len(bodies)
+
+        def worker(index: int, body: dict) -> None:
+            results[index] = self.post_auto("k", body)
+
+        threads = [
+            threading.Thread(target=worker, args=(index, body))
+            for index, body in enumerate(bodies)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        return [result for result in results if result is not None]
+
+    def test_concurrent_identical_requests_commit_exactly_once(self) -> None:
+        self.seed_conflict()
+        body = self.good_auto_request(policy="highest_identity")
+        results = self.run_concurrently([dict(body) for _ in range(8)])
+        statuses = sorted(status for status, _ in results)
+        self.assertEqual(statuses, [200] * 7 + [201])
+        for _, payload in results:
+            self.assertEqual(payload["value"], "v2")
+            self.assertEqual(payload["policy"], "highest_identity")
+        _, page = self.get_sync()
+        self.assertEqual(
+            [e["operation"]["operationId"] for e in page["operations"]],
+            ["o1", "o2", "fix-1"],
+        )
+
+    def test_concurrent_mixed_policies_commit_exactly_one(self) -> None:
+        self.seed_conflict()
+        bodies = [
+            auto_request(
+                "r3",
+                f"fix-{index}",
+                {"r1": 1, "r2": 1, "r3": 1},
+                policy="lowest_identity" if index % 2 == 0 else "highest_identity",
+            )
+            for index in range(8)
+        ]
+        results = self.run_concurrently(bodies)
+        created = [payload for status, payload in results if status == 201]
+        conflicts = [payload for status, payload in results if status == 409]
+        # Each request carries a distinct identity, so exactly one wins the
+        # race; the rest find the key already resolved.
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(conflicts), 7)
+        for payload in conflicts:
+            self.assertEqual(payload, {"error": "resolution_conflict"})
+        _, page = self.get_sync()
+        self.assertEqual(len(page["operations"]), 3)
+        _, state = self.get_state("k")
+        self.assertEqual(state["status"], "resolved")
+        # The single committed repair reports the same value the state
+        # settled on, chosen by its own policy.
+        self.assertEqual(created[0]["value"], state["value"])
+        expected = "v1" if created[0]["policy"] == "lowest_identity" else "v2"
+        self.assertEqual(created[0]["value"], expected)
 
 
 class AutoResolveAuthTests(unittest.TestCase):
@@ -574,8 +837,8 @@ class PersistentAutoResolveTestCase(unittest.TestCase):
             )
             self.assertEqual(status, 201)
 
-    def good_auto_request(self) -> dict:
-        return auto_request("r3", "fix-1", {"r1": 1, "r2": 1, "r3": 1})
+    def good_auto_request(self, policy: str = "lowest_identity") -> dict:
+        return auto_request("r3", "fix-1", {"r1": 1, "r2": 1, "r3": 1}, policy)
 
     def test_auto_resolution_is_durable_and_recovers(self) -> None:
         server = self.start_server()
@@ -615,6 +878,47 @@ class PersistentAutoResolveTestCase(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(payload, {"error": "operation_conflict"})
 
+    def test_policy_binding_is_durable_and_recovers(self) -> None:
+        server = self.start_server()
+        self.seed_conflict(server)
+        status, payload = self.request(
+            server,
+            "POST",
+            "/v1/states/k/resolve/auto",
+            self.good_auto_request(policy="highest_identity"),
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["value"], "v2")
+        # The binding is committed atomically with the operation.
+        _, _, policies = load_data_file_full(str(self.data_file))
+        self.assertEqual(policies, {("r3", "fix-1"): "highest_identity"})
+
+        server.shutdown()
+        server.server_close()
+
+        server = self.start_server()
+        # Same identity and same binding: a 200 replay reporting the
+        # originally chosen value, appending nothing.
+        status, payload = self.request(
+            server,
+            "POST",
+            "/v1/states/k/resolve/auto",
+            self.good_auto_request(policy="highest_identity"),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["value"], "v2")
+        self.assertEqual(payload["policy"], "highest_identity")
+        self.assertEqual(len(load_data_file(str(self.data_file))), 3)
+        # The same identity under the other policy conflicts after restart.
+        status, payload = self.request(
+            server,
+            "POST",
+            "/v1/states/k/resolve/auto",
+            self.good_auto_request(policy="lowest_identity"),
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"error": "operation_conflict"})
+
     def test_persistence_failure_is_500_and_changes_nothing(self) -> None:
         server = self.start_server()
         self.seed_conflict(server)
@@ -624,28 +928,118 @@ class PersistentAutoResolveTestCase(unittest.TestCase):
             StateStore, "_persist_locked", side_effect=server_module.PersistenceError("disk gone")
         ):
             status, payload = self.request(
-                server, "POST", "/v1/states/k/resolve/auto", self.good_auto_request()
+                server,
+                "POST",
+                "/v1/states/k/resolve/auto",
+                self.good_auto_request(policy="highest_identity"),
             )
             self.assertEqual(status, 500)
             self.assertEqual(payload, {"error": "internal_error"})
 
-        # Memory, identity index, and file are exactly as before.
+        # Memory, identity index, policy bindings, and file are exactly as
+        # before.
         self.assertEqual(self.data_file.read_bytes(), before)
+        _, _, policies = load_data_file_full(str(self.data_file))
+        self.assertEqual(policies, {})
         status, state = self.request(server, "GET", "/v1/states/k")
         self.assertEqual(state["status"], "conflict")
         status, page = self.request(server, "GET", "/v1/sync/operations")
         self.assertEqual([e["operation"]["operationId"] for e in page["operations"]], ["o1", "o2"])
         # The failed resolution commits cleanly once persistence works again.
         status, payload = self.request(
-            server, "POST", "/v1/states/k/resolve/auto", self.good_auto_request()
+            server,
+            "POST",
+            "/v1/states/k/resolve/auto",
+            self.good_auto_request(policy="highest_identity"),
         )
         self.assertEqual(status, 201)
-        self.assertEqual(payload["value"], "v1")
+        self.assertEqual(payload["value"], "v2")
         status, state = self.request(server, "GET", "/v1/states/k")
         self.assertEqual(state["status"], "resolved")
-        self.assertEqual(state["value"], "v1")
+        self.assertEqual(state["value"], "v2")
+        _, _, policies = load_data_file_full(str(self.data_file))
+        self.assertEqual(policies, {("r3", "fix-1"): "highest_identity"})
         leftovers = [p.name for p in self.tmp.iterdir() if p.name != self.data_file.name]
         self.assertEqual(leftovers, [])
+
+    def test_file_without_policies_section_recovers(self) -> None:
+        # A version:1 file written before policy bindings existed recovers
+        # with no bindings; new resolutions then persist theirs.
+        self.data_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "operations": [
+                        {
+                            "replicaId": "r1",
+                            "operation": operation("o1", "k", "v1", {"r1": 1}),
+                        },
+                        {
+                            "replicaId": "r2",
+                            "operation": operation("o2", "k", "v2", {"r2": 1}),
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        server = self.start_server()
+        status, payload = self.request(
+            server,
+            "POST",
+            "/v1/states/k/resolve/auto",
+            self.good_auto_request(policy="highest_identity"),
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["value"], "v2")
+        _, _, policies = load_data_file_full(str(self.data_file))
+        self.assertEqual(policies, {("r3", "fix-1"): "highest_identity"})
+
+    def test_invalid_policies_section_is_rejected_at_startup(self) -> None:
+        base_operations = [
+            {
+                "replicaId": "r1",
+                "operation": operation("o1", "k", "v1", {"r1": 1}),
+            }
+        ]
+        bad_sections = [
+            {},  # must be a list
+            [{"replicaId": "r1", "operationId": "o1"}],  # missing policy
+            [
+                {
+                    "replicaId": "r1",
+                    "operationId": "o1",
+                    "policy": "lowest_identity",
+                    "extra": 1,
+                }
+            ],
+            [{"replicaId": "r1", "operationId": "o1", "policy": "middle_identity"}],
+            [{"replicaId": "r1", "operationId": "o1", "policy": ""}],
+            [{"replicaId": "r1", "operationId": "o1", "policy": 1}],
+            [{"replicaId": "", "operationId": "o1", "policy": "lowest_identity"}],
+            [{"replicaId": "r1", "operationId": "", "policy": "lowest_identity"}],
+            # A binding for an identity with no accepted operation.
+            [{"replicaId": "r9", "operationId": "o9", "policy": "lowest_identity"}],
+            # Duplicate bindings for one identity.
+            [
+                {"replicaId": "r1", "operationId": "o1", "policy": "lowest_identity"},
+                {"replicaId": "r1", "operationId": "o1", "policy": "highest_identity"},
+            ],
+        ]
+        for section in bad_sections:
+            with self.subTest(section=section):
+                self.data_file.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "operations": base_operations,
+                            "policies": section,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(server_module.PersistenceError):
+                    StateStore(data_file=str(self.data_file))
 
 
 if __name__ == "__main__":

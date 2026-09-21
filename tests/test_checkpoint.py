@@ -235,7 +235,7 @@ class PersistentCheckpointStoreTests(unittest.TestCase):
         store.apply_operation("r1", operation("o1", "k", "v", {"r1": 1}))
         store.save_checkpoint("p1", 1)
         store.save_checkpoint("p2", 0)
-        records, checkpoints = load_data_file_full(str(self.data_file))
+        records, checkpoints, _ = load_data_file_full(str(self.data_file))
         self.assertEqual([r[0] for r in records], ["r1"])
         self.assertEqual(checkpoints, {"p1": 1, "p2": 0})
 
