@@ -1571,6 +1571,32 @@ class StateStore:
             ],
         }
 
+    def get_operation(
+        self, replica_id: str, operation_id: str
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one accepted operation by identity, or 404 when unknown.
+
+        The lookup reads the identity index under the same commit lock used
+        by local writes, sync imports, repairs, and checkpoints, so the
+        response always describes a single committed snapshot and never
+        observes half an import batch. The read is strictly read-only: it
+        mutates neither memory, the data file, metrics, candidates, audit
+        streams, checkpoints, nor logs.
+
+        Every first-accepted operation is addressable — ordinary writes,
+        stale writes that added no candidate, manual and automatic
+        resolutions, and sync-imported records. Identical replays add no
+        record, and conflicting, invalid, or durably-failed requests never
+        enter the index, so they stay 404. With ``--data-file`` the index is
+        rebuilt identically during recovery, so the same identity yields the
+        same response before and after a restart.
+        """
+        with self._lock:
+            operation = self._operations.get((replica_id, operation_id))
+        if operation is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+        return HTTPStatus.OK, {"replicaId": replica_id, "operation": operation}
+
 
 class SemanticStateServer(ThreadingHTTPServer):
     """Threading HTTP server carrying its own StateStore."""
@@ -1697,6 +1723,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(status, payload)
             return
         if (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "replicas"
+            and segments[3] == "operations"
+        ):
+            self._handle_operation_get(segments[2], segments[4])
+            return
+        if (
             len(segments) == 3
             and segments[0] == "v1"
             and segments[1] == "sync"
@@ -1804,6 +1838,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         self._json(HTTPStatus.OK, self._store.get_metrics())
+
+    def _handle_operation_get(self, replica_id: str, operation_id: str) -> None:
+        # The route accepts no query parameters; route-shape errors were
+        # already answered with 404 during route matching, so a matched
+        # route with any parameter (repeated, blank-named, or blank-valued)
+        # is a 400 here.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._store.get_operation(replica_id, operation_id)
+        self._json(status, payload)
 
     def _handle_verification_digest_get(self) -> None:
         if not parse_metrics_query(urlsplit(self.path).query):

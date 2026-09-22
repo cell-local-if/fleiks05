@@ -286,6 +286,19 @@ The endpoint takes no query parameters: any parameter — including a repeated n
 
 With `--data-file`, the stream is rebuilt from the recovered log on startup, so the same recovery history yields the identical digest and `operations` count before and after a restart. Persistence failures and rejected (conflicting) batches never enter the log and therefore cannot influence the digest, either before or after a restart.
 
+### Operation archive lookup
+
+`GET /v1/replicas/{replicaId}/operations/{operationId}` returns one accepted operation addressed by its `(replicaId, operationId)` identity:
+
+- The identity was never first-accepted: HTTP 404 with `{"error":"not_found"}`.
+- Otherwise: HTTP 200 with a JSON object containing exactly `replicaId` and `operation`, where `operation` carries the full committed record — `operationId`, `key`, `value`, and `clock` — with the same field and value semantics as the write that committed it.
+
+Every first-accepted operation is addressable: ordinary writes, stale writes that added no candidate, manual and automatic conflict repairs, and records accepted through sync import. Identical replays add no record, and conflicting (`409`), invalid (`400`), or durably-failed requests never create an archive entry.
+
+Both path segments are percent-decoded like the other routes and must be non-empty; a missing or extra segment, or an unknown route, returns HTTP 404 with `{"error":"not_found"}`. The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}`, and the route-shape check takes precedence over the query check.
+
+The lookup reads the identity index under the same commit lock used by local writes, sync-import batches, repairs, and checkpoints, so the response always describes a single committed snapshot. The request is strictly read-only — it changes no metrics, candidates, audit streams, checkpoints, logs, or the data file — and its response uses UTF-8 JSON with an explicit `Content-Length`. When authentication is enabled the route follows the same rules as the other GET endpoints (`/health` stays anonymous). With `--data-file`, the identity index is rebuilt from the recovered log on startup, so successful results, 404 boundaries, and error states are identical before and after a restart.
+
 ## Tests
 
 ```bash
