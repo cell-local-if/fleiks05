@@ -286,6 +286,18 @@ The endpoint takes no query parameters: any parameter — including a repeated n
 
 With `--data-file`, the stream is rebuilt from the recovered log on startup, so the same recovery history yields the identical digest and `operations` count before and after a restart. Persistence failures and rejected (conflicting) batches never enter the log and therefore cannot influence the digest, either before or after a restart.
 
+### Per-operation archive query
+
+`GET /v1/replicas/{replicaId}/operations/{operationId}` locates one **first-accepted operation** by its `(replicaId, operationId)` identity. Both path segments are percent-decoded like every other route and must be non-empty after decoding.
+
+- An accepted identity returns HTTP 200 with a UTF-8 JSON object containing exactly two fields: `{"replicaId":R,"operation":{...}}`, where `operation` carries exactly `operationId`, `key`, `value`, and `clock` with their committed values.
+- Every accepted record is addressable: ordinary writes, stale writes whose clock was already dominated, manual and automatic conflict repairs, and sync-imported records all appear under the identity they were committed with.
+- An identity that was never first-accepted returns HTTP 404 with `{"error":"not_found"}`. Identical replays add no record, and conflicting (`409`), invalid (`400`), or undurably-committed requests never enter the archive, so they stay 404.
+- The lookup runs under the same commit lock used by local writes, sync imports, repairs, and checkpoints, so the response always describes a committed snapshot. The request is strictly read-only — it changes no metrics, candidates, audit streams, checkpoints, logs, or the data file — and its response uses the same explicit `Content-Length` contract as the other endpoints.
+- The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}`. A missing, empty, or extra path segment (for example `/v1/replicas//operations/{operationId}` or `/v1/replicas/{replicaId}/operations/{operationId}/extra`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query check, so a malformed path together with a query parameter is still 404.
+
+With `--data-file`, the identity index is rebuilt from the recovered log on startup, so successful results, the 404 boundary, and error statuses are identical before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
+
 ## Tests
 
 ```bash

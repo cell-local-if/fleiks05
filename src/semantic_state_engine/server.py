@@ -1531,6 +1531,43 @@ class StateStore:
                 self._checkpoints[peer_id] = cursor
             return HTTPStatus.OK, None
 
+    def get_operation(
+        self, replica_id: str, operation_id: str
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one accepted operation by identity from a single snapshot.
+
+        The lookup runs under the same commit lock used by local writes,
+        sync imports, repairs, and checkpoints, so the response always
+        describes a committed state: a read can never observe half an import
+        batch or a partially applied repair. The snapshot mutates neither
+        memory, the data file, candidates, metrics, audits, checkpoints,
+        nor logs.
+
+        Every first-accepted operation is addressable by its
+        ``(replicaId, operationId)`` identity — ordinary writes, stale
+        writes that added no candidate, manual and automatic resolutions,
+        and sync-imported records alike. Identical replays add no record,
+        and conflicting, invalid, or undurably-committed requests never
+        enter the identity index, so they stay 404. Returns
+        ``(404, {"error": "not_found"})`` for an unknown identity and
+        ``(200, {"replicaId", "operation"})`` otherwise, where ``operation``
+        carries exactly ``operationId``, ``key``, ``value``, and ``clock``
+        with their committed values. With ``--data-file`` the identity
+        index is rebuilt identically during recovery, so the same identity
+        yields the same response before and after a restart.
+        """
+        with self._lock:
+            operation = self._operations.get((replica_id, operation_id))
+            if operation is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            record = {
+                "operationId": operation["operationId"],
+                "key": operation["key"],
+                "value": operation["value"],
+                "clock": dict(operation["clock"]),
+            }
+        return HTTPStatus.OK, {"replicaId": replica_id, "operation": record}
+
     def get_checkpoint(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Return the registered checkpoint, or 404 when ``peer_id`` is unknown.
 
@@ -1722,6 +1759,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_audit_digest_get(segments[3])
             return
+        if (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "replicas"
+            and segments[3] == "operations"
+        ):
+            self._handle_operation_archive_get(segments[2], segments[4])
+            return
         matched, checkpoint_peer = self._checkpoint_route()
         if matched:
             self._handle_checkpoint_get(checkpoint_peer)
@@ -1850,6 +1895,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         # Every path key is a valid audit subject: a key with no accepted
         # history hashes the empty stream and reports operations 0.
         self._json(HTTPStatus.OK, self._store.get_key_audit_digest(key))
+
+    def _handle_operation_archive_get(self, replica_id: str, operation_id: str) -> None:
+        # The route accepts no query parameters; any parameter — repeated,
+        # blank-named, or blank-valued — is an invalid request. Route-shape
+        # mismatches (missing, empty, or extra segments) never reach this
+        # handler: they fall through to the generic 404 first.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._store.get_operation(replica_id, operation_id)
+        self._json(status, payload)
 
     def _handle_sync_post(self) -> None:
         raw = self._read_bounded_body()
