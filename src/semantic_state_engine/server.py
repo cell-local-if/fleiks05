@@ -220,6 +220,89 @@ def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, A
     }
 
 
+AUTO_RESOLVE_BATCH_MIN = 1
+AUTO_RESOLVE_BATCH_MAX = 100
+
+
+def parse_auto_resolve_batch(raw: bytes | str | dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse and validate a batch of automatic conflict-resolution requests.
+
+    The body must be a JSON object whose only key is ``resolutions`` holding
+    between 1 and 100 entries in request order. Each entry must contain
+    exactly ``key``, ``replicaId``, ``operationId``, ``clock``, and
+    ``policy``: the four fields of a single automatic resolution plus the
+    target key (there is no path key for the batch route). The constraints
+    match :func:`parse_auto_resolve_payload`, with two extra batch-level
+    rules: no two entries may name the same key or the same
+    ``(replicaId, operationId)`` identity. Returns the normalized entries in
+    request order. Raises ValueError on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            document: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        document = raw
+    if not isinstance(document, dict) or set(document.keys()) != {"resolutions"}:
+        raise ValueError("body must be an object with only resolutions")
+    entries_raw = document["resolutions"]
+    if not isinstance(entries_raw, list) or not (
+        AUTO_RESOLVE_BATCH_MIN <= len(entries_raw) <= AUTO_RESOLVE_BATCH_MAX
+    ):
+        raise ValueError("resolutions must be a list of 1-100 entries")
+
+    entries: list[dict[str, Any]] = []
+    keys: set[str] = set()
+    identities: set[tuple[str, str]] = set()
+    for entry in entries_raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {
+            "key",
+            "replicaId",
+            "operationId",
+            "clock",
+            "policy",
+        }:
+            raise ValueError(
+                "each resolution must have only key, replicaId, operationId, clock, policy"
+            )
+        key = entry["key"]
+        if not isinstance(key, str) or key == "":
+            raise ValueError("key must be a non-empty string")
+        replica_id = entry["replicaId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise ValueError("replicaId must be a non-empty string")
+        operation_id = entry["operationId"]
+        if not isinstance(operation_id, str) or operation_id == "":
+            raise ValueError("operationId must be a non-empty string")
+        clock = _validate_clock(entry.get("clock"), replica_id)
+        policy = entry["policy"]
+        if policy not in AUTO_RESOLVE_POLICIES:
+            raise ValueError("policy must be 'lowest_identity' or 'highest_identity'")
+        if key in keys:
+            raise ValueError(f"duplicate key {key!r} in batch")
+        identity = (replica_id, operation_id)
+        if identity in identities:
+            raise ValueError(f"duplicate identity {identity!r} in batch")
+        keys.add(key)
+        identities.add(identity)
+        entries.append(
+            {
+                "key": key,
+                "replicaId": replica_id,
+                "operationId": operation_id,
+                "clock": clock,
+                "policy": policy,
+            }
+        )
+    return entries
+
+
 SYNC_BATCH_MIN = 1
 SYNC_BATCH_MAX = 100
 SYNC_DEFAULT_LIMIT = 100
@@ -1251,6 +1334,156 @@ class StateStore:
             self._candidates[key] = next_candidates
             return HTTPStatus.CREATED, operation, None
 
+    def apply_auto_resolutions(
+        self, requests: list[dict[str, Any]]
+    ) -> tuple[HTTPStatus, list[dict[str, Any]], int, int, str | None]:
+        """Apply validated automatic resolutions sequentially as one batch.
+
+        Each entry carries the same fields as a single automatic resolution
+        plus its target ``key``; the parser already guarantees 1-100 entries
+        with distinct keys and distinct identities. Entries are processed in
+        request order against a staged view of the store, so the semantics
+        are exactly those of :meth:`apply_auto_resolution` applied in
+        sequence:
+
+        - a known identity with the same binding (key, clock, and policy) is
+          a replay, reporting the originally chosen value;
+        - a known identity with a different binding is an operation
+          conflict;
+        - an unseen identity for a missing key, a key not currently in value
+          conflict, a key whose candidates moved, or a request clock that
+          does not dominate every current candidate is a resolution
+          conflict (a structurally *illegal* clock is rejected earlier by
+          the parser as an invalid request, distinct from a legal clock
+          that simply fails to dominate the live candidates);
+
+        The whole batch is validated (dry-run) before anything is persisted
+        or made visible: any conflict or invalid clock rejects the entire
+        batch unchanged, however far validation got. All new operations and
+        their policy bindings are then committed together in one atomic
+        commit, exactly like a sync-import batch.
+
+        Returns ``(status, results, accepted, replayed, error)``: 201 when
+        at least one entry was newly committed or 200 when every entry was a
+        replay, with ``results`` in request order (each carrying ``key``,
+        ``replicaId``, ``operationId``, the selected ``value``, and
+        ``policy``); or 409 with ``"operation_conflict"`` /
+        ``"resolution_conflict"`` and an unchanged store. Raises
+        PersistenceError when the durable commit fails, in which case
+        memory, the identity index, the policy bindings, and the file are
+        unchanged.
+        """
+        with self._lock:
+            # Staged copies keep the whole dry run off the visible state:
+            # the batch is fixed in its entirety before the single commit.
+            staged_operations = dict(self._operations)
+            staged_policies = dict(self._policies)
+            staged_candidates = {
+                key: list(candidates) for key, candidates in self._candidates.items()
+            }
+            new_records: list[tuple[str, dict[str, Any]]] = []
+            new_policies: dict[tuple[str, str], str] = {}
+            results: list[dict[str, Any]] = []
+            accepted = 0
+            replayed = 0
+
+            for entry in requests:
+                replica_id = entry["replicaId"]
+                key = entry["key"]
+                identity = (replica_id, entry["operationId"])
+                operation = {
+                    "operationId": entry["operationId"],
+                    "key": key,
+                    "value": "",
+                    "clock": entry["clock"],
+                }
+                seen = staged_operations.get(identity)
+                if seen is not None:
+                    # Same replay binding as the single-request path: key,
+                    # clock, and policy must all match the committed
+                    # operation (which must carry a policy binding).
+                    if (
+                        seen["key"] == key
+                        and seen["clock"] == operation["clock"]
+                        and staged_policies.get(identity) == entry["policy"]
+                    ):
+                        replayed += 1
+                        results.append(
+                            {
+                                "key": key,
+                                "replicaId": replica_id,
+                                "operationId": entry["operationId"],
+                                "value": seen["value"],
+                                "policy": entry["policy"],
+                            }
+                        )
+                        continue
+                    return HTTPStatus.CONFLICT, [], 0, 0, "operation_conflict"
+
+                current = staged_candidates.get(key, [])
+                if not current or all(c["value"] == current[0]["value"] for c in current):
+                    return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
+
+                if entry["policy"] == "highest_identity":
+                    chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
+                else:
+                    chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+                operation["value"] = chosen["value"]
+
+                # A legal clock that nevertheless fails to dominate the live
+                # candidates is a failed resolution precondition (409), not
+                # a malformed request: structurally invalid clocks were
+                # rejected by the parser before the store was ever reached.
+                if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
+                    return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
+
+                staged_candidates[key] = self._next_candidates(
+                    current, replica_id, operation
+                )
+                staged_operations[identity] = operation
+                staged_policies[identity] = entry["policy"]
+                new_records.append((replica_id, operation))
+                new_policies[identity] = entry["policy"]
+                accepted += 1
+                results.append(
+                    {
+                        "key": key,
+                        "replicaId": replica_id,
+                        "operationId": entry["operationId"],
+                        "value": operation["value"],
+                        "policy": entry["policy"],
+                    }
+                )
+
+            if not new_records:
+                return HTTPStatus.OK, results, accepted, replayed, None
+
+            # Commit every new operation and binding together. The atomic
+            # rename is the single durable commit point; memory, the identity
+            # index, and the policy bindings move only after it succeeds, so
+            # a failed durable commit leaves everything exactly as before.
+            if self._data_file is not None:
+                previous_length = len(self._accepted)
+                self._accepted.extend(new_records)
+                self._policies.update(new_policies)
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    del self._accepted[previous_length:]
+                    for identity in new_policies:
+                        del self._policies[identity]
+                    raise
+            else:
+                self._accepted.extend(new_records)
+                self._policies.update(new_policies)
+            for replica_id, operation in new_records:
+                self._operations[(replica_id, operation["operationId"])] = operation
+                op_key = operation["key"]
+                self._candidates[op_key] = self._next_candidates(
+                    self._candidates.get(op_key, []), replica_id, operation
+                )
+            return HTTPStatus.CREATED, results, accepted, replayed, None
+
     def get_sync_operations(
         self, after: int, limit: int
     ) -> tuple[list[dict[str, Any]], int, bool]:
@@ -1659,6 +1892,27 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _json_newline(
+        self,
+        status: HTTPStatus,
+        payload: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        """Respond with compact JSON terminated by one newline.
+
+        Same compact encoding as :meth:`_json`, with a single trailing
+        ``\\n`` included in both the body and its declared length; used by
+        the batch endpoint whose contract requires the line terminator.
+        """
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n"
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
     def _require_auth(self) -> bool:
         """Enforce bearer-token authentication when it is configured.
 
@@ -1995,6 +2249,35 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_auto_resolve_batch_post(self) -> None:
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            entries = parse_auto_resolve_batch(raw)
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status, results, accepted, replayed, error = self._store.apply_auto_resolutions(
+                entries
+            )
+        except PersistenceError:
+            self._json_newline(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json_newline(status, {"error": error})
+            return
+        self._json_newline(
+            status,
+            {
+                "status": "created" if status is HTTPStatus.CREATED else "ok",
+                "resolutions": results,
+                "accepted": accepted,
+                "replayed": replayed,
+            },
+        )
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
         segments = self._path_segments()
@@ -2023,15 +2306,23 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "sync"
             and segments[2] == "operations"
         )
+        is_auto_resolve_batch_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "resolve"
+            and segments[2] == "auto"
+            and segments[3] == "batch"
+        )
         if (
             matched
             or is_operation_post
             or is_resolve_post
             or is_auto_resolve_post
             or is_sync_post
+            or is_auto_resolve_batch_post
         ):
-            # On the five POST endpoints the Content-Length contract keeps
-            # its priority: a 400/413 is answered before authentication.
+            # On the POST endpoints the Content-Length contract keeps its
+            # priority: a 400/413 is answered before authentication.
             # Authentication then runs before the body is read, the commit
             # lock is taken, or any state or data file is touched; an
             # unauthorized request leaves the body unread and the
@@ -2080,6 +2371,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_auto_resolve_post:
             self._handle_auto_resolve_post(segments[2])
+            return
+        if is_auto_resolve_batch_post:
+            self._handle_auto_resolve_batch_post()
             return
         self._handle_sync_post()
 
