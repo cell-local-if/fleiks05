@@ -18,7 +18,7 @@ PYTHONPATH=src python3 -m semantic_state_engine.server --host 127.0.0.1 --port 8
 {"service":"semantic-state-engine","status":"ok"}
 ```
 
-Unknown routes return HTTP 404 with `{"error":"not_found"}`. Responses use UTF-8 JSON and include an explicit content length.
+Unknown routes return HTTP 404 with `{"error":"not_found"}`. Responses use UTF-8 JSON and include an explicit content length. A trailing slash on any published path is treated as a missing/extra path-segment boundary and returns HTTP 404 with `{"error":"not_found"}` — it is never served as an alias for the bare path.
 
 ### Request body limits
 
@@ -112,9 +112,9 @@ A successful HTTP 200 response is a compact UTF-8 JSON object with exactly five 
 - `status`: `"resolved"` when every current candidate agrees on the value, `"conflict"` otherwise — the same classification as `GET /v1/states/{key}`.
 - `candidates`: the current candidates in the same order as the conflict view of `GET /v1/states/{key}` — sorted by `(replicaId, operationId)` ascending — each carrying exactly `value`, `clock`, `replicaId`, and `operationId`.
 - `relations`: one entry per unordered pair of current candidates, enumerated in candidate order. Each entry names the pair's endpoints as `{"replicaId","operationId"}` identities under `from`/`to` and classifies the pair under `relation`:
-  - `"dominates"` when one candidate's clock dominates the other's (`from` is the dominating candidate). Current candidates never dominate one another, so this kind completes the vocabulary without being emitted by the present store.
-  - `"overwrites"` when the two candidates hold the same value: either one covers the other, so the pair cannot conflict. For a resolved key these entries report the agreed value's unique source relation.
-  - `"concurrent"` when the values differ and neither clock dominates the other — exactly why the pair does not dominate each other.
+  - `"overwrites"` when the two candidates hold the same value: either one covers the other, so the pair cannot conflict. For a resolved key these entries report the agreed value's unique source relation. The same-value rule takes precedence over the clock comparison.
+  - `"dominates"` when the values differ and one candidate's clock dominates the other's (`from` is the dominating candidate). Current candidates never dominate one another, so this kind completes the vocabulary without being emitted by the present store.
+  - `"concurrent"` when the values differ and neither clock dominates the other — exactly why the pair does not dominate each other. In a mixed conflict (some pairs sharing a value, some not) a different-valued, mutually non-dominating pair is therefore never misreported as `overwrites` or `dominates`.
   A key with a single candidate has an empty relation set, still expressed as an array (`[]`).
 - `suggestion`: `{"lowest_identity":C,"highest_identity":C}` reporting which current candidate each of the two existing automatic-resolution policies would select — the smallest and largest `(replicaId, operationId)` — in the same shape as the `candidates` entries. The suggestion is purely informational: the endpoint creates no repair operation, log record, or checkpoint.
 
@@ -123,6 +123,31 @@ Every number in the response is a JSON integer (the only numbers are vector-cloc
 The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state. A missing, empty, or extra path segment (for example `/v1/states/{key}/why/extra`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check.
 
 The candidate set, the relations, and the suggestion are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit and never observes half an import batch or a partially applied repair. The request is strictly read-only — it modifies neither memory nor the data file and creates no file. With `--data-file`, the candidate state is rebuilt identically during recovery, so the same state yields the same relations, sources, and policy suggestions before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route.
+
+### Cross-key causal impact
+
+`GET /v1/states/{key}/impact?after=N&limit=N` returns a read-only report of the operations on **other keys** that are causally later than one key's current state. A key with no current candidates — one that never appeared, or one whose history leaves no current candidate — returns HTTP 404 with `{"error":"not_found"}`.
+
+The query reads only the target key's current candidates and the shared accepted-operation log: an accepted operation on a different key is an impact when its clock **dominates** at least one of the target key's current candidates (missing components count as 0, exactly as in the write semantics). The target key's own operations never appear, and identical replays (`200`), conflicting or malformed requests (`409`/`400`), and uncommitted writes never enter the accepted log, so they can never appear either.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object with exactly six fields, terminated by a single newline:
+
+```json
+{"candidates":[{"clock":{"r1":1},"operationId":"op-1","replicaId":"r1","value":"blue"}],"hasMore":false,"impacts":[{"operation":{"clock":{"r1":1,"r2":1},"key":"size","operationId":"op-9","value":"large"},"replicaId":"r2"}],"key":"color","nextCursor":1,"status":"resolved"}
+```
+
+- `key`: the requested key (the path segment is percent-decoded like every route).
+- `status`: `"resolved"` when every current candidate agrees on the value, `"conflict"` otherwise — the same classification as `GET /v1/states/{key}`.
+- `candidates`: the basis candidates the judgement is made from — the target key's current candidates in the same order as the conflict view of `GET /v1/states/{key}` (sorted by `(replicaId, operationId)` ascending), each carrying exactly `value`, `clock`, `replicaId`, and `operationId`.
+- `impacts`: one page of the impacting operations in the shared log's global commit order. Each entry preserves the committed record shape `{"replicaId":R,"operation":{"operationId","key","value","clock"}}` — identity, key, value, and clock exactly as committed.
+- `nextCursor`: the number of impact records skipped after this page — feed it back as the next `after`.
+- `hasMore`: whether further impact records remain.
+
+Paging follows the sync-export rules: `after` is the number of impact records already skipped (a 0-based resume cursor) and defaults to `0`; `limit` defaults to `100` and must be between `1` and `100`. A negative, blank, or non-ASCII-decimal `after`/`limit`, a repeated or unknown query parameter, a `limit` outside `1-100`, or an `after` past the impact record count returns HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state. A missing, empty, or extra path segment (for example `/v1/states/{key}/impact/extra` or `/v1/states/{key}/impact/`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check.
+
+Every number in the response is a JSON integer; strings escape only the quote (`\"`), the backslash (`\\`), and control characters U+0000–U+001F (always as `\u00XX` with lowercase hex) — every other Unicode code point is written literally.
+
+The candidate set, the impact list, the status, and the paging boundaries are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit and never observes half an import batch or a partially applied repair. The request is strictly read-only — it modifies neither memory nor the data file and creates no temporary file. With `--data-file`, the candidate state and the log are rebuilt identically during recovery, so the same state yields the same impact report before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route.
 
 ### Read-only metrics
 

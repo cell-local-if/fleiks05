@@ -503,6 +503,54 @@ def _escape_digest_string(value: str) -> str:
     return '"' + "".join(escaped) + '"'
 
 
+def _canonical_json_bytes(value: Any) -> bytes:
+    """Serialize a response payload to canonical compact UTF-8 JSON.
+
+    Objects are emitted with their keys sorted lexicographically (Unicode
+    code point order), arrays in order, and no insignificant whitespace
+    anywhere. Strings escape only the quote, the backslash, and control
+    characters (U+0000-U+001F, always as ``\\u00XX`` with lowercase hex) —
+    every other code point is written literally. Integers are emitted as
+    plain JSON integers (booleans as ``true``/``false``); no float,
+    negative zero, or non-finite value can appear because the store only
+    ever holds validated integers.
+    """
+
+    def emit(item: Any, parts: list[str]) -> None:
+        if isinstance(item, dict):
+            parts.append("{")
+            for index, name in enumerate(sorted(item)):
+                if index:
+                    parts.append(",")
+                parts.append(_escape_digest_string(name))
+                parts.append(":")
+                emit(item[name], parts)
+            parts.append("}")
+        elif isinstance(item, (list, tuple)):
+            parts.append("[")
+            for index, element in enumerate(item):
+                if index:
+                    parts.append(",")
+                emit(element, parts)
+            parts.append("]")
+        elif isinstance(item, str):
+            parts.append(_escape_digest_string(item))
+        elif item is True:
+            parts.append("true")
+        elif item is False:
+            parts.append("false")
+        elif item is None:
+            parts.append("null")
+        elif isinstance(item, int):
+            parts.append(str(item))
+        else:  # pragma: no cover - payloads never carry other types
+            raise TypeError(f"cannot serialize {type(item)!r} canonically")
+
+    parts: list[str] = []
+    emit(value, parts)
+    return "".join(parts).encode("utf-8")
+
+
 def _verification_digest_input(candidates: dict[str, list[dict[str, Any]]]) -> bytes:
     """Serialize the current candidate sets to the canonical digest input.
 
@@ -1888,7 +1936,22 @@ class StateStore:
                     "replicaId": second["replicaId"],
                     "operationId": second["operationId"],
                 }
-                if clock_dominates(first["clock"], second["clock"]):
+                # Fixed classification: an equal value always reports
+                # "overwrites" (either side covers the other, so the pair
+                # cannot conflict); a dominating clock reports "dominates";
+                # only different values under mutually non-dominating clocks
+                # report "concurrent". In a mixed conflict a pair with
+                # different values and non-dominating clocks is therefore
+                # never misreported as "overwrites" or "dominates".
+                if first["value"] == second["value"]:
+                    relations.append(
+                        {
+                            "from": first_identity,
+                            "to": second_identity,
+                            "relation": "overwrites",
+                        }
+                    )
+                elif clock_dominates(first["clock"], second["clock"]):
                     relations.append(
                         {
                             "from": first_identity,
@@ -1902,14 +1965,6 @@ class StateStore:
                             "from": second_identity,
                             "to": first_identity,
                             "relation": "dominates",
-                        }
-                    )
-                elif first["value"] == second["value"]:
-                    relations.append(
-                        {
-                            "from": first_identity,
-                            "to": second_identity,
-                            "relation": "overwrites",
                         }
                     )
                 else:
@@ -1931,6 +1986,91 @@ class StateStore:
                 "lowest_identity": candidates[0],
                 "highest_identity": candidates[-1],
             },
+        }
+
+    def get_state_impact(
+        self, key: str, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Report the cross-key causal impact on one key from one snapshot.
+
+        The candidate set and the accepted-operation log are read under the
+        same commit lock used by local writes, sync imports, repairs, and
+        checkpoint commits, so the impact list, the status, and the paging
+        boundaries always describe a single commit: a read can never observe
+        half an import batch or a partially applied repair. The snapshot
+        mutates neither memory, the data file, logs, nor checkpoints, and
+        the query creates no operation, record, or file.
+
+        Returns ``(404, {"error": "not_found"})`` when the key holds no
+        current candidates. Otherwise returns ``(200, report)`` with exactly
+        six categories of information:
+
+        - ``key``: the requested key.
+        - ``status``: ``"resolved"`` when every current candidate agrees on
+          the value, ``"conflict"`` otherwise — the same classification as
+          :meth:`get_state`.
+        - ``candidates``: the current candidates the judgement is based on,
+          in the existing query order (sorted by ``(replicaId, operationId)``
+          ascending), each carrying exactly ``value``, ``clock``,
+          ``replicaId``, and ``operationId``.
+        - ``impacts``: one page of the accepted operations on *other* keys
+          whose clocks dominate at least one of those candidates (i.e. the
+          operations causally later than the key's current state), kept in
+          the shared log's global commit order. Each entry preserves the
+          committed record shape ``{"replicaId", "operation"}`` with the
+          operation's identity, key, value, and clock. The key's own
+          operations never appear, and identical replays, rejected requests,
+          and uncommitted writes never enter the accepted log, so they can
+          never appear either.
+        - ``nextCursor``: the number of impact records skipped after this
+          page — feed it back as the next ``after``.
+        - ``hasMore``: whether further impact records remain.
+
+        ``after`` is the number of impact records already skipped (a 0-based
+        resume cursor) and ``limit`` the page size. Raises ValueError when
+        ``after`` is past the impact record count of the snapshot. With
+        ``--data-file`` the candidate state and the log are rebuilt
+        identically during recovery, so the same state yields the same
+        impact report before and after a restart.
+        """
+        with self._lock:
+            ordered = sorted(
+                self._candidates.get(key, []),
+                key=lambda c: (c["replicaId"], c["operationId"]),
+            )
+            if not ordered:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            candidates = [
+                {
+                    "value": c["value"],
+                    "clock": dict(c["clock"]),
+                    "replicaId": c["replicaId"],
+                    "operationId": c["operationId"],
+                }
+                for c in ordered
+            ]
+            basis_clocks = [c["clock"] for c in ordered]
+            impacts = [
+                {"replicaId": replica_id, "operation": operation}
+                for replica_id, operation in self._accepted
+                if operation["key"] != key
+                and any(
+                    clock_dominates(operation["clock"], basis) for basis in basis_clocks
+                )
+            ]
+            total = len(impacts)
+            if after > total:
+                raise ValueError("after is past the end of the impact list")
+            page = impacts[after : after + limit]
+        agreed = all(c["value"] == candidates[0]["value"] for c in candidates)
+        next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "key": key,
+            "status": "resolved" if agreed else "conflict",
+            "candidates": candidates,
+            "impacts": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
         }
 
     def get_state(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
@@ -2063,7 +2203,14 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _path_segments(self) -> list[str]:
         path = urlsplit(self.path).path
-        return [unquote(segment) for segment in path.split("/") if segment != ""]
+        segments = [unquote(segment) for segment in path.split("/") if segment != ""]
+        if path != "/" and path.endswith("/"):
+            # A trailing slash on a published path is a missing/extra
+            # segment boundary, not an alias for the bare path: keep an
+            # empty final segment so no route shape matches and the
+            # request falls through to 404 instead of being served.
+            segments.append("")
+        return segments
 
     def _checkpoint_route(self) -> tuple[bool, str]:
         """Match ``/v1/sync/peers/{peerId}/checkpoint`` on the raw path.
@@ -2114,6 +2261,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[3] == "why"
         ):
             self._handle_state_why_get(segments[2])
+            return
+        if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "states"
+            and segments[3] == "impact"
+        ):
+            self._handle_state_impact_get(segments[2])
             return
         if (
             len(segments) == 3
@@ -2242,6 +2397,44 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         status, payload = self._store.get_state_explanation(key)
         self._json_newline(status, payload)
+
+    def _json_canonical_newline(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        """Respond with canonical compact JSON terminated by one newline.
+
+        The body is serialized by :func:`_canonical_json_bytes`: sorted
+        object keys, no insignificant whitespace, strings escaping only the
+        quote, the backslash, and control characters, and every number a
+        plain JSON integer. A single trailing ``\\n`` is included in both
+        the body and its declared length.
+        """
+        body = _canonical_json_bytes(payload) + b"\n"
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_state_impact_get(self, key: str) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there), so a
+        # malformed query is rejected here without any state being read or
+        # changed. The response follows the compact-single-line contract:
+        # canonical JSON, one trailing newline, numbers only as integers.
+        params = parse_paging_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_state_impact(key, after, limit)
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
 
     def _handle_verification_digest_get(self) -> None:
         if not parse_metrics_query(urlsplit(self.path).query):
