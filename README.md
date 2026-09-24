@@ -98,6 +98,32 @@ Candidates are stored per key with vector-clock semantics (missing components co
 
 Keys are isolated from each other, and reads reflect the latest writes.
 
+### Explaining a key's candidate state
+
+`GET /v1/states/{key}/why` returns a read-only causal explanation of one key's current candidate state. A key with no current candidates — one that never appeared, or one whose history leaves no current candidate — returns HTTP 404 with `{"error":"not_found"}`.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object with exactly five fields, terminated by a single newline:
+
+```json
+{"candidates":[{"clock":{"r1":1},"operationId":"op-1","replicaId":"r1","value":"blue"},{"clock":{"r2":1},"operationId":"op-2","replicaId":"r2","value":"red"}],"key":"color","relations":[{"from":{"operationId":"op-1","replicaId":"r1"},"relation":"concurrent","to":{"operationId":"op-2","replicaId":"r2"}}],"status":"conflict","suggestion":{"highest_identity":{"clock":{"r2":1},"operationId":"op-2","replicaId":"r2","value":"red"},"lowest_identity":{"clock":{"r1":1},"operationId":"op-1","replicaId":"r1","value":"blue"}}}
+```
+
+- `key`: the requested key (the path segment is percent-decoded like every route).
+- `status`: `"resolved"` when every current candidate agrees on the value, `"conflict"` otherwise — the same classification as `GET /v1/states/{key}`.
+- `candidates`: the current candidates in the same order as the conflict view of `GET /v1/states/{key}` — sorted by `(replicaId, operationId)` ascending — each carrying exactly `value`, `clock`, `replicaId`, and `operationId`.
+- `relations`: one entry per unordered pair of current candidates, enumerated in candidate order. Each entry names the pair's endpoints as `{"replicaId","operationId"}` identities under `from`/`to` and classifies the pair under `relation`:
+  - `"dominates"` when one candidate's clock dominates the other's (`from` is the dominating candidate). Current candidates never dominate one another, so this kind completes the vocabulary without being emitted by the present store.
+  - `"overwrites"` when the two candidates hold the same value: either one covers the other, so the pair cannot conflict. For a resolved key these entries report the agreed value's unique source relation.
+  - `"concurrent"` when the values differ and neither clock dominates the other — exactly why the pair does not dominate each other.
+  A key with a single candidate has an empty relation set, still expressed as an array (`[]`).
+- `suggestion`: `{"lowest_identity":C,"highest_identity":C}` reporting which current candidate each of the two existing automatic-resolution policies would select — the smallest and largest `(replicaId, operationId)` — in the same shape as the `candidates` entries. The suggestion is purely informational: the endpoint creates no repair operation, log record, or checkpoint.
+
+Every number in the response is a JSON integer (the only numbers are vector-clock ticks); no float, negative zero, or non-finite value can appear.
+
+The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state. A missing, empty, or extra path segment (for example `/v1/states/{key}/why/extra`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check.
+
+The candidate set, the relations, and the suggestion are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit and never observes half an import batch or a partially applied repair. The request is strictly read-only — it modifies neither memory nor the data file and creates no file. With `--data-file`, the candidate state is rebuilt identically during recovery, so the same state yields the same relations, sources, and policy suggestions before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route.
+
 ### Read-only metrics
 
 `GET /v1/metrics` returns HTTP 200 with a UTF-8 JSON object containing exactly six non-negative integer counters:

@@ -1813,6 +1813,126 @@ class StateStore:
             return HTTPStatus.NOT_FOUND, {"error": "not_found"}
         return HTTPStatus.OK, {"peerId": peer_id, "cursor": cursor}
 
+    def get_state_explanation(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Explain one key's current candidate state from a single snapshot.
+
+        The candidate set is copied under the same commit lock used by local
+        writes, sync imports, repairs, and checkpoint commits, so the
+        response always describes one commit: a read can never observe half
+        an import batch or a partially applied repair. The snapshot mutates
+        neither memory, the data file, logs, nor checkpoints, and the
+        explanation creates no repair operation, log record, or checkpoint.
+
+        Returns ``(404, {"error": "not_found"})`` when the key holds no
+        current candidates — whether it never appeared or its history leaves
+        no current candidate. Otherwise returns ``(200, explanation)`` with
+        exactly five categories of information:
+
+        - ``key``: the requested key.
+        - ``status``: ``"resolved"`` when every current candidate agrees on
+          the value, ``"conflict"`` otherwise — the same classification as
+          :meth:`get_state`.
+        - ``candidates``: the current candidates in the existing query
+          order (sorted by ``(replicaId, operationId)`` ascending), each
+          carrying exactly ``value``, ``clock``, ``replicaId``, and
+          ``operationId``.
+        - ``relations``: one entry per unordered pair of current
+          candidates, enumerated in candidate order. Each entry names the
+          pair's endpoints as ``{"replicaId", "operationId"}`` identities
+          under ``from``/``to`` and classifies the pair under ``relation``:
+          ``"dominates"`` when one candidate's clock dominates the other's
+          (``from`` dominates ``to``; current candidates never dominate
+          each other, so the kind completes the vocabulary without being
+          emitted), ``"overwrites"`` when the two candidates hold the same
+          value (either covers the other, so the pair cannot conflict —
+          for a resolved key these entries report the agreed value's
+          unique source relation), and ``"concurrent"`` when the values
+          differ and neither clock dominates the other, which is exactly
+          why the pair does not dominate each other. A key with a single
+          candidate yields an empty list.
+        - ``suggestion``: ``{"lowest_identity": C, "highest_identity": C}``
+          reporting which current candidate each of the two existing
+          automatic-resolution policies would select — the smallest and
+          largest ``(replicaId, operationId)`` — in the same shape as the
+          ``candidates`` entries.
+
+        With ``--data-file`` the candidate state is rebuilt identically
+        during recovery, so the same state yields the same relations,
+        sources, and policy suggestions before and after a restart.
+        """
+        with self._lock:
+            ordered = sorted(
+                self._candidates.get(key, []),
+                key=lambda c: (c["replicaId"], c["operationId"]),
+            )
+            candidates = [
+                {
+                    "value": c["value"],
+                    "clock": dict(c["clock"]),
+                    "replicaId": c["replicaId"],
+                    "operationId": c["operationId"],
+                }
+                for c in ordered
+            ]
+        if not candidates:
+            return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+
+        relations: list[dict[str, Any]] = []
+        for index, first in enumerate(candidates):
+            first_identity = {
+                "replicaId": first["replicaId"],
+                "operationId": first["operationId"],
+            }
+            for second in candidates[index + 1 :]:
+                second_identity = {
+                    "replicaId": second["replicaId"],
+                    "operationId": second["operationId"],
+                }
+                if clock_dominates(first["clock"], second["clock"]):
+                    relations.append(
+                        {
+                            "from": first_identity,
+                            "to": second_identity,
+                            "relation": "dominates",
+                        }
+                    )
+                elif clock_dominates(second["clock"], first["clock"]):
+                    relations.append(
+                        {
+                            "from": second_identity,
+                            "to": first_identity,
+                            "relation": "dominates",
+                        }
+                    )
+                elif first["value"] == second["value"]:
+                    relations.append(
+                        {
+                            "from": first_identity,
+                            "to": second_identity,
+                            "relation": "overwrites",
+                        }
+                    )
+                else:
+                    relations.append(
+                        {
+                            "from": first_identity,
+                            "to": second_identity,
+                            "relation": "concurrent",
+                        }
+                    )
+
+        agreed = all(c["value"] == candidates[0]["value"] for c in candidates)
+        return HTTPStatus.OK, {
+            "key": key,
+            "status": "resolved" if agreed else "conflict",
+            "candidates": candidates,
+            "relations": relations,
+            "suggestion": {
+                "lowest_identity": candidates[0],
+                "highest_identity": candidates[-1],
+            },
+        }
+
     def get_state(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
         with self._lock:
             candidates = list(self._candidates.get(key, []))
@@ -1988,6 +2108,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(status, payload)
             return
         if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "states"
+            and segments[3] == "why"
+        ):
+            self._handle_state_why_get(segments[2])
+            return
+        if (
             len(segments) == 3
             and segments[0] == "v1"
             and segments[1] == "sync"
@@ -2103,6 +2231,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         self._json(HTTPStatus.OK, self._store.get_metrics())
+
+    def _handle_state_why_get(self, key: str) -> None:
+        # The route-shape check in do_GET already ran, so a query parameter
+        # is rejected here without any state being read or changed. The
+        # explanation body follows the compact-single-line contract: one
+        # trailing newline, numbers only as JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._store.get_state_explanation(key)
+        self._json_newline(status, payload)
 
     def _handle_verification_digest_get(self) -> None:
         if not parse_metrics_query(urlsplit(self.path).query):
