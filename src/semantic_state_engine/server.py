@@ -443,6 +443,55 @@ def parse_sync_query(query: str) -> tuple[int, int] | None:
     return parse_paging_query(query)
 
 
+CAUSAL_COMPARE_IDENTITY_PARAMS = (
+    "leftReplicaId",
+    "leftOperationId",
+    "rightReplicaId",
+    "rightOperationId",
+)
+
+
+def parse_causal_compare_query(query: str) -> tuple[str, str, str, str, int, int] | None:
+    """Validate the causal-compare query string.
+
+    Accepts exactly the four identity parameters (all required, each a
+    single non-empty value decoded by the standard query rules) plus the
+    shared paging parameters ``after`` (default 0) and ``limit`` (default
+    100, 1-100) under the same rules as :func:`parse_paging_query`. A
+    missing, repeated, unknown, or empty parameter, and a malformed,
+    negative, non-ASCII, or out-of-range ``after``/``limit`` return None.
+    Returns ``(left_replica_id, left_operation_id, right_replica_id,
+    right_operation_id, after, limit)``.
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    allowed = set(CAUSAL_COMPARE_IDENTITY_PARAMS) | {"after", "limit"}
+    if not set(parsed) <= allowed:
+        return None
+    if not all(name in parsed for name in CAUSAL_COMPARE_IDENTITY_PARAMS):
+        return None
+    identities: list[str] = []
+    for name in CAUSAL_COMPARE_IDENTITY_PARAMS:
+        value = parsed[name][0]
+        if value == "":
+            return None
+        identities.append(value)
+    after = 0
+    limit = SYNC_DEFAULT_LIMIT
+    if "after" in parsed:
+        after_value = _non_negative_int(parsed["after"][0])
+        if after_value is None:
+            return None
+        after = after_value
+    if "limit" in parsed:
+        limit_value = _non_negative_int(parsed["limit"][0])
+        if limit_value is None or not (1 <= limit_value <= SYNC_BATCH_MAX):
+            return None
+        limit = limit_value
+    return (identities[0], identities[1], identities[2], identities[3], after, limit)
+
+
 def parse_metrics_query(query: str) -> bool:
     """Validate the metrics query string, which accepts no parameters.
 
@@ -1938,6 +1987,68 @@ class StateStore:
             }
         return HTTPStatus.OK, {"replicaId": replica_id, "operation": record}
 
+    def _strict_predecessors_locked(
+        self, replica_id: str, operation_id: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+        """Return the source operation and its classified strict predecessors.
+
+        Must be called with the commit lock held. Returns None when the
+        identity was never first-accepted; otherwise returns
+        ``(source, ancestors)`` where ``ancestors`` is the full predecessor
+        list in global commit order, each entry in the archive record shape
+        plus the ``relation`` field (``"direct"`` when no other strict
+        predecessor's clock dominates the record's clock, ``"transitive"``
+        otherwise). This is the shared single-operation chain used by both
+        the per-operation ancestor query and the two-operation comparison.
+        """
+        source = self._operations.get((replica_id, operation_id))
+        if source is None:
+            return None
+        predecessors: list[tuple[str, dict[str, Any]]] = []
+        for accepted_replica, accepted_operation in self._accepted:
+            if (
+                accepted_replica == replica_id
+                and accepted_operation["operationId"] == operation_id
+            ):
+                # The source identity is unique in the log; only records
+                # committed before it can be its predecessors.
+                break
+            if clock_dominates(source["clock"], accepted_operation["clock"]):
+                predecessors.append((accepted_replica, accepted_operation))
+        ancestors: list[dict[str, Any]] = []
+        for index, (pred_replica, pred_operation) in enumerate(predecessors):
+            dominated = any(
+                other_index != index
+                and clock_dominates(other_operation["clock"], pred_operation["clock"])
+                for other_index, (_, other_operation) in enumerate(predecessors)
+            )
+            ancestors.append(
+                {
+                    "replicaId": pred_replica,
+                    "operation": {
+                        "operationId": pred_operation["operationId"],
+                        "key": pred_operation["key"],
+                        "value": pred_operation["value"],
+                        "clock": dict(pred_operation["clock"]),
+                    },
+                    "relation": "transitive" if dominated else "direct",
+                }
+            )
+        return source, ancestors
+
+    @staticmethod
+    def _archive_record(replica_id: str, operation: dict[str, Any]) -> dict[str, Any]:
+        """Shape a committed operation as a per-operation archive record."""
+        return {
+            "replicaId": replica_id,
+            "operation": {
+                "operationId": operation["operationId"],
+                "key": operation["key"],
+                "value": operation["value"],
+                "clock": dict(operation["clock"]),
+            },
+        }
+
     def get_causal_ancestors(
         self, replica_id: str, operation_id: str, after: int, limit: int
     ) -> tuple[HTTPStatus, dict[str, Any]]:
@@ -1980,55 +2091,122 @@ class StateStore:
         relations, and the same pages before and after a restart.
         """
         with self._lock:
-            source = self._operations.get((replica_id, operation_id))
-            if source is None:
+            chain = self._strict_predecessors_locked(replica_id, operation_id)
+            if chain is None:
                 return HTTPStatus.NOT_FOUND, {"error": "not_found"}
-            predecessors: list[tuple[str, dict[str, Any]]] = []
-            for accepted_replica, accepted_operation in self._accepted:
-                if (
-                    accepted_replica == replica_id
-                    and accepted_operation["operationId"] == operation_id
-                ):
-                    # The source identity is unique in the log; only records
-                    # committed before it can be its predecessors.
-                    break
-                if clock_dominates(source["clock"], accepted_operation["clock"]):
-                    predecessors.append((accepted_replica, accepted_operation))
-            ancestors: list[dict[str, Any]] = []
-            for index, (pred_replica, pred_operation) in enumerate(predecessors):
-                dominated = any(
-                    other_index != index
-                    and clock_dominates(other_operation["clock"], pred_operation["clock"])
-                    for other_index, (_, other_operation) in enumerate(predecessors)
-                )
-                ancestors.append(
-                    {
-                        "replicaId": pred_replica,
-                        "operation": {
-                            "operationId": pred_operation["operationId"],
-                            "key": pred_operation["key"],
-                            "value": pred_operation["value"],
-                            "clock": dict(pred_operation["clock"]),
-                        },
-                        "relation": "transitive" if dominated else "direct",
-                    }
-                )
+            source, ancestors = chain
             total = len(ancestors)
             if after > total:
                 raise ValueError("after is past the end of the ancestor list")
             page = ancestors[after : after + limit]
-            source_record = {
-                "operationId": source["operationId"],
-                "key": source["key"],
-                "value": source["value"],
-                "clock": dict(source["clock"]),
-            }
+            source_record = self._archive_record(replica_id, source)
         cursor = after + len(page)
         return HTTPStatus.OK, {
-            "operation": {"replicaId": replica_id, "operation": source_record},
+            "operation": source_record,
             "ancestors": page,
             "cursor": cursor,
             "more": cursor < total,
+        }
+
+    def get_causal_compare(
+        self,
+        left_replica_id: str,
+        left_operation_id: str,
+        right_replica_id: str,
+        right_operation_id: str,
+        after: int,
+        limit: int,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Compare the strict causal slices of two accepted operations.
+
+        Both source operations, both predecessor lists, the relation, the
+        difference counts, and the paging boundaries are all read under the
+        same commit lock used by local writes, sync imports, repairs, and
+        checkpoint commits, so the response always describes a single
+        commit: a read can never observe half an import batch or a partially
+        applied repair. The snapshot mutates neither memory, the data file,
+        candidates, metrics, audits, checkpoints, nor logs.
+
+        Each side reuses the single-operation chain of
+        :meth:`get_causal_ancestors`: the source record in the archive
+        shape, its strict predecessors in global commit order classified
+        ``direct``/``transitive``, and one page of them. ``after`` is the
+        number of predecessors both sides skip together and ``limit`` the
+        shared page size; paging only trims the two predecessor lists.
+
+        ``relation`` compares the two source clocks: ``"left_dominates_right"``
+        when the left source clock dominates the right one,
+        ``"right_dominates_left"`` for the converse, and ``"concurrent"``
+        when neither dominates (equal clocks included).
+
+        ``difference`` counts predecessor identities — ``(replicaId,
+        operationId)`` pairs, deduplicated — over the two **full**
+        predecessor sets, never the pages: ``shared`` in both, ``leftOnly``
+        only on the left, ``rightOnly`` only on the right.
+
+        Returns ``(404, {"error": "not_found"})`` when either identity was
+        never first-accepted. Otherwise returns ``(200, report)`` with
+        exactly four fields: ``left`` and ``right`` (each carrying
+        ``operation``, ``ancestors``, ``cursor``, and ``more`` exactly as
+        the single-operation report), ``relation``, and ``difference``.
+        Raises ValueError when ``after`` is past either side's predecessor
+        count in the snapshot. With ``--data-file`` the log is rebuilt
+        identically during recovery, so the same state yields the same
+        comparison before and after a restart.
+        """
+        with self._lock:
+            left_chain = self._strict_predecessors_locked(left_replica_id, left_operation_id)
+            if left_chain is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            right_chain = self._strict_predecessors_locked(right_replica_id, right_operation_id)
+            if right_chain is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            left_source, left_ancestors = left_chain
+            right_source, right_ancestors = right_chain
+            left_total = len(left_ancestors)
+            right_total = len(right_ancestors)
+            if after > left_total or after > right_total:
+                raise ValueError("after is past the end of an ancestor list")
+            left_page = left_ancestors[after : after + limit]
+            right_page = right_ancestors[after : after + limit]
+            left_record = self._archive_record(left_replica_id, left_source)
+            right_record = self._archive_record(right_replica_id, right_source)
+            if clock_dominates(left_source["clock"], right_source["clock"]):
+                relation = "left_dominates_right"
+            elif clock_dominates(right_source["clock"], left_source["clock"]):
+                relation = "right_dominates_left"
+            else:
+                relation = "concurrent"
+            left_identities = {
+                (entry["replicaId"], entry["operation"]["operationId"])
+                for entry in left_ancestors
+            }
+            right_identities = {
+                (entry["replicaId"], entry["operation"]["operationId"])
+                for entry in right_ancestors
+            }
+            difference = {
+                "shared": len(left_identities & right_identities),
+                "leftOnly": len(left_identities - right_identities),
+                "rightOnly": len(right_identities - left_identities),
+            }
+        left_cursor = after + len(left_page)
+        right_cursor = after + len(right_page)
+        return HTTPStatus.OK, {
+            "left": {
+                "operation": left_record,
+                "ancestors": left_page,
+                "cursor": left_cursor,
+                "more": left_cursor < left_total,
+            },
+            "right": {
+                "operation": right_record,
+                "ancestors": right_page,
+                "cursor": right_cursor,
+                "more": right_cursor < right_total,
+            },
+            "relation": relation,
+            "difference": difference,
         }
 
     def get_checkpoint(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
@@ -2494,6 +2672,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_operation_archive_get(segments[2], segments[4])
             return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "causal"
+            and segments[2] == "compare"
+        ):
+            self._handle_causal_compare_get()
+            return
         if len(segments) == 4 and segments[0] == "v1" and segments[1] == "causal":
             self._handle_causal_get(segments[2], segments[3])
             return
@@ -2717,6 +2903,38 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             status, payload = self._store.get_causal_ancestors(
                 replica_id, operation_id, after, limit
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
+
+    def _handle_causal_compare_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing, empty, or
+        # extra segments — including a trailing slash — are 404 there), so
+        # a malformed query is rejected here without any state being read
+        # or changed. The response follows the compact-single-line
+        # contract: canonical JSON, one trailing newline, numbers only as
+        # integers.
+        params = parse_causal_compare_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        left_replica_id, left_operation_id, right_replica_id, right_operation_id, after, limit = (
+            params
+        )
+        try:
+            status, payload = self._store.get_causal_compare(
+                left_replica_id,
+                left_operation_id,
+                right_replica_id,
+                right_operation_id,
+                after,
+                limit,
             )
         except ValueError:
             self._json_canonical_newline(
