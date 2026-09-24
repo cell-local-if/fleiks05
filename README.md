@@ -372,6 +372,29 @@ With `--data-file`, the stream is rebuilt from the recovered log on startup, so 
 
 With `--data-file`, the identity index is rebuilt from the recovered log on startup, so successful results, the 404 boundary, and error statuses are identical before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
 
+### Per-operation causal ancestor chain
+
+`GET /v1/causal/{replicaId}/{operationId}?after=N&limit=N` returns a read-only page of one operation's **strict causal predecessors**. Both path segments are percent-decoded like every other route and must be non-empty after decoding; an identity that was never first-accepted returns HTTP 404 with `{"error":"not_found"}`, and the route-shape check takes precedence over every other check.
+
+A strict predecessor is a first-accepted record committed **before** the source operation in the shared log whose clock is strictly smaller than the source operation's clock — the source clock dominates it (missing components count as 0, and domination already requires the clocks to differ). The source operation itself never appears. Stale writes and accepted conflict repairs are ordinary committed records and participate like any other; identical replays (`200`), conflicting or malformed requests (`409`/`400`), and uncommitted writes never enter the log, so they can never appear.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly four fields:
+
+```json
+{"ancestors":[{"operation":{"clock":{"r1":1},"key":"color","operationId":"op-1","value":"blue"},"relation":"direct","replicaId":"r1"}],"cursor":1,"more":false,"operation":{"operation":{"clock":{"r1":1,"r2":1},"key":"size","operationId":"op-2","value":"large"},"replicaId":"r2"}}
+```
+
+- `operation`: the source record in the per-operation archive shape `{"replicaId":R,"operation":{"operationId","key","value","clock"}}`.
+- `ancestors`: one page of the strict predecessors in the shared log's global commit order. Each entry preserves the archive record content and adds `relation`: `"direct"` when no other strict predecessor's clock dominates the record's clock, `"transitive"` otherwise.
+- `cursor`: the number of predecessors skipped after this page — feed it back as the next `after`.
+- `more`: whether further predecessors remain.
+
+Paging follows the sync-export rules: `after` is the number of predecessors already skipped (a 0-based resume cursor) and defaults to `0`; `limit` defaults to `100` and must be between `1` and `100`. A legal identity with no predecessors — or an `after` equal to the predecessor count — returns HTTP 200 with an empty `ancestors` list. A negative, blank, or non-ASCII-decimal `after`/`limit`, a repeated or unknown query parameter, a `limit` outside `1-100`, or an `after` past the predecessor count returns HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state. A missing, empty, or extra path segment (for example `/v1/causal/{replicaId}` or `/v1/causal/{replicaId}/{operationId}/`) returns HTTP 404 with `{"error":"not_found"}`.
+
+Every number in the response is a JSON integer; strings escape only the quote (`\"`), the backslash (`\\`), and control characters U+0000–U+001F (always as `\u00XX` with lowercase hex) — every other Unicode code point is written literally.
+
+The source record, the predecessor list, the relation classification, and the paging boundaries are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit: a read can never observe half an import batch or a partially applied repair. The request is strictly read-only — it modifies neither memory nor the data file and creates no temporary file. With `--data-file`, the log is rebuilt identically during recovery, so the same recovered state yields the same source, the same predecessor relations, and the same pages before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route.
+
 ### Replication-snapshot consistency verification
 
 `GET /v1/replication/snapshot` returns a read-only consistency summary over one committed snapshot: the current candidate state, the accepted-log position, and the whole checkpoint mapping are read together. A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with an explicit `Content-Length` and exactly seven fields:

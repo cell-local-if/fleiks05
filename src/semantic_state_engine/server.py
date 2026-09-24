@@ -1938,6 +1938,99 @@ class StateStore:
             }
         return HTTPStatus.OK, {"replicaId": replica_id, "operation": record}
 
+    def get_causal_ancestors(
+        self, replica_id: str, operation_id: str, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of an operation's strict causal predecessors.
+
+        The source operation, the predecessor list, and the paging
+        boundaries are all read under the same commit lock used by local
+        writes, sync imports, repairs, and checkpoint commits, so the
+        response always describes a single commit: a read can never observe
+        half an import batch or a partially applied repair. The snapshot
+        mutates neither memory, the data file, candidates, metrics, audits,
+        checkpoints, nor logs.
+
+        A strict predecessor is a first-accepted record committed **before**
+        the source operation in the shared log whose clock is strictly
+        smaller than the source operation's clock — the source clock
+        dominates it (missing components count as 0, and domination already
+        requires the clocks to differ). The source operation itself never
+        appears. Stale writes and accepted repairs are ordinary committed
+        records and participate like any other; identical replays,
+        conflicting or invalid requests, and uncommitted writes never enter
+        the log, so they can never appear.
+
+        Each strict predecessor is classified under ``relation``:
+        ``"direct"`` when no other strict predecessor's clock dominates its
+        own, ``"transitive"`` otherwise.
+
+        Returns ``(404, {"error": "not_found"})`` when the identity was
+        never first-accepted. Otherwise returns ``(200, report)`` with
+        exactly four fields: ``operation`` (the source record in the
+        per-operation archive shape ``{"replicaId", "operation"}``),
+        ``ancestors`` (one page of predecessor records in the shared log's
+        global commit order, each preserving the archive record content
+        plus the ``relation`` field), ``cursor`` (the number of
+        predecessors skipped after this page — feed it back as the next
+        ``after``), and ``more`` (whether further predecessors remain).
+        Raises ValueError when ``after`` is past the predecessor count of
+        the snapshot. With ``--data-file`` the log is rebuilt identically
+        during recovery, so the same state yields the same source, the same
+        relations, and the same pages before and after a restart.
+        """
+        with self._lock:
+            source = self._operations.get((replica_id, operation_id))
+            if source is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            predecessors: list[tuple[str, dict[str, Any]]] = []
+            for accepted_replica, accepted_operation in self._accepted:
+                if (
+                    accepted_replica == replica_id
+                    and accepted_operation["operationId"] == operation_id
+                ):
+                    # The source identity is unique in the log; only records
+                    # committed before it can be its predecessors.
+                    break
+                if clock_dominates(source["clock"], accepted_operation["clock"]):
+                    predecessors.append((accepted_replica, accepted_operation))
+            ancestors: list[dict[str, Any]] = []
+            for index, (pred_replica, pred_operation) in enumerate(predecessors):
+                dominated = any(
+                    other_index != index
+                    and clock_dominates(other_operation["clock"], pred_operation["clock"])
+                    for other_index, (_, other_operation) in enumerate(predecessors)
+                )
+                ancestors.append(
+                    {
+                        "replicaId": pred_replica,
+                        "operation": {
+                            "operationId": pred_operation["operationId"],
+                            "key": pred_operation["key"],
+                            "value": pred_operation["value"],
+                            "clock": dict(pred_operation["clock"]),
+                        },
+                        "relation": "transitive" if dominated else "direct",
+                    }
+                )
+            total = len(ancestors)
+            if after > total:
+                raise ValueError("after is past the end of the ancestor list")
+            page = ancestors[after : after + limit]
+            source_record = {
+                "operationId": source["operationId"],
+                "key": source["key"],
+                "value": source["value"],
+                "clock": dict(source["clock"]),
+            }
+        cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "operation": {"replicaId": replica_id, "operation": source_record},
+            "ancestors": page,
+            "cursor": cursor,
+            "more": cursor < total,
+        }
+
     def get_checkpoint(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Return the registered checkpoint, or 404 when ``peer_id`` is unknown.
 
@@ -2401,6 +2494,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_operation_archive_get(segments[2], segments[4])
             return
+        if len(segments) == 4 and segments[0] == "v1" and segments[1] == "causal":
+            self._handle_causal_get(segments[2], segments[3])
+            return
         matched, checkpoint_peer = self._checkpoint_route()
         if matched:
             self._handle_checkpoint_get(checkpoint_peer)
@@ -2603,6 +2699,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         status, payload = self._store.get_operation(replica_id, operation_id)
         self._json(status, payload)
+
+    def _handle_causal_get(self, replica_id: str, operation_id: str) -> None:
+        # The route-shape check in do_GET already ran (missing, empty, or
+        # extra segments — including a trailing slash — are 404 there), so
+        # a malformed query is rejected here without any state being read
+        # or changed. The response follows the compact-single-line
+        # contract: canonical JSON, one trailing newline, numbers only as
+        # integers.
+        params = parse_paging_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_causal_ancestors(
+                replica_id, operation_id, after, limit
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
 
     def _handle_sync_post(self) -> None:
         raw = self._read_bounded_body()
