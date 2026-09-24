@@ -1840,16 +1840,19 @@ class StateStore:
           candidates, enumerated in candidate order. Each entry names the
           pair's endpoints as ``{"replicaId", "operationId"}`` identities
           under ``from``/``to`` and classifies the pair under ``relation``:
-          ``"dominates"`` when one candidate's clock dominates the other's
-          (``from`` dominates ``to``; current candidates never dominate
-          each other, so the kind completes the vocabulary without being
-          emitted), ``"overwrites"`` when the two candidates hold the same
-          value (either covers the other, so the pair cannot conflict —
-          for a resolved key these entries report the agreed value's
-          unique source relation), and ``"concurrent"`` when the values
-          differ and neither clock dominates the other, which is exactly
-          why the pair does not dominate each other. A key with a single
-          candidate yields an empty list.
+          ``"overwrites"`` when the two candidates hold the same value
+          (either covers the other, so the pair cannot conflict — for a
+          resolved key these entries report the agreed value's unique
+          source relation), ``"dominates"`` when the values differ and one
+          candidate's clock dominates the other's (``from`` dominates
+          ``to``; current candidates never dominate each other, so the
+          kind completes the vocabulary without being emitted), and
+          ``"concurrent"`` when the values differ and neither clock
+          dominates the other, which is exactly why the pair does not
+          dominate each other. A mixed conflict therefore never reports a
+          different-valued, mutually non-dominating pair as anything but
+          ``"concurrent"``. A key with a single candidate yields an empty
+          list.
         - ``suggestion``: ``{"lowest_identity": C, "highest_identity": C}``
           reporting which current candidate each of the two existing
           automatic-resolution policies would select — the smallest and
@@ -1888,7 +1891,17 @@ class StateStore:
                     "replicaId": second["replicaId"],
                     "operationId": second["operationId"],
                 }
-                if clock_dominates(first["clock"], second["clock"]):
+                if first["value"] == second["value"]:
+                    # Same value: either candidate covers the other, so the
+                    # pair cannot conflict however the clocks relate.
+                    relations.append(
+                        {
+                            "from": first_identity,
+                            "to": second_identity,
+                            "relation": "overwrites",
+                        }
+                    )
+                elif clock_dominates(first["clock"], second["clock"]):
                     relations.append(
                         {
                             "from": first_identity,
@@ -1902,14 +1915,6 @@ class StateStore:
                             "from": second_identity,
                             "to": first_identity,
                             "relation": "dominates",
-                        }
-                    )
-                elif first["value"] == second["value"]:
-                    relations.append(
-                        {
-                            "from": first_identity,
-                            "to": second_identity,
-                            "relation": "overwrites",
                         }
                     )
                 else:
