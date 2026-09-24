@@ -2247,6 +2247,194 @@ class StateStore:
             },
         }
 
+    def get_causal_diff(
+        self,
+        left_replica_id: str,
+        left_operation_id: str,
+        right_replica_id: str,
+        right_operation_id: str,
+        after: int,
+        limit: int,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return the grouped strict-predecessor diff of two operations.
+
+        Like :meth:`get_causal_comparison`, both source records and their
+        complete strict predecessor sets are read under one commit lock, so
+        the response always describes a single commit and is strictly
+        read-only.
+
+        The de-duplicated predecessor identities are partitioned into three
+        evidence groups, each kept in the shared log's global commit order:
+        ``shared`` (present on both sides), ``left_only`` (only the left
+        source dominates the record), and ``right_only``. Each entry keeps
+        the comparison endpoint's predecessor record shape
+        (``replicaId``/``operation`` plus a ``relation`` field); the
+        ``direct``/``transitive`` relation is computed once against the
+        merged evidence union rather than per side, so every identity has a
+        single stable classification.
+
+        ``explanation`` is the compressed causal explanation: one entry per
+        one-sided predecessor that no other one-sided predecessor on the
+        same side dominates — the minimal boundary that still differentiates
+        the two sources. Shared evidence and same-side one-sided evidence
+        that is itself covered by another one-sided predecessor never
+        appear. Each entry carries exactly ``from`` (the boundary
+        identity), ``to`` (that side's source identity), and ``side``
+        (``"left"`` or ``"right"``); the entries keep global commit order.
+
+        Paging runs over one stable merge of the three groups — shared,
+        then left-only, then right-only — and the current window is
+        partitioned back into the three groups. ``difference`` counts and
+        the explanation are always computed from the complete, unpaged
+        predecessor sets. ``after`` equal to the merged predecessor count is
+        a valid empty tail.
+
+        Returns ``(404, {"error": "not_found"})`` when either identity was
+        never first-accepted. Otherwise returns ``(200, report)``. Raises
+        ValueError when ``after`` is past the merged predecessor count of
+        the snapshot. With ``--data-file`` the log is rebuilt identically
+        during recovery, so the same state yields the same groups,
+        difference counts, explanation, and pages before and after a
+        restart.
+        """
+        with self._lock:
+            left_source = self._operations.get((left_replica_id, left_operation_id))
+            right_source = self._operations.get((right_replica_id, right_operation_id))
+            if left_source is None or right_source is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            left_predecessors = self._strict_predecessors_locked(
+                self._accepted,
+                left_replica_id,
+                left_operation_id,
+                left_source["clock"],
+            )
+            right_predecessors = self._strict_predecessors_locked(
+                self._accepted,
+                right_replica_id,
+                right_operation_id,
+                right_source["clock"],
+            )
+            left_identities = {
+                (pred_replica, pred_operation["operationId"])
+                for pred_replica, pred_operation in left_predecessors
+            }
+            right_identities = {
+                (pred_replica, pred_operation["operationId"])
+                for pred_replica, pred_operation in right_predecessors
+            }
+            # Merge the two sides in the shared log's global commit order.
+            # Each predecessor list is a commit-ordered subsequence of the
+            # accepted log, so a scan of the log reproduces their identity
+            # union in exactly that order.
+            union: list[tuple[str, dict[str, Any]]] = [
+                (accepted_replica, accepted_operation)
+                for accepted_replica, accepted_operation in self._accepted
+                if (
+                    accepted_replica,
+                    accepted_operation["operationId"],
+                )
+                in left_identities
+                or (
+                    accepted_replica,
+                    accepted_operation["operationId"],
+                )
+                in right_identities
+            ]
+            # Classify direct/transitive once against the merged evidence
+            # pool, giving every identity one stable relation value.
+            union_entries = self._ancestor_entries_locked(union)
+            shared: list[dict[str, Any]] = []
+            left_only: list[dict[str, Any]] = []
+            right_only: list[dict[str, Any]] = []
+            left_only_records: list[tuple[str, dict[str, Any]]] = []
+            right_only_records: list[tuple[str, dict[str, Any]]] = []
+            for record, entry in zip(union, union_entries):
+                identity = (record[0], record[1]["operationId"])
+                in_left = identity in left_identities
+                in_right = identity in right_identities
+                if in_left and in_right:
+                    shared.append(entry)
+                elif in_left:
+                    left_only.append(entry)
+                    left_only_records.append(record)
+                else:
+                    right_only.append(entry)
+                    right_only_records.append(record)
+
+            # Compressed minimal-boundary explanation. A one-sided
+            # predecessor is located only when no other one-sided
+            # predecessor on the same side dominates it; walking the union
+            # keeps the explanation itself in global commit order.
+            explanation: list[dict[str, Any]] = []
+            for pred_replica, pred_operation in union:
+                identity = (pred_replica, pred_operation["operationId"])
+                in_left = identity in left_identities
+                in_right = identity in right_identities
+                if in_left and in_right:
+                    continue
+                if in_left:
+                    side = "left"
+                    group_records = left_only_records
+                    target = (left_replica_id, left_operation_id)
+                else:
+                    side = "right"
+                    group_records = right_only_records
+                    target = (right_replica_id, right_operation_id)
+                covered = any(
+                    (other_replica, other_operation["operationId"]) != identity
+                    and clock_dominates(other_operation["clock"], pred_operation["clock"])
+                    for other_replica, other_operation in group_records
+                )
+                if not covered:
+                    explanation.append(
+                        {
+                            "from": {
+                                "replicaId": pred_replica,
+                                "operationId": pred_operation["operationId"],
+                            },
+                            "to": {
+                                "replicaId": target[0],
+                                "operationId": target[1],
+                            },
+                            "side": side,
+                        }
+                    )
+
+            merged = [*shared, *left_only, *right_only]
+            total = len(merged)
+            if after > total:
+                raise ValueError("after is past the end of the merged predecessor list")
+            window = merged[after : after + limit]
+            shared_page: list[dict[str, Any]] = []
+            left_page: list[dict[str, Any]] = []
+            right_page: list[dict[str, Any]] = []
+            for entry in window:
+                identity = (entry["replicaId"], entry["operation"]["operationId"])
+                if identity in left_identities and identity in right_identities:
+                    shared_page.append(entry)
+                elif identity in left_identities:
+                    left_page.append(entry)
+                else:
+                    right_page.append(entry)
+            left_record = self._source_record_locked(left_replica_id, left_source)
+            right_record = self._source_record_locked(right_replica_id, right_source)
+        cursor = after + len(window)
+        return HTTPStatus.OK, {
+            "left": {"operation": left_record},
+            "right": {"operation": right_record},
+            "difference": {
+                "shared": len(shared),
+                "leftOnly": len(left_only),
+                "rightOnly": len(right_only),
+            },
+            "shared": shared_page,
+            "leftOnly": left_page,
+            "rightOnly": right_page,
+            "explanation": explanation,
+            "cursor": cursor,
+            "more": cursor < total,
+        }
+
     def get_checkpoint(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Return the registered checkpoint, or 404 when ``peer_id`` is unknown.
 
@@ -2719,10 +2907,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_causal_compare_get()
             return
         if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "causal"
+            and segments[2] == "diff"
+        ):
+            self._handle_causal_diff_get()
+            return
+        if (
             len(segments) == 4
             and segments[0] == "v1"
             and segments[1] == "causal"
-            and segments[2] != "compare"
+            and segments[2] not in ("compare", "diff")
         ):
             self._handle_causal_get(segments[2], segments[3])
             return
@@ -2977,6 +3173,45 @@ class RequestHandler(BaseHTTPRequestHandler):
         ) = params
         try:
             status, payload = self._store.get_causal_comparison(
+                left_replica_id,
+                left_operation_id,
+                right_replica_id,
+                right_operation_id,
+                after,
+                limit,
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
+
+    def _handle_causal_diff_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before any
+        # query or identity check), so a malformed query is rejected here
+        # without any state being read or changed. The diff carries the same
+        # four identity parameters plus after/limit as the comparison route,
+        # and its response follows the same compact-single-line contract:
+        # canonical JSON, one trailing newline, counts and cursors only as
+        # integers.
+        params = parse_causal_compare_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        (
+            left_replica_id,
+            left_operation_id,
+            right_replica_id,
+            right_operation_id,
+            after,
+            limit,
+        ) = params
+        try:
+            status, payload = self._store.get_causal_diff(
                 left_replica_id,
                 left_operation_id,
                 right_replica_id,
