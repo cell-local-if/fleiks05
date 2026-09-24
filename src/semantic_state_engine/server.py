@@ -1938,6 +1938,91 @@ class StateStore:
             }
         return HTTPStatus.OK, {"replicaId": replica_id, "operation": record}
 
+    def get_causal_ancestors(
+        self, replica_id: str, operation_id: str, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of an operation's strict causal predecessors.
+
+        The identity index and the accepted-operation log are read under the
+        same commit lock used by local writes, sync imports, repairs, and
+        checkpoint commits, so the source record, the ancestor list, and the
+        paging boundaries always describe a single commit: a read can never
+        observe half an import batch or a partially applied repair. The
+        snapshot mutates neither memory, the data file, candidates, metrics,
+        audits, checkpoints, nor logs.
+
+        A strict predecessor is a first-accepted record committed before the
+        source operation whose clock is strictly less than the source clock
+        (the source clock dominates it; missing components count as 0, and
+        equal clocks are not strictly less). The source operation itself is
+        never listed. Stale writes and accepted repairs are ordinary
+        committed records and therefore participate; identical replays,
+        rejected requests, and uncommitted requests never enter the log and
+        so never appear. A strict predecessor dominated by no other strict
+        predecessor is marked ``"direct"``; every other strict predecessor
+        is marked ``"transitive"``.
+
+        ``after`` is the number of ancestors already skipped (a 0-based
+        resume cursor) and ``limit`` the page size. Returns
+        ``(404, {"error": "not_found"})`` for an unaccepted identity and
+        ``(200, report)`` otherwise, where the report carries exactly
+        ``operation`` (the source record in the archive shape
+        ``{"replicaId", "operation"}``), ``ancestors`` (one page in global
+        commit order, each entry preserving the archive record content plus
+        ``relation``), ``cursor`` (the number of ancestors skipped after
+        this page), and ``more`` (whether further ancestors remain). Raises
+        ValueError when ``after`` is past the ancestor count of the
+        snapshot. With ``--data-file`` the log is rebuilt identically during
+        recovery, so the same state yields the same source, relations, and
+        pages before and after a restart.
+        """
+        with self._lock:
+            identity = (replica_id, operation_id)
+            source = self._operations.get(identity)
+            if source is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            source_clock = source["clock"]
+            strict: list[dict[str, Any]] = []
+            for accepted_replica, accepted_operation in self._accepted:
+                if (accepted_replica, accepted_operation["operationId"]) == identity:
+                    # Only records committed before the source qualify; the
+                    # source itself is never its own ancestor.
+                    break
+                if clock_dominates(source_clock, accepted_operation["clock"]):
+                    strict.append(
+                        {"replicaId": accepted_replica, "operation": accepted_operation}
+                    )
+            dominated: set[int] = set()
+            for index, entry in enumerate(strict):
+                entry_clock = entry["operation"]["clock"]
+                if any(
+                    other_index != index
+                    and clock_dominates(other["operation"]["clock"], entry_clock)
+                    for other_index, other in enumerate(strict)
+                ):
+                    dominated.add(index)
+            ancestors = [
+                {**entry, "relation": "transitive" if index in dominated else "direct"}
+                for index, entry in enumerate(strict)
+            ]
+            total = len(ancestors)
+            if after > total:
+                raise ValueError("after is past the end of the ancestor list")
+            page = ancestors[after : after + limit]
+            record = {
+                "operationId": source["operationId"],
+                "key": source["key"],
+                "value": source["value"],
+                "clock": dict(source_clock),
+            }
+        cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "operation": {"replicaId": replica_id, "operation": record},
+            "ancestors": page,
+            "cursor": cursor,
+            "more": cursor < total,
+        }
+
     def get_checkpoint(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Return the registered checkpoint, or 404 when ``peer_id`` is unknown.
 
@@ -2401,6 +2486,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_operation_archive_get(segments[2], segments[4])
             return
+        if len(segments) == 4 and segments[0] == "v1" and segments[1] == "causal":
+            self._handle_causal_get(segments[2], segments[3])
+            return
         matched, checkpoint_peer = self._checkpoint_route()
         if matched:
             self._handle_checkpoint_get(checkpoint_peer)
@@ -2603,6 +2691,30 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         status, payload = self._store.get_operation(replica_id, operation_id)
         self._json(status, payload)
+
+    def _handle_causal_get(self, replica_id: str, operation_id: str) -> None:
+        # The route-shape check in do_GET already ran (missing, empty, or
+        # extra segments — including a trailing slash — are 404 there), so a
+        # malformed query is rejected here without any state being read or
+        # changed. The response follows the compact-single-line contract:
+        # canonical JSON, one trailing newline, numbers only as integers.
+        params = parse_paging_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_causal_ancestors(
+                replica_id, operation_id, after, limit
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
 
     def _handle_sync_post(self) -> None:
         raw = self._read_bounded_body()
