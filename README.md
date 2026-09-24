@@ -313,6 +313,29 @@ A checkpoint is not an operation. It changes neither the accepted-operation log 
 
 With `--data-file`, a new or advanced checkpoint is written to the data file in the same atomic commit protocol (`write temp file → fsync → rename → fsync directory`) before the HTTP 200. A durable failure returns HTTP 500 `{"error":"internal_error"}` and leaves both memory and the file unchanged — a new registration is absent and an advanced cursor keeps its old value — so the request is safely retryable; an equal-value replay needs no write and still succeeds during the fault. A version:1 file written before checkpoints existed (without the `checkpoints` section) recovers with no registered checkpoints and otherwise unchanged semantics; after the format is supplemented on disk, a restart preserves both the checkpoints and every existing behavior. Without `--data-file` checkpoints live only in memory, exactly like the rest of the state.
 
+### Replication snapshot verification
+
+`GET /v1/replication/snapshot` returns a read-only consistency summary over one committed snapshot: the current candidate state, the accepted-log position, and every registered checkpoint mapping are read together under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit — a read never observes half an import batch, a partially applied repair, or a checkpoint commit halfway through.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object with exactly seven fields, terminated by a single newline and sent with an explicit `Content-Length`:
+
+```json
+{"candidateDigest":"<64 lowercase hex chars>","candidateVersions":3,"checkpoints":{"peer-a":2},"keys":2,"logCursor":4,"snapshotDigest":"<64 lowercase hex chars>","status":"ok"}
+```
+
+- `status`: the verification conclusion — always `"ok"` for a successfully assembled snapshot.
+- `candidateDigest`: the 64-character lowercase hexadecimal SHA-256 of the current candidate sets, computed by exactly the canonical rules of `GET /v1/verification/digest`.
+- `snapshotDigest`: the 64-character lowercase hexadecimal SHA-256 of the canonical snapshot bytes described below.
+- `logCursor`: the length of the accepted-operation log — the same position a sync-export cursor resumes from after the whole log.
+- `keys` and `candidateVersions`: the same non-negative counts reported by `GET /v1/metrics` and `GET /v1/verification/digest`.
+- `checkpoints`: the full `{peerId: cursor}` mapping of sender-side consumption progress; an empty mapping is reported as `{}`.
+
+The snapshot-digest input is a compact UTF-8 JSON array whose elements are, in order, the candidate digest, the log cursor, and the checkpoint mapping: `["<candidateDigest>",N,{"peerId":cursor,...}]`. The bytes carry no whitespace; the checkpoint mapping keeps every registered peer (an empty mapping serializes to `{}`) with peer ids in lexicographic (Unicode code point) order; strings escape only the quote (`\"`), the backslash (`\\`), and control characters U+0000–U+001F (always as `\u00XX` with lowercase hex). The cursor and every checkpoint value are plain JSON integers. The SHA-256 is computed over exactly those bytes.
+
+The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state. A missing, empty, or extra path segment (for example `/v1/replication/snapshot/extra` or `/v1/replication/snapshot/`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check.
+
+The request is strictly read-only — it modifies neither memory nor the data file and creates no temporary file. With `--data-file`, the candidate state, the log, and the checkpoints are rebuilt identically during recovery, so the same state yields the identical response before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route.
+
 ### Per-key operation audit
 
 `GET /v1/audit/keys/{key}/operations?after=N&limit=N` returns the history of **accepted operations for one key**, reusing the same commit order, record shape (`{"replicaId","operation"}`), and paging rules as sync export — the stream is simply the shared accepted-operation log filtered to records whose `operation.key` equals the path key.

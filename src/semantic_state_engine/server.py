@@ -631,6 +631,25 @@ def _key_audit_digest_input(records: list[tuple[str, dict[str, Any]]]) -> bytes:
     return "".join(parts).encode("utf-8")
 
 
+def _replication_snapshot_input(
+    candidate_digest: str, log_cursor: int, checkpoints: dict[str, int]
+) -> bytes:
+    """Serialize the replication-snapshot digest input to canonical bytes.
+
+    The input is a compact UTF-8 JSON array whose elements are, in order,
+    the candidate digest (the 64-character lowercase hexadecimal SHA-256 of
+    the current candidate sets, exactly as reported by the verification
+    digest), the accepted-log cursor (the number of first-accepted
+    operations, i.e. the sync-export resume position after the whole log),
+    and the checkpoint mapping of sender-side progress. The mapping keeps
+    every registered peer — an empty mapping serializes to ``{}`` — with
+    peer ids in lexicographic (Unicode code point) order. No whitespace is
+    emitted anywhere and strings escape exactly as in
+    :func:`_escape_digest_string`.
+    """
+    return _canonical_json_bytes([candidate_digest, log_cursor, checkpoints])
+
+
 class PersistenceError(Exception):
     """Raised when the data file cannot be opened, parsed, or written.
 
@@ -1661,6 +1680,60 @@ class StateStore:
             "candidateVersions": candidate_versions,
         }
 
+    def get_replication_snapshot(self) -> dict[str, Any]:
+        """Return the read-only replication snapshot summary from one snapshot.
+
+        The candidate state, the accepted-log cursor, and the checkpoint
+        mapping are read together under the same commit lock used by local
+        writes, sync imports, repairs, and checkpoint commits, so the
+        response always describes a single commit: a read can never observe
+        half an import batch, a partially applied repair, or a checkpoint
+        commit halfway through. The snapshot mutates neither memory nor the
+        data file and creates no file.
+
+        The result carries exactly seven fields:
+
+        - ``status``: the verification conclusion, always ``"ok"`` for a
+          successfully assembled snapshot.
+        - ``candidateDigest``: the SHA-256 of the current candidate sets,
+          computed by exactly the rules of the verification digest.
+        - ``snapshotDigest``: the SHA-256 of the canonical snapshot bytes
+          from :func:`_replication_snapshot_input` — the candidate digest,
+          the log cursor, and the checkpoint mapping, in that order.
+        - ``logCursor``: the length of the accepted-operation log — the
+          sync-export resume cursor after the whole log.
+        - ``keys`` / ``candidateVersions``: the same counts reported by
+          the metrics and the verification digest.
+        - ``checkpoints``: the full ``{peerId: cursor}`` mapping of
+          sender-side progress (empty when no peer has registered).
+
+        Both digests are 64-character lowercase hexadecimal SHA-256 values;
+        the cursor and both counts are JSON integers. With ``--data-file``
+        the log, the candidate state, and the checkpoints are rebuilt
+        identically during recovery, so the same state yields the same
+        response before and after a restart.
+        """
+        with self._lock:
+            keys = len(self._candidates)
+            candidate_versions = sum(len(c) for c in self._candidates.values())
+            candidate_digest = hashlib.sha256(
+                _verification_digest_input(self._candidates)
+            ).hexdigest()
+            log_cursor = len(self._accepted)
+            checkpoints = dict(self._checkpoints)
+        snapshot_input = _replication_snapshot_input(
+            candidate_digest, log_cursor, checkpoints
+        )
+        return {
+            "status": "ok",
+            "candidateDigest": candidate_digest,
+            "snapshotDigest": hashlib.sha256(snapshot_input).hexdigest(),
+            "logCursor": log_cursor,
+            "keys": keys,
+            "candidateVersions": candidate_versions,
+            "checkpoints": checkpoints,
+        }
+
     def get_key_audit_digest(self, key: str) -> dict[str, Any]:
         """Return one key's audit-integrity digest from a single snapshot.
 
@@ -2250,6 +2323,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_verification_digest_get()
             return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "snapshot"
+        ):
+            self._handle_replication_snapshot_get()
+            return
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
@@ -2441,6 +2522,21 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         self._json(HTTPStatus.OK, self._store.get_verification_digest())
+
+    def _handle_replication_snapshot_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there), so a
+        # query parameter is rejected here without any state being read or
+        # changed. The response follows the compact-single-line contract:
+        # canonical JSON, one trailing newline, numbers only as integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(
+            HTTPStatus.OK, self._store.get_replication_snapshot()
+        )
 
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)
