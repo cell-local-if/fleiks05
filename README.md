@@ -372,6 +372,27 @@ With `--data-file`, the stream is rebuilt from the recovered log on startup, so 
 
 With `--data-file`, the identity index is rebuilt from the recovered log on startup, so successful results, the 404 boundary, and error statuses are identical before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
 
+### Replication-snapshot consistency verification
+
+`GET /v1/replication/snapshot` returns a read-only consistency summary over one committed snapshot: the current candidate state, the accepted-log position, and the whole checkpoint mapping are read together. A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with an explicit `Content-Length` and exactly seven fields:
+
+```json
+{"candidateDigest":"<64 lowercase hex chars>","candidateVersions":3,"checkpoints":{"peer-a":2},"keys":2,"logCursor":4,"snapshotDigest":"<64 lowercase hex chars>","status":"ok"}
+```
+
+- `status`: the verification conclusion, always `"ok"` — the summary is assembled atomically from one commit, so it is internally consistent by construction.
+- `candidateDigest`: the 64-character lowercase hexadecimal SHA-256 of the canonical candidate snapshot, following exactly the rules of `GET /v1/verification/digest` (it covers only the current candidate sets).
+- `snapshotDigest`: the 64-character lowercase hexadecimal SHA-256 of the canonical snapshot bytes described below.
+- `logCursor`: the number of first-accepted operations in the shared log — the sync-export resume cursor at the tail of the log.
+- `keys` and `candidateVersions`: the same counts reported by `GET /v1/metrics` and `GET /v1/verification/digest`.
+- `checkpoints`: the full `{peerId: cursor}` mapping of sender-side replication progress; an empty mapping is reported as `{}`.
+
+The snapshot-digest input is a compact UTF-8 JSON array of exactly three elements, in this fixed order: the candidate digest (as a hex string), the log cursor (a JSON integer), and the checkpoint mapping with peer ids sorted lexicographically (an empty mapping is kept as `{}`). No whitespace appears anywhere, and strings escape exactly as in the verification-digest rules — only the quote (`\"`), the backslash (`\\`), and control characters U+0000–U+001F (always as `\u00XX` with lowercase hex). The SHA-256 is computed over exactly those bytes. Both digests are 64-character lowercase hexadecimal strings; the counts and the cursor appear only as JSON integers.
+
+The candidate state, the log cursor, and the checkpoint mapping are read from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit: a read observes either the old or the new complete state, never half an import batch or a partially applied repair. The request is strictly read-only — it modifies neither memory nor the data file and creates no temporary file. With `--data-file`, the log and the checkpoints are rebuilt identically during recovery, so the same state yields the same verification result before and after a restart.
+
+The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}` without reading any state. A missing or extra path segment, an unknown route, or a trailing slash (for example `/v1/replication/snapshot/`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
+
 ## Tests
 
 ```bash
