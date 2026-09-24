@@ -499,6 +499,24 @@ def parse_causal_compare_query(
     return (*identities, after, limit)
 
 
+def parse_causal_diff_query(
+    query: str,
+) -> tuple[str, str, str, str, int, int] | None:
+    """Validate the causal-difference query string.
+
+    The four source-operation identities — ``leftReplicaId``,
+    ``leftOperationId``, ``rightReplicaId``, ``rightOperationId`` — follow
+    :func:`parse_causal_compare_query` exactly: each required exactly once
+    with a non-empty percent-decoded value, plus the shared paging
+    parameters ``after`` (default 0) and ``limit`` (default 100, 1-100)
+    under the same rules. Unknown parameters, repeated names, blank values,
+    and malformed paging values return None. The bound on ``after``
+    against the merged evidence length is checked by the store against the
+    committed snapshot.
+    """
+    return parse_causal_compare_query(query)
+
+
 def parse_metrics_query(query: str) -> bool:
     """Validate the metrics query string, which accepts no parameters.
 
@@ -2247,6 +2265,252 @@ class StateStore:
             },
         }
 
+    @staticmethod
+    def _group_entries_locked(
+        records: list[tuple[str, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Render one evidence group in the comparison predecessor shape.
+
+        Each entry preserves the archive record content and adds
+        ``relation``: ``"direct"`` when no other record **in this group**
+        dominates the record's clock, ``"transitive"`` otherwise — the
+        same classification the comparison endpoint computes per side,
+        applied here to the group's own record set. Entries keep the
+        shared log's global commit order.
+        """
+        entries: list[dict[str, Any]] = []
+        for index, (record_replica, record_operation) in enumerate(records):
+            dominated = any(
+                other_index != index
+                and clock_dominates(other_operation["clock"], record_operation["clock"])
+                for other_index, (_, other_operation) in enumerate(records)
+            )
+            entries.append(
+                {
+                    "replicaId": record_replica,
+                    "operation": {
+                        "operationId": record_operation["operationId"],
+                        "key": record_operation["key"],
+                        "value": record_operation["value"],
+                        "clock": dict(record_operation["clock"]),
+                    },
+                    "relation": "transitive" if dominated else "direct",
+                }
+            )
+        return entries
+
+    @staticmethod
+    def _minimal_frontier_locked(
+        records: list[tuple[str, dict[str, Any]]],
+    ) -> set[tuple[str, str]]:
+        """Return the minimal-boundary identities of one side's exclusive evidence.
+
+        An exclusive (one-sided) evidence record is explained away when
+        another exclusive record of the **same side** has a clock that
+        dominates its clock: the boundary is then already placed at the
+        dominating record, which the source also causally covers. Only the
+        records no other same-side exclusive evidence dominates — the
+        minimal frontier — are returned, as accepted record identities.
+        The domination test is exactly the one behind the comparison's
+        ``"direct"``/``"transitive"`` classification, applied to the
+        side's exclusive evidence set.
+        """
+        frontier: set[tuple[str, str]] = set()
+        for index, (record_replica, record_operation) in enumerate(records):
+            dominated = any(
+                other_index != index
+                and clock_dominates(other_operation["clock"], record_operation["clock"])
+                for other_index, (_, other_operation) in enumerate(records)
+            )
+            if not dominated:
+                frontier.add((record_replica, record_operation["operationId"]))
+        return frontier
+
+    def get_causal_diff(
+        self,
+        left_replica_id: str,
+        left_operation_id: str,
+        right_replica_id: str,
+        right_operation_id: str,
+        after: int,
+        limit: int,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Report the minimal locatable causal difference between two operations.
+
+        The two source records, their complete strict-predecessor sets, the
+        three evidence groups, the difference counts, the minimal
+        explanation, and the paging boundaries are all read under the same
+        commit lock used by local writes, sync imports, repairs, and
+        checkpoint commits, so the response always describes a single
+        commit: a read can never observe half an import batch or a
+        partially applied repair. The snapshot mutates neither memory, the
+        data file, candidates, metrics, audits, checkpoints, nor logs.
+
+        Each side's predecessors follow :meth:`get_causal_ancestors`
+        exactly and are de-duplicated by accepted record identity into
+        three groups — ``shared`` (identities present on both sides),
+        ``leftOnly``, and ``rightOnly`` — each kept in the shared log's
+        global commit order and rendered in the comparison predecessor
+        entry shape, with ``relation`` computed within that group. The
+        three counts of ``difference`` always come from the complete,
+        unpaged sets.
+
+        ``explanation`` only locates: for each side it names the exclusive
+        evidence records that no other same-side exclusive evidence
+        dominates — the minimal boundary — as ``{"from","to","side"}``
+        items, ``side`` being ``"left"`` or ``"right"``. It is likewise
+        computed from the complete sets.
+
+        Paging walks the stable merge of shared, then left-only, then
+        right-only evidence: ``after`` is the number of merged records
+        already skipped and ``limit`` bounds the current page. Each group
+        carries only its own slice of that page, while the top-level
+        ``cursor``/``more`` pair resumes the merge. The records are
+        sliced from one snapshot, so the groups, the cursor, and ``more``
+        always agree.
+
+        Returns ``(404, {"error": "not_found"})`` when either identity was
+        never first-accepted. Otherwise returns ``(200, report)``. Raises
+        ValueError when ``after`` is past the larger of the merged
+        evidence length of the snapshot. With ``--data-file`` the log is
+        rebuilt identically during recovery, so the same state yields the
+        same sources, groups, counts, explanation, and pages before and
+        after a restart.
+        """
+        with self._lock:
+            left_source = self._operations.get((left_replica_id, left_operation_id))
+            right_source = self._operations.get((right_replica_id, right_operation_id))
+            if left_source is None or right_source is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            left_predecessors = self._strict_predecessors_locked(
+                self._accepted,
+                left_replica_id,
+                left_operation_id,
+                left_source["clock"],
+            )
+            right_predecessors = self._strict_predecessors_locked(
+                self._accepted,
+                right_replica_id,
+                right_operation_id,
+                right_source["clock"],
+            )
+            left_index = {
+                (pred_replica, pred_operation["operationId"]): (pred_replica, pred_operation)
+                for pred_replica, pred_operation in left_predecessors
+            }
+            right_index = {
+                (pred_replica, pred_operation["operationId"]): (pred_replica, pred_operation)
+                for pred_replica, pred_operation in right_predecessors
+            }
+            # The predecessor lists already follow the global commit order,
+            # so an ordered membership filter preserves that order within
+            # every group.
+            shared_records = [
+                (pred_replica, pred_operation)
+                for pred_replica, pred_operation in left_predecessors
+                if (pred_replica, pred_operation["operationId"]) in right_index
+            ]
+            left_only_records = [
+                (pred_replica, pred_operation)
+                for pred_replica, pred_operation in left_predecessors
+                if (pred_replica, pred_operation["operationId"]) not in right_index
+            ]
+            right_only_records = [
+                (pred_replica, pred_operation)
+                for pred_replica, pred_operation in right_predecessors
+                if (pred_replica, pred_operation["operationId"]) not in left_index
+            ]
+            groups = (
+                ("shared", shared_records),
+                ("leftOnly", left_only_records),
+                ("rightOnly", right_only_records),
+            )
+            merged_total = (
+                len(shared_records) + len(left_only_records) + len(right_only_records)
+            )
+            if after > merged_total:
+                raise ValueError("after is past the end of the merged evidence list")
+
+            # The relation labels are classified against each complete
+            # group first (exactly as the comparison classifies a side
+            # against its complete predecessor set), so paging never
+            # changes a record from "direct" to "transitive". The labeled
+            # lists are then sliced across the stable shared -> left-only
+            # -> right-only concatenation by global merged position.
+            entries = {
+                group_name: self._group_entries_locked(group_records)
+                for group_name, group_records in groups
+            }
+            pages: dict[str, list[dict[str, Any]]] = {}
+            offset = 0
+            for group_name, group_records in groups:
+                group_total = len(group_records)
+                start = max(0, after - offset)
+                end = max(0, after + limit - offset)
+                pages[group_name] = entries[group_name][start:end]
+                offset += group_total
+            explanation_frontiers = {
+                "left": self._minimal_frontier_locked(left_only_records),
+                "right": self._minimal_frontier_locked(right_only_records),
+            }
+            # Merge the two frontiers into one stable global commit order:
+            # walk the shared log once, emitting an item when the record is
+            # on that side's minimal frontier. The frontiers are disjoint
+            # (a record cannot be both left-only and right-only), so each
+            # record yields at most one item.
+            explanation: list[dict[str, Any]] = []
+            for frontier_replica, frontier_operation in self._accepted:
+                frontier_identity = (
+                    frontier_replica,
+                    frontier_operation["operationId"],
+                )
+                if frontier_identity in explanation_frontiers["left"]:
+                    explanation.append(
+                        {
+                            "from": {
+                                "replicaId": frontier_replica,
+                                "operationId": frontier_operation["operationId"],
+                            },
+                            "to": {
+                                "replicaId": left_replica_id,
+                                "operationId": left_operation_id,
+                            },
+                            "side": "left",
+                        }
+                    )
+                elif frontier_identity in explanation_frontiers["right"]:
+                    explanation.append(
+                        {
+                            "from": {
+                                "replicaId": frontier_replica,
+                                "operationId": frontier_operation["operationId"],
+                            },
+                            "to": {
+                                "replicaId": right_replica_id,
+                                "operationId": right_operation_id,
+                            },
+                            "side": "right",
+                        }
+                    )
+            left_record = self._source_record_locked(left_replica_id, left_source)
+            right_record = self._source_record_locked(right_replica_id, right_source)
+        cursor = after + sum(len(page) for page in pages.values())
+        return HTTPStatus.OK, {
+            "left": left_record,
+            "right": right_record,
+            "difference": {
+                "shared": len(shared_records),
+                "leftOnly": len(left_only_records),
+                "rightOnly": len(right_only_records),
+            },
+            "shared": pages["shared"],
+            "leftOnly": pages["leftOnly"],
+            "rightOnly": pages["rightOnly"],
+            "explanation": explanation,
+            "cursor": cursor,
+            "more": cursor < merged_total,
+        }
+
     def get_checkpoint(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Return the registered checkpoint, or 404 when ``peer_id`` is unknown.
 
@@ -2719,10 +2983,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_causal_compare_get()
             return
         if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "causal"
+            and segments[2] == "diff"
+        ):
+            self._handle_causal_diff_get()
+            return
+        if (
             len(segments) == 4
             and segments[0] == "v1"
             and segments[1] == "causal"
-            and segments[2] != "compare"
+            and segments[2] not in ("compare", "diff")
         ):
             self._handle_causal_get(segments[2], segments[3])
             return
@@ -2977,6 +3249,43 @@ class RequestHandler(BaseHTTPRequestHandler):
         ) = params
         try:
             status, payload = self._store.get_causal_comparison(
+                left_replica_id,
+                left_operation_id,
+                right_replica_id,
+                right_operation_id,
+                after,
+                limit,
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
+
+    def _handle_causal_diff_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before any
+        # query or identity check), so a malformed query is rejected here
+        # without any state being read or changed. The response follows the
+        # compact-single-line contract: canonical JSON, one trailing newline,
+        # numbers only as integers.
+        params = parse_causal_diff_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        (
+            left_replica_id,
+            left_operation_id,
+            right_replica_id,
+            right_operation_id,
+            after,
+            limit,
+        ) = params
+        try:
+            status, payload = self._store.get_causal_diff(
                 left_replica_id,
                 left_operation_id,
                 right_replica_id,
