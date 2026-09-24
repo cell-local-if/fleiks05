@@ -499,6 +499,51 @@ def parse_causal_compare_query(
     return (*identities, after, limit)
 
 
+CAUSAL_DESCENDANTS_IDENTITY_PARAMS = ("replicaId", "operationId")
+
+
+def parse_causal_descendants_query(
+    query: str,
+) -> tuple[str, str, int, int] | None:
+    """Validate the causal-descendants query string.
+
+    Requires exactly one occurrence of each identity parameter —
+    ``replicaId`` and ``operationId`` — each with a non-empty
+    percent-decoded value (percent decoding is applied by ``parse_qs``),
+    plus the shared paging parameters ``after`` (default 0) and ``limit``
+    (default 100, 1-100) under the same rules as :func:`parse_paging_query`.
+    Unknown parameters, repeated names (identities included), blank
+    identity values, malformed or negative paging values, and out-of-range
+    limits return None. The bound on ``after`` against the descendant
+    count is checked by the store against the committed snapshot.
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    required = set(CAUSAL_DESCENDANTS_IDENTITY_PARAMS)
+    if not required <= set(parsed):
+        return None
+    if not set(parsed) <= required | {"after", "limit"}:
+        return None
+    replica_id = parsed["replicaId"][0]
+    operation_id = parsed["operationId"][0]
+    if replica_id == "" or operation_id == "":
+        return None
+    after = 0
+    limit = SYNC_DEFAULT_LIMIT
+    if "after" in parsed:
+        after_value = _non_negative_int(parsed["after"][0])
+        if after_value is None:
+            return None
+        after = after_value
+    if "limit" in parsed:
+        limit_value = _non_negative_int(parsed["limit"][0])
+        if limit_value is None or not (1 <= limit_value <= SYNC_BATCH_MAX):
+            return None
+        limit = limit_value
+    return replica_id, operation_id, after, limit
+
+
 def parse_metrics_query(query: str) -> bool:
     """Validate the metrics query string, which accepts no parameters.
 
@@ -2435,6 +2480,104 @@ class StateStore:
             "more": cursor < total,
         }
 
+    @staticmethod
+    def _strict_descendants_locked(
+        accepted: list[tuple[str, dict[str, Any]]],
+        source_replica_id: str,
+        source_operation_id: str,
+        source_clock: dict[str, int],
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Collect one source operation's strict causal descendants.
+
+        Scans the shared accepted log (already in global commit order)
+        starting strictly after the source record, keeping every later
+        record whose clock strictly dominates the source clock. Missing
+        clock components count as 0. The source identity is unique in the
+        log, so the scan starts at its record; records committed before the
+        source are never descendants even when their clocks are larger.
+        """
+        descendants: list[tuple[str, dict[str, Any]]] = []
+        after_source = False
+        for accepted_replica, accepted_operation in accepted:
+            if not after_source:
+                if (
+                    accepted_replica == source_replica_id
+                    and accepted_operation["operationId"] == source_operation_id
+                ):
+                    after_source = True
+                continue
+            if clock_dominates(accepted_operation["clock"], source_clock):
+                descendants.append((accepted_replica, accepted_operation))
+        return descendants
+
+    def get_causal_descendants(
+        self, replica_id: str, operation_id: str, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of an operation's complete causal descendant chain.
+
+        The source operation, the full descendant list, the relation
+        classification, and the paging boundaries are all read under the
+        same commit lock used by local writes, sync imports, repairs, and
+        checkpoint commits, so the response always describes a single
+        commit: a read can never observe half an import batch or a
+        partially applied repair. The snapshot mutates neither memory, the
+        data file, candidates, metrics, audits, checkpoints, nor logs.
+
+        A strict descendant is a first-accepted record committed **after**
+        the source operation in the shared log whose clock strictly
+        dominates the source operation's clock — the record clock dominates
+        the source (missing components count as 0, and domination already
+        requires the clocks to differ). The source operation itself never
+        appears. Stale writes on other keys and accepted conflict repairs
+        are ordinary committed records and participate like any other;
+        identical replays, conflicting or invalid requests, and
+        uncommitted writes never enter the log, so they can never appear.
+
+        Each strict descendant is classified under ``relation`` against
+        the complete descendant set, never the current page: ``"direct"``
+        when no other strict descendant's clock dominates its own,
+        ``"transitive"`` otherwise. Paging only trims the entries, so a
+        record's relation is stable across every window that contains it.
+
+        Returns ``(404, {"error": "not_found"})`` when the identity was
+        never first-accepted. Otherwise returns ``(200, report)`` with
+        exactly four fields: ``operation`` (the source record in the
+        per-operation archive shape ``{"replicaId", "operation"}``),
+        ``descendants`` (one page of descendant records in the shared
+        log's global commit order, each preserving the archive record
+        content plus the ``relation`` field), ``cursor`` (the number of
+        descendants skipped after this page — feed it back as the next
+        ``after``), and ``more`` (whether further descendants remain).
+        Raises ValueError when ``after`` is past the descendant count of
+        the snapshot. With ``--data-file`` the log is rebuilt identically
+        during recovery, so the same state yields the same source, the same
+        relations, and the same pages before and after a restart.
+        """
+        with self._lock:
+            source = self._operations.get((replica_id, operation_id))
+            if source is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            descendants_records = self._strict_descendants_locked(
+                self._accepted, replica_id, operation_id, source["clock"]
+            )
+            # The archive-entry renderer is generic over any committed
+            # record set: it preserves the record content and classifies
+            # each entry direct/transitive against the full set passed in,
+            # which here is the complete descendant list rather than a page.
+            entries = self._ancestor_entries_locked(descendants_records)
+            total = len(entries)
+            if after > total:
+                raise ValueError("after is past the end of the descendant list")
+            page = entries[after : after + limit]
+            source_record = self._source_record_locked(replica_id, source)
+        cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "operation": source_record,
+            "descendants": page,
+            "cursor": cursor,
+            "more": cursor < total,
+        }
+
     def get_checkpoint(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Return the registered checkpoint, or 404 when ``peer_id`` is unknown.
 
@@ -2915,10 +3058,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_causal_diff_get()
             return
         if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "causal"
+            and segments[2] == "descendants"
+        ):
+            self._handle_causal_descendants_get()
+            return
+        if (
             len(segments) == 4
             and segments[0] == "v1"
             and segments[1] == "causal"
-            and segments[2] not in ("compare", "diff")
+            and segments[2] not in ("compare", "diff", "descendants")
         ):
             self._handle_causal_get(segments[2], segments[3])
             return
@@ -3218,6 +3369,33 @@ class RequestHandler(BaseHTTPRequestHandler):
                 right_operation_id,
                 after,
                 limit,
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
+
+    def _handle_causal_descendants_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before any
+        # query or identity check), so a malformed query is rejected here
+        # without any state being read or changed. Unlike the single-chain
+        # route, the two identity fields ride alongside after/limit in the
+        # query string. The response follows the compact-single-line
+        # contract: canonical JSON, one trailing newline, numbers only as
+        # integers.
+        params = parse_causal_descendants_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        replica_id, operation_id, after, limit = params
+        try:
+            status, payload = self._store.get_causal_descendants(
+                replica_id, operation_id, after, limit
             )
         except ValueError:
             self._json_canonical_newline(
