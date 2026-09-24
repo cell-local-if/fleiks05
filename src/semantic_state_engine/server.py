@@ -1841,6 +1841,133 @@ class StateStore:
             ],
         }
 
+    def get_state_why(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Explain one key's current candidates causally from one snapshot.
+
+        Read-only counterpart to :meth:`get_state` for
+        ``GET /v1/states/{key}/why``. The candidates, their pairwise
+        relations, and the two policy recommendations are all computed
+        together under the same commit lock used by writes, sync imports,
+        resolutions, and checkpoint commits, so the response always
+        describes one commit: a read can never observe half an import batch
+        or a partially applied repair. The snapshot mutates neither memory,
+        the data file, logs, nor checkpoints, and creates no repair
+        operation.
+
+        Candidates use the same query order as :meth:`get_state` —
+        ``(replicaId, operationId)`` ascending — and each carries its
+        identity, value, and clock. Relations enumerate every unordered
+        candidate pair once in that order with one of three relations:
+
+        - ``"dominates"``: the ``from`` candidate's clock dominates the
+          ``to`` candidate's clock;
+        - ``"concurrent"``: neither clock dominates the other, which is why
+          the two coexist as candidates;
+        - ``"overwritten"``: the ``to`` candidate's clock dominates the
+          ``from`` candidate's clock.
+
+        The candidate-set invariant (a candidate already dominated by
+        another is never retained) means every pair of current candidates
+        is necessarily concurrent: a conflict response therefore explains,
+        pair by pair, why no candidate dominates another. When all
+        candidates agree on the value the key is resolved and the relations
+        identify the value's unique source. A key that has never held a
+        candidate — including a key whose history now holds none — is
+        ``404 not_found``, exactly as for :meth:`get_state`.
+
+        The recommendations report, for each of the two existing
+        ``lowest_identity`` / ``highest_identity`` policies, the identity
+        and value that policy would select from the current candidates,
+        using the same deterministic extreme-identity choice as automatic
+        resolution. They create nothing. With ``--data-file`` the
+        candidates are rebuilt identically during recovery, so the same
+        state yields the same relations, sources, and recommendations
+        before and after a restart.
+        """
+        with self._lock:
+            current = list(self._candidates.get(key, []))
+            if not current:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            ordered = sorted(current, key=lambda c: (c["replicaId"], c["operationId"]))
+            candidates = [
+                {
+                    "replicaId": c["replicaId"],
+                    "operationId": c["operationId"],
+                    "value": c["value"],
+                    "clock": dict(c["clock"]),
+                }
+                for c in ordered
+            ]
+            relations = self._candidate_relations_locked(ordered)
+            resolved = all(c["value"] == ordered[0]["value"] for c in ordered)
+            recommendations = [
+                self._identity_recommendation_locked("lowest_identity", ordered),
+                self._identity_recommendation_locked("highest_identity", ordered),
+            ]
+        return HTTPStatus.OK, {
+            "key": key,
+            "status": "resolved" if resolved else "conflict",
+            "candidates": candidates,
+            "relations": relations,
+            "recommendations": recommendations,
+        }
+
+    @staticmethod
+    def _candidate_relations_locked(
+        ordered: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Build the pairwise clock relations of ordered candidates.
+
+        Each unordered pair appears once, in candidate query order: the
+        earlier candidate is ``from`` and the later ``to``. Exactly one
+        relation is reported per pair — ``dominates`` (from dominates to),
+        ``overwritten`` (to dominates from), or ``concurrent`` (neither).
+        """
+        relations: list[dict[str, Any]] = []
+        for index, source in enumerate(ordered):
+            for target in ordered[index + 1 :]:
+                if clock_dominates(source["clock"], target["clock"]):
+                    relation = "dominates"
+                elif clock_dominates(target["clock"], source["clock"]):
+                    relation = "overwritten"
+                else:
+                    relation = "concurrent"
+                relations.append(
+                    {
+                        "from": {
+                            "replicaId": source["replicaId"],
+                            "operationId": source["operationId"],
+                        },
+                        "to": {
+                            "replicaId": target["replicaId"],
+                            "operationId": target["operationId"],
+                        },
+                        "relation": relation,
+                    }
+                )
+        return relations
+
+    @staticmethod
+    def _identity_recommendation_locked(
+        policy: str, ordered: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Report the candidate one existing identity policy would choose.
+
+        Mirrors the deterministic selection in automatic resolution: the
+        candidate with the smallest ``(replicaId, operationId)`` for
+        ``lowest_identity`` and the largest for ``highest_identity``.
+        """
+        if policy == "highest_identity":
+            chosen = max(ordered, key=lambda c: (c["replicaId"], c["operationId"]))
+        else:
+            chosen = min(ordered, key=lambda c: (c["replicaId"], c["operationId"]))
+        return {
+            "policy": policy,
+            "replicaId": chosen["replicaId"],
+            "operationId": chosen["operationId"],
+            "value": chosen["value"],
+        }
+
 
 class SemanticStateServer(ThreadingHTTPServer):
     """Threading HTTP server carrying its own StateStore."""
@@ -1962,6 +2089,26 @@ class RequestHandler(BaseHTTPRequestHandler):
             return False, ""
         return True, unquote(parts[4])
 
+    def _state_why_route(self) -> tuple[bool, str]:
+        """Match ``/v1/states/{key}/why`` on the raw path.
+
+        Returns ``(matched, key)``. Like :meth:`_checkpoint_route`, the
+        empty segment of ``/v1/states//why`` is preserved rather than
+        filtered, so the shape check rejects a missing key segment: the
+        raw split has five parts (not four) and never matches. Extra
+        segments such as ``/v1/states/{key}/why/extra`` or a trailing
+        slash likewise never match. Only the exact four-segment shape is
+        accepted, with a percent-decoded non-empty key handed to the
+        handler. The route-shape check therefore happens before the
+        query-parameter check.
+        """
+        parts = urlsplit(self.path).path.split("/")
+        if len(parts) != 5:
+            return False, ""
+        if parts[1:3] != ["v1", "states"] or parts[4] != "why" or parts[3] == "":
+            return False, ""
+        return True, unquote(parts[3])
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path == "/health":
             # The health probe stays anonymous even when auth is enabled.
@@ -2024,6 +2171,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         matched, checkpoint_peer = self._checkpoint_route()
         if matched:
             self._handle_checkpoint_get(checkpoint_peer)
+            return
+        matched_why, why_key = self._state_why_route()
+        if matched_why:
+            self._handle_state_why_get(why_key)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -2149,6 +2300,25 @@ class RequestHandler(BaseHTTPRequestHandler):
         # Every path key is a valid audit subject: a key with no accepted
         # history hashes the empty stream and reports operations 0.
         self._json(HTTPStatus.OK, self._store.get_key_audit_digest(key))
+
+    def _handle_state_why_get(self, key: str) -> None:
+        # The causal-explanation route accepts no query parameters; any
+        # parameter — repeated, blank-named, or blank-valued — is an
+        # invalid request. Route-shape mismatches (a missing key segment
+        # such as /v1/states//why, an extra segment such as
+        # /v1/states/{key}/why/extra, or any unknown route) never reach
+        # this handler: they fall through to the generic 404 first, so the
+        # 404 route check takes precedence over this query check.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._store.get_state_why(key)
+        if status is HTTPStatus.OK:
+            # Success uses the compact-JSON-terminated-by-one-newline
+            # envelope; the 404/400 envelopes stay the shared GET shape.
+            self._json_newline(status, payload)
+            return
+        self._json(status, payload)
 
     def _handle_operation_archive_get(self, replica_id: str, operation_id: str) -> None:
         # The route accepts no query parameters; any parameter — repeated,

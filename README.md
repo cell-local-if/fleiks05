@@ -98,6 +98,29 @@ Candidates are stored per key with vector-clock semantics (missing components co
 
 Keys are isolated from each other, and reads reflect the latest writes.
 
+### Explaining a conflict causally (read-only)
+
+`GET /v1/states/{key}/why` explains one business key's **current candidates** in causal terms without changing anything. It is strictly read-only: it creates no repair operation, writes no log or checkpoint, and changes neither memory nor the data file.
+
+A successful HTTP 200 response is compact UTF-8 JSON ending in exactly one newline and contains exactly five categories of information:
+
+```json
+{"candidates":[{"clock":{"r1":1},"operationId":"op-1","replicaId":"r1","value":"v1"},{"clock":{"r2":1},"operationId":"op-2","replicaId":"r2","value":"v2"}],"key":"k","recommendations":[{"operationId":"op-1","policy":"lowest_identity","replicaId":"r1","value":"v1"},{"operationId":"op-2","policy":"highest_identity","replicaId":"r2","value":"v2"}],"relations":[{"from":{"operationId":"op-1","replicaId":"r1"},"relation":"concurrent","to":{"operationId":"op-2","replicaId":"r2"}}],"status":"conflict"}
+```
+
+- `key` is the requested key and `status` is `"resolved"` when every candidate carries the same value (including a single candidate) or `"conflict"` only when the candidate values disagree.
+- `candidates` lists the current candidates in the same query order as `GET /v1/states/{key}` — `(replicaId, operationId)` ascending — each carrying only its **identity** (`replicaId`, `operationId`), its `value`, and its vector `clock`.
+- `relations` explains the candidate pairs. Each unordered pair appears once, in candidate query order, with `from`/`to` identities and exactly one relation: `"dominates"` (the `from` clock dominates the `to` clock), `"overwritten"` (the `to` clock dominates the `from` clock), or `"concurrent"` (neither clock dominates the other). In a conflict every pair is `concurrent`, which is pair-by-pair why the candidates coexist without one dominating another; when resolved, the relations identify the value's unique source (a single candidate leaves an empty `[]`).
+- `recommendations` reports, for each of the two existing policies, the candidate that policy would select **without performing the selection**: `lowest_identity` reports the value and identity of the candidate with the smallest `(replicaId, operationId)`, `highest_identity` those of the largest. Both use exactly the deterministic choice of the automatic-resolution endpoints; the recommendation only reports, it never repairs.
+
+Every numeric value is a JSON integer — no floats, negative zero, or non-finite values appear — and an empty relation set is still expressed as an array.
+
+- A key that has never appeared, or one whose history currently holds no candidate, returns HTTP 404 with `{"error":"not_found"}`.
+- A missing key segment (`/v1/states//why`), an extra segment (`/v1/states/{key}/why/extra`, including a trailing slash), or any unknown route returns HTTP 404 with `{"error":"not_found"}`. The route-shape check takes precedence over the query check, so a malformed path together with a query parameter is still a 404.
+- The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}` and reads or changes no state.
+
+The candidates, relations, and recommendations are computed from one snapshot under the same commit lock used by local writes, sync imports, manual and automatic repairs, and checkpoint commits, so the response always describes a single commit and never observes half an import batch or a partially applied repair. With `--data-file`, the candidates are rebuilt identically during recovery, so the same candidate state yields the same relations, sources, and policy recommendations before and after a restart. When bearer-token authentication is enabled, a missing, duplicated, or mismatching `Authorization` header returns HTTP 401 with `{"error":"unauthorized"}` (and a `WWW-Authenticate: Bearer` header) before route matching, query parsing, or any state read, and leaves all state unchanged.
+
 ### Read-only metrics
 
 `GET /v1/metrics` returns HTTP 200 with a UTF-8 JSON object containing exactly six non-negative integer counters:
