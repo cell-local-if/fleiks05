@@ -826,6 +826,36 @@ def _verification_digest_input(candidates: dict[str, list[dict[str, Any]]]) -> b
     return "".join(parts).encode("utf-8")
 
 
+def _audit_record_bytes(replica_id: str, operation: dict[str, Any]) -> bytes:
+    """Serialize one accepted operation to the key-audit canonical bytes.
+
+    The result is the compact UTF-8 JSON object
+    ``{"replicaId":R,"operation":{"operationId":I,"key":K,"value":V,"clock":C}}``
+    with the clock's component names sorted lexicographically (Unicode
+    code point order), no whitespace, and strings escaped exactly as in
+    :func:`_escape_digest_string` — identical to a single element of the
+    array produced by :func:`_key_audit_digest_input`, without the
+    surrounding array. It is the per-record canonical byte string shared
+    by the per-key audit digest and the global audit chain.
+    """
+    clock = ",".join(
+        f"{_escape_digest_string(name)}:{tick}"
+        for name, tick in sorted(operation["clock"].items())
+    )
+    parts: list[str] = ['{"replicaId":']
+    parts.append(_escape_digest_string(replica_id))
+    parts.append(',"operation":{"operationId":')
+    parts.append(_escape_digest_string(operation["operationId"]))
+    parts.append(',"key":')
+    parts.append(_escape_digest_string(operation["key"]))
+    parts.append(',"value":')
+    parts.append(_escape_digest_string(operation["value"]))
+    parts.append(',"clock":{')
+    parts.append(clock)
+    parts.append("}}}")
+    return "".join(parts).encode("utf-8")
+
+
 def _key_audit_digest_input(records: list[tuple[str, dict[str, Any]]]) -> bytes:
     """Serialize one key's accepted-operation stream to the digest input.
 
@@ -892,6 +922,12 @@ def _replication_snapshot_input(
         parts.append(str(checkpoints[peer_id]))
     parts.append("}]")
     return "".join(parts).encode("utf-8")
+
+
+# The genesis predecessor digest and the head of an empty log: 64 ASCII
+# zero characters, the hexadecimal SHA-256 form used throughout the audit
+# chain.
+ZERO_DIGEST = "0" * 64
 
 
 class PersistenceError(Exception):
@@ -2297,6 +2333,78 @@ class StateStore:
             "operations": operations,
         }
 
+    def get_audit_chain(
+        self, after: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int, bool, str]:
+        """Return one page of the global read-only audit chain.
+
+        The chain is the shared accepted-operation log in global commit
+        order with every record linked to its predecessor by a SHA-256
+        digest. The entries, the paging boundaries, and the chain head are
+        all computed against the same snapshot under the commit lock used
+        by local writes, sync imports, repairs, and checkpoint commits, so
+        the page, the cursor, the remainder flag, and the head always
+        describe a single commit: a read can never observe half an import
+        batch or a partially applied repair, and the head never changes
+        between pages of one snapshot. The snapshot is strictly read-only —
+        it mutates neither memory, logs, checkpoints, audits, metrics,
+        candidates, nor the data file, and creates no temporary file.
+
+        Each chain entry carries ``sequence`` (1-based), ``prevDigest``
+        (the previous entry's digest, or 64 zeros for the first entry),
+        and ``digest`` — the 64-character lowercase hexadecimal SHA-256 of
+        the concatenation, with no separator, of the predecessor digest
+        encoded as ASCII, the decimal sequence number encoded as ASCII,
+        and the single record's canonical bytes (the same field order,
+        clock ordering, compact format, and escaping as the per-key audit
+        digest). The chain ``head`` is the digest of the last accepted
+        record, or 64 zeros when the log is empty; it does not vary with
+        paging.
+
+        ``after`` is the number of chain entries (log records) already
+        skipped — a 0-based resume cursor defaulting to 0 — and ``limit``
+        the page size. Returns ``(entries, next_cursor, has_more, head)``
+        where ``next_cursor`` is the number of entries skipped after this
+        page and ``has_more`` reports whether further entries remain.
+        Raises ValueError when ``after`` is past the log length of the
+        snapshot; ``after`` equal to the log length is a valid empty tail
+        and still reports the head. With ``--data-file`` the log is
+        rebuilt identically during recovery, so the same history yields
+        the same record order, link digests, cursors, and head before and
+        after a restart.
+        """
+        with self._lock:
+            total = len(self._accepted)
+            if after > total:
+                raise ValueError("after is past the end of the audit chain")
+
+            # Build the digest links for the whole chain first. Digests are
+            # chained over the complete log so a page starting at any offset
+            # still carries the correct predecessor digest, and so the head
+            # reported with the page is the tail of exactly this snapshot.
+            entries: list[dict[str, Any]] = []
+            prev_digest = ZERO_DIGEST
+            for index, (replica_id, operation) in enumerate(self._accepted):
+                record_input = (
+                    prev_digest.encode("ascii")
+                    + str(index + 1).encode("ascii")
+                    + _audit_record_bytes(replica_id, operation)
+                )
+                digest = hashlib.sha256(record_input).hexdigest()
+                entries.append(
+                    {
+                        "sequence": index + 1,
+                        "prevDigest": prev_digest,
+                        "digest": digest,
+                    }
+                )
+                prev_digest = digest
+            head = prev_digest
+            page = entries[after : after + limit]
+
+        next_cursor = after + len(page)
+        return page, next_cursor, next_cursor < total, head
+
     def import_operations(
         self, records: list[tuple[str, dict[str, Any]]]
     ) -> tuple[HTTPStatus, int, int]:
@@ -3433,6 +3541,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_audit_get(segments[3])
             return
         if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "audit"
+            and segments[2] == "log"
+            and segments[3] == "chain"
+        ):
+            self._handle_audit_chain_get()
+            return
+        if (
             len(segments) == 5
             and segments[0] == "v1"
             and segments[1] == "audit"
@@ -3663,6 +3780,39 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._json(
             HTTPStatus.OK,
             {"operations": page, "nextCursor": next_cursor, "hasMore": has_more},
+        )
+
+    def _handle_audit_chain_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing, extra, or
+        # unknown path segments — including a trailing slash — are 404
+        # there, before any query check), so a malformed query is rejected
+        # here without any state being read or changed. The response
+        # follows the compact-single-line contract: canonical JSON, one
+        # trailing newline, counts and cursors only as JSON integers.
+        params = parse_paging_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            entries, next_cursor, has_more, head = self._store.get_audit_chain(
+                after, limit
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(
+            HTTPStatus.OK,
+            {
+                "entries": entries,
+                "nextCursor": next_cursor,
+                "hasMore": has_more,
+                "head": head,
+            },
         )
 
     def _handle_audit_digest_get(self, key: str) -> None:

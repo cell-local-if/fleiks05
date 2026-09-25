@@ -385,6 +385,38 @@ The endpoint takes no query parameters: any parameter — including a repeated n
 
 With `--data-file`, the stream is rebuilt from the recovered log on startup, so the same recovery history yields the identical digest and `operations` count before and after a restart. Persistence failures and rejected (conflicting) batches never enter the log and therefore cannot influence the digest, either before or after a restart.
 
+### Global read-only audit chain
+
+`GET /v1/audit/log/chain?after=N&limit=N` returns a read-only, integrity-linked view of the **whole** accepted-operation log in global commit order. It is purely additive: it creates no records and changes no state.
+
+- `after` is the number of chain entries already skipped (a 0-based resume cursor); it defaults to `0`. `after=N` returns the entries committed after the first `N`, and `after` equal to the current chain length is a valid empty tail.
+- `limit` defaults to `100` and must be between `1` and `100`; both parameters are plain ASCII decimal integers.
+- A successful HTTP 200 response is compact UTF-8 JSON terminated by a single newline, containing exactly four fields (every count is a JSON integer):
+
+```json
+{"entries":[{"digest":"56b07c69…","prevDigest":"6c960333…","sequence":2}],"hasMore":false,"head":"56b07c69…","nextCursor":2}
+```
+
+- `entries`: one page of the log in global commit order. Each entry carries exactly `sequence`, `prevDigest`, and `digest`. `sequence` starts at `1` and links each entry to its predecessor.
+- `nextCursor`: the number of entries skipped after this page — feed it back as the next `after`.
+- `hasMore`: whether further entries remain.
+- `head`: the chain-tail summary — the digest of the last accepted entry. It is reported on every page and does not change with paging.
+
+Each entry's `digest` is the 64-character lowercase hexadecimal SHA-256 of the concatenation of three parts with no separator:
+
+1. the predecessor digest (`prevDigest`) encoded as ASCII;
+2. the decimal `sequence` encoded as ASCII;
+3. the single record's canonical bytes.
+
+The record bytes reuse exactly the per-key audit-digest rules — the fixed field order `{"replicaId":R,"operation":{"operationId":I,"key":K,"value":V,"clock":C}}`, vector-clock component names sorted lexicographically, compact UTF-8 with no whitespace, and strings escaping only the quote (`\"`), the backslash (`\\`), and control characters U+0000–U+001F (always as `\u00XX` lowercase hex); every other code point is written literally. The first entry's `prevDigest` and the `head` of an empty log are both 64 ASCII zero characters.
+
+The chain contains every first-accepted operation in global commit order — ordinary writes, stale writes that add no candidate, accepted manual/automatic repairs, and sync imports — so an entry's `prevDigest` equals the previous entry's `digest`. Identical replays (`200`), rejected or malformed requests (`409`/`400`), unfinished transactions, failed or rejected batches, and operations whose durable commit failed never enter the log and therefore never enter the chain or move the head.
+
+- A negative, blank, or non-ASCII-decimal `after`/`limit` (signs, decimals, whitespace, and non-ASCII numerals are all rejected), a repeated or unknown query parameter, a `limit` outside `1-100`, or an `after` greater than the current chain length returns HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state; any query parameter other than `after` and `limit` is rejected.
+- A missing or extra path segment, an unknown route, or a trailing slash (for example `/v1/audit/log/chain/` or `/v1/audit/log/chain/extra`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check.
+
+The entries, the paging boundaries, and the head are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so concurrent commits never produce a page, a cursor, or a head from different commits: the digest links and the resume cursor always agree. The request is strictly read-only — it modifies neither memory, candidates, logs, checkpoints, audit streams, metrics, nor the data file, and creates no temporary file. With `--data-file`, the log is rebuilt identically during recovery, so a restart yields the same record order, link digests, cursors, and head. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
+
 ### Per-operation archive query
 
 `GET /v1/replicas/{replicaId}/operations/{operationId}` locates one **first-accepted operation** by its `(replicaId, operationId)` identity. Both path segments are percent-decoded like every other route and must be non-empty after decoding.
