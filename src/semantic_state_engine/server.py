@@ -2132,6 +2132,53 @@ class StateStore:
         next_cursor = after + len(page)
         return page, next_cursor, next_cursor < total
 
+    def get_peer_operations(
+        self, peer_id: str, after: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int, bool] | None:
+        """Return one page of a peer's unconsumed accepted operations.
+
+        The peer's stream is the shared accepted-operation log from its
+        registered checkpoint onward, in global commit order: every
+        first-accepted record the peer has not yet consumed — ordinary
+        writes, stale writes that added no candidate, sync-imported
+        records, and manual or automatic conflict repairs. Identical
+        replays, conflicting or malformed requests, uncommitted requests,
+        and operations whose durable commit failed never enter the log, so
+        they can never appear.
+
+        ``after`` is the number of the peer's unconsumed records already
+        skipped (a 0-based resume cursor relative to the checkpoint) and
+        ``limit`` the page size. The checkpoint, the slice, the returned
+        cursor, and ``has_more`` are all read against the same snapshot
+        under the commit lock, so pages interleave cleanly with concurrent
+        commits and never observe half an import batch. The query is
+        strictly read-only: it neither advances nor writes the checkpoint
+        and mutates neither memory nor the data file.
+
+        Returns None when ``peer_id`` has no registered checkpoint.
+        Otherwise returns ``(records, next_cursor, has_more)`` where
+        ``next_cursor`` is the number of the peer's unconsumed records
+        skipped after this page (feed it back as the next ``after``).
+        Raises ValueError when ``after`` is past the peer's unconsumed
+        record count. With ``--data-file`` the log and the checkpoints are
+        rebuilt identically during recovery, so the same state yields the
+        same pages before and after a restart.
+        """
+        with self._lock:
+            cursor = self._checkpoints.get(peer_id)
+            if cursor is None:
+                return None
+            remaining = self._accepted[cursor:]
+            total = len(remaining)
+            if after > total:
+                raise ValueError("after is past the end of the peer's unconsumed log")
+            page = [
+                {"replicaId": replica_id, "operation": operation}
+                for replica_id, operation in remaining[after : after + limit]
+            ]
+        next_cursor = after + len(page)
+        return page, next_cursor, next_cursor < total
+
     def get_key_operations(
         self, key: str, after: int, limit: int
     ) -> tuple[list[dict[str, Any]], int, bool]:
@@ -3575,6 +3622,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_causal_get(segments[2], segments[3])
             return
+        if (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "sync"
+            and segments[2] == "peers"
+            and segments[4] == "operations"
+        ):
+            self._handle_peer_operations_get(segments[3])
+            return
         matched, checkpoint_peer = self._checkpoint_route()
         if matched:
             self._handle_checkpoint_get(checkpoint_peer)
@@ -3616,6 +3672,39 @@ class RequestHandler(BaseHTTPRequestHandler):
         if length is None:
             return None
         return self.rfile.read(length) if length > 0 else b""
+
+    def _handle_peer_operations_get(self, peer_id: str) -> None:
+        # The route-shape check in do_GET already ran: a missing, empty, or
+        # extra path segment — including a trailing slash — never matches
+        # the five-segment shape and falls through to 404 there, before any
+        # query check. A malformed query is rejected here without any state
+        # being read or changed. The response follows the
+        # compact-single-line contract: canonical JSON, one trailing
+        # newline, numbers only as JSON integers.
+        params = parse_paging_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            result = self._store.get_peer_operations(peer_id, after, limit)
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        if result is None:
+            self._json_canonical_newline(
+                HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            )
+            return
+        page, next_cursor, has_more = result
+        self._json_canonical_newline(
+            HTTPStatus.OK,
+            {"operations": page, "nextCursor": next_cursor, "hasMore": has_more},
+        )
 
     def _handle_checkpoint_get(self, peer_id: str) -> None:
         if not parse_metrics_query(urlsplit(self.path).query):
