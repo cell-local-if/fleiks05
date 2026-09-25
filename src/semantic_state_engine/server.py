@@ -619,6 +619,18 @@ def parse_peer_receipts_query(query: str) -> tuple[int, int] | None:
     return parse_peer_pickup_query(query)
 
 
+def parse_peer_receipts_audit_query(query: str) -> tuple[int, int] | None:
+    """Validate the peer-receipts-audit query string.
+
+    Delegates to :func:`parse_peer_pickup_query` — both ``after`` and
+    ``limit`` are required, with the same rejection rules as the receipts
+    route; kept as a named entry point for the receipts-audit route. The
+    bound on ``after`` against the peer's committed receipt count is
+    checked by the store against the committed snapshot.
+    """
+    return parse_peer_pickup_query(query)
+
+
 CAUSAL_COMPARE_IDENTITY_PARAMS = (
     "leftReplicaId",
     "leftOperationId",
@@ -3589,6 +3601,206 @@ class StateStore:
             "receiptsCount": total,
         }
 
+    @staticmethod
+    def _audit_receipts_locked(
+        committed: list[tuple[str, dict[str, Any]]],
+        accepted: list[tuple[str, dict[str, Any]]],
+    ) -> tuple[int, int, bool, list[dict[str, Any]]]:
+        """Audit one peer's committed receipts against the accepted log.
+
+        ``committed`` is the peer's receipt list in commit (creation) order;
+        ``accepted`` is the shared accepted-operation log. Returns the
+        audited coverage interval ``(start, end)`` (both 0-based absolute
+        log cursors, equal for an empty receipt set), the chain-integrity
+        verdict, and the anomaly list — all computed from the caller's
+        snapshot.
+
+        The first receipt's start is derived from its own operation count
+        and confirmation cursor (``cursor - len(operations)``); the audit
+        covers the shared accepted log from that start to the last
+        receipt's confirmation cursor. Every later receipt must begin
+        exactly where the previous one ended (its implied start must equal
+        the previous receipt's cursor), and each confirmed identity must
+        match the identity at the corresponding absolute log position.
+        Empty confirmation segments are legal: they start and end at the
+        same cursor.
+
+        Anomalies are reported in audit order (receipt index, then
+        confirmation position) in four disjoint categories: ``"gap"`` (a
+        receipt starts past the previous end), ``"overlap"`` (it starts
+        before the previous end), ``"identityMismatch"`` (a confirmed
+        identity does not name the record at its log position, including a
+        position outside the accepted log), and ``"cursorRegression"`` (a
+        confirmation cursor is below the previous receipt's cursor). Each
+        anomaly carries the 0-based receipt ``index`` and the implicated
+        position or boundary.
+        """
+        anomalies: list[dict[str, Any]] = []
+        if not committed:
+            # An empty receipt set is a complete, anomaly-free audit of the
+            # empty coverage interval [0, 0); nothing can gap, overlap, or
+            # regress.
+            return 0, 0, True, anomalies
+
+        log_length = len(accepted)
+        first_cursor = committed[0][1]["cursor"]
+        first_start = first_cursor - len(committed[0][1]["operations"])
+        end = committed[-1][1]["cursor"]
+        expected_start = first_start
+        previous_cursor = 0
+        for index, (_, receipt) in enumerate(committed):
+            cursor = receipt["cursor"]
+            operations = receipt["operations"]
+            receipt_start = cursor - len(operations)
+            if index > 0 and cursor < previous_cursor:
+                # A backwards cursor already explains why this receipt does
+                # not continue at the previous end, so it is reported once
+                # as a regression rather than again as an overlap.
+                anomalies.append(
+                    {"kind": "cursorRegression", "index": index, "cursor": cursor}
+                )
+            elif receipt_start > expected_start:
+                anomalies.append(
+                    {
+                        "kind": "gap",
+                        "index": index,
+                        "from": expected_start,
+                        "to": receipt_start,
+                    }
+                )
+            elif index > 0 and receipt_start < expected_start:
+                anomalies.append(
+                    {
+                        "kind": "overlap",
+                        "index": index,
+                        "from": receipt_start,
+                        "to": expected_start,
+                    }
+                )
+            for offset, identity in enumerate(operations):
+                position = receipt_start + offset
+                if not (0 <= position < log_length):
+                    anomalies.append(
+                        {
+                            "kind": "identityMismatch",
+                            "index": index,
+                            "position": position,
+                        }
+                    )
+                    continue
+                log_replica, log_operation = accepted[position]
+                if (
+                    log_replica != identity["replicaId"]
+                    or log_operation["operationId"] != identity["operationId"]
+                ):
+                    anomalies.append(
+                        {
+                            "kind": "identityMismatch",
+                            "index": index,
+                            "position": position,
+                        }
+                    )
+            # A first receipt with no confirmed operations whose cursor
+            # names a position past the accepted log end cannot be caught by
+            # a position check: report the uncovered run to the log end as a
+            # gap so a broken chain always names its anomaly.
+            if (
+                index == 0
+                and not operations
+                and cursor > log_length
+            ):
+                anomalies.append(
+                    {
+                        "kind": "gap",
+                        "index": index,
+                        "from": log_length,
+                        "to": cursor,
+                    }
+                )
+            expected_start = cursor
+            previous_cursor = cursor
+        return first_start, end, not anomalies, anomalies
+
+    def audit_peer_receipts(
+        self, peer_id: str, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Audit one peer's full receipt confirmation chain from a snapshot.
+
+        The audit covers the shared accepted-operation log from the first
+        receipt's start (derived from its own confirmation cursor and
+        operation count) to the last receipt's confirmation cursor,
+        checking that every later receipt begins exactly where the previous
+        one ended — with no gaps or overlaps, empty confirmation segments
+        staying legal — and that each confirmed identity matches the record
+        at its absolute log position. The receipts, the accepted log, the
+        page slice, the returned cursor, ``hasMore``, the coverage interval,
+        the conclusion, the anomaly list, and the whole-history digest are
+        all computed from one snapshot under the commit lock, so they always
+        describe a single commit even while acknowledgements are being
+        committed. The audit never advances or writes the checkpoint,
+        records no receipt, and mutates neither memory nor the data file.
+
+        Paging only trims the exported receipts and follows the existing
+        receipt rules: ``after`` is the number of receipts already skipped
+        and ``limit`` the page size; an ``after`` equal to the receipt count
+        is a valid empty tail, and an ``after`` past the count raises
+        ValueError. The coverage interval, the conclusion, the anomalies,
+        and the digest are always computed from the complete receipt
+        history, never from the current page. An empty receipt set reports
+        a complete, anomaly-free audit of the empty coverage interval
+        ``[0, 0)`` and still returns a stable empty page.
+
+        Returns ``(404, {"error": "not_found"})`` when the peer has never
+        registered a checkpoint. Otherwise returns ``(200, report)`` with
+        exactly nine fields: ``receipts`` (the page, in the receipt-list
+        shape), ``nextCursor``, ``hasMore``, ``algorithm`` (``"sha256"``),
+        ``digest`` (the whole-history receipt digest, identical to
+        :meth:`get_peer_receipts`), ``receiptsCount``, ``coverage`` (the
+        ``{"start", "end"}`` interval audited), ``conclusion`` (``"ok"``
+        when the receipts form one seamless, non-overlapping, log-consistent
+        chain and ``"broken"`` otherwise), and ``anomalies`` (the gap,
+        overlap, identity-mismatch, and cursor-regression findings in audit
+        order). With ``--data-file`` the receipts are rebuilt identically
+        during recovery, so the same state yields the same audit before and
+        after a restart.
+        """
+        with self._lock:
+            if peer_id not in self._checkpoints:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            committed = [
+                (ack_id, receipt)
+                for (receipt_peer, ack_id), receipt in self._acks.items()
+                if receipt_peer == peer_id
+            ]
+            total = len(committed)
+            if after > total:
+                raise ValueError("after is past the end of the peer's receipts")
+            coverage_start, coverage_end, intact, anomalies = self._audit_receipts_locked(
+                committed, self._accepted
+            )
+            digest_input = _receipts_digest_input(peer_id, committed)
+            page = [
+                {
+                    "peerId": peer_id,
+                    "ackId": ack_id,
+                    "cursor": receipt["cursor"],
+                    "operations": [dict(identity) for identity in receipt["operations"]],
+                }
+                for ack_id, receipt in committed[after : after + limit]
+            ]
+        next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "receipts": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "receiptsCount": total,
+            "coverage": {"start": coverage_start, "end": coverage_end},
+            "conclusion": "ok" if intact else "broken",
+            "anomalies": anomalies,
+        }
+
     def get_state_explanation(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Explain one key's current candidate state from a single snapshot.
 
@@ -4014,6 +4226,29 @@ class RequestHandler(BaseHTTPRequestHandler):
             return False, ""
         return True, unquote(parts[4])
 
+    def _receipts_audit_route(self) -> tuple[bool, str]:
+        """Match ``/v1/sync/peers/{peerId}/receipts/audit`` on the raw path.
+
+        Returns ``(matched, peer_id)``. As with :meth:`_receipts_route`,
+        the empty segment of ``/v1/sync/peers//receipts/audit`` is
+        preserved so the shape still matches and yields an empty
+        ``peer_id``; the audit contract treats an empty peer id exactly
+        like a shape failure (404), so the handler rejects it before any
+        query check. Any other segment count — missing segments, a
+        non-``audit`` tail such as ``.../receipts/extra``, or a trailing
+        slash — falls through to the generic 404.
+        """
+        parts = urlsplit(self.path).path.split("/")
+        if len(parts) != 7:
+            return False, ""
+        if (
+            parts[1:4] != ["v1", "sync", "peers"]
+            or parts[5] != "receipts"
+            or parts[6] != "audit"
+        ):
+            return False, ""
+        return True, unquote(parts[4])
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path == "/health":
             # The health probe stays anonymous even when auth is enabled.
@@ -4150,6 +4385,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         if matched:
             self._handle_peer_receipts_get(receipts_peer)
             return
+        matched, receipts_audit_peer = self._receipts_audit_route()
+        if matched:
+            self._handle_peer_receipts_audit_get(receipts_audit_peer)
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def _validate_declared_length(self) -> int | None:
@@ -4247,6 +4486,34 @@ class RequestHandler(BaseHTTPRequestHandler):
         # ackId, cursor, operations per receipt; replicaId, operationId per
         # identity), so the body is emitted in the payload's field order
         # rather than sorted.
+        self._json_ordered_newline(status, payload)
+
+    def _handle_peer_receipts_audit_get(self, peer_id: str) -> None:
+        # Route-shape matching ran first in do_GET (missing/extra segments
+        # and trailing slashes never reach here); an empty peer id is a
+        # shape failure and stays 404 even when the query is malformed.
+        if peer_id == "":
+            self._json_ordered_newline(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        params = parse_peer_receipts_audit_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.audit_peer_receipts(peer_id, after, limit)
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        # The audit contract fixes the response field order (receipts,
+        # nextCursor, hasMore, algorithm, digest, receiptsCount, coverage,
+        # conclusion, anomalies; start/end on coverage; kind/index plus the
+        # position-bearing fields on each anomaly), so the body is emitted
+        # in the payload's field order rather than sorted.
         self._json_ordered_newline(status, payload)
 
     def _handle_checkpoint_post(self, peer_id: str) -> None:
