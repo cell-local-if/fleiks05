@@ -577,14 +577,14 @@ The page slice, `nextCursor`, `hasMore`, and `head` are computed from a single s
 
 ### Global audit-chain integrity verification
 
-`GET /v1/audit/log/verify?after=N&limit=N&head=H&count=N` is the read-only integrity-verification companion to the global audit-chain query. It is a separate entry point that does not change the chain query in any way; it uses the same read permission, the same accepted-operation log, and the same `after`/`limit` paging. The chain links are returned in global commit order and cover exactly what the chain query covers — ordinary writes, stale writes whose clock was already dominated, accepted conflict repairs, and sync-imported records — while identical replays (`200`), rejected requests (`409`/`400`), uncommitted requests, failed batches, and records whose durable commit failed never enter the log and so never enter verification.
+`GET /v1/audit/log/verify?after=N&limit=N&head=H&count=N` is the read-only integrity-verification companion to the global audit-chain query. It is a separate entry point that does not change the chain query in any way; it uses the same read permission, the same accepted-operation log, and the same `after`/`limit` paging rules — except that both paging parameters are **required** here. The chain links are returned in global commit order and cover exactly what the chain query covers — ordinary writes, stale writes whose clock was already dominated, accepted conflict repairs, and sync-imported records — while identical replays (`200`), rejected requests (`409`/`400`), uncommitted requests, failed batches, and records whose durable commit failed never enter the log and so never enter verification.
 
-Besides the chain query's paging, the request carries two **required external expectations**:
+Besides the required paging, the request carries two **required external expectations**:
 
 - `head`: exactly 64 lowercase hexadecimal characters — the chain-tail digest the caller expects (the `head` previously returned by the chain query). Uppercase, non-hex, blank, or wrong-length values are rejected.
 - `count`: a non-negative ASCII decimal integer — the total chain length the caller expects (the full log length, not the page length). Signs, decimals, whitespace, and non-ASCII numerals are rejected.
 
-`after` and `limit` keep the chain query's defaults (`0` and `100`, with `limit` between `1` and `100`). A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly five fields — the chain query's four fields plus `verification`:
+`after` and `limit` are both **required** (no defaults are applied): `after` is a non-negative ASCII decimal integer — the number of chain links already skipped, starting at `0` — and `limit` is an ASCII decimal integer between `1` and `100`; a request missing either one is HTTP 400 with `{"error":"invalid_request"}`. A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly five fields — the chain query's four fields plus `verification`:
 
 ```json
 {"entries":[{"sequence":1,"prevDigest":"<64 zeros>","digest":"<64 lowercase hex chars>"}],"nextCursor":1,"hasMore":false,"head":"<64 lowercase hex chars>","verification":{"status":"ok","missingSequences":[],"duplicateSequences":[],"outOfRangeSequences":[],"brokenLinks":[],"digestMismatches":[],"headMismatches":[],"countMismatches":[]}}
@@ -609,7 +609,7 @@ Each anomaly list is independent and every entry keeps the chain-link position (
 
 `status` is `"ok"` exactly when the internal chain is intact (the first five lists empty) **and** both external expectations match; otherwise it is `"broken"`. An empty log is intact with a 64-zero head and verifies `"ok"` for `head` equal to 64 zeros and `count` `0`.
 
-Paging trims only the `entries` page: the `head`, the count comparison, and the whole `verification` conclusion always cover the complete history on every page, including a stable empty page returned when `after` equals the chain length. A missing, repeated, or unknown parameter, a blank value, a malformed `head`/`count`/`after`/`limit`, a `limit` outside `1-100`, or an `after` past the chain length returns HTTP 400 with `{"error":"invalid_request"}`. A missing or extra path segment (for example `/v1/audit/log`, `/v1/audit/log/verify/extra`, or a trailing slash) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query check.
+Paging trims only the `entries` page: the `head`, the count comparison, and the whole `verification` conclusion always cover the complete history on every page, including a stable empty page returned when `after` equals the chain length. A missing, repeated, or unknown parameter, a blank value, a malformed `head`/`count`/`after`/`limit` (signs, decimal points, whitespace, and non-ASCII numerals are all rejected), a `limit` outside `1-100`, or an `after` past the chain length returns HTTP 400 with `{"error":"invalid_request"}`. A missing or extra path segment (for example `/v1/audit/log`, `/v1/audit/log/verify/extra`, or a trailing slash) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query check.
 
 The page, the expectation comparison, and the verification conclusion are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so they always describe a single commit even while commits are in flight. The request is strictly read-only — it changes no candidates, operation logs, checkpoints, receipts, transactions, policy audits, metrics, or data files, and creates no temporary file. With `--data-file`, the log is rebuilt identically during recovery, so the same recovery history yields the same page, head, count comparison, and verification before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 with a `Bearer` challenge; in scope-policy mode an authenticated token lacking the read scope is HTTP 403 without a challenge; and `/health` stays anonymous.
 
@@ -740,6 +740,27 @@ The snapshot-digest input is a compact UTF-8 JSON array of exactly three element
 The candidate state, the log cursor, and the checkpoint mapping are read from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit: a read observes either the old or the new complete state, never half an import batch or a partially applied repair. The request is strictly read-only — it modifies neither memory nor the data file and creates no temporary file. With `--data-file`, the log and the checkpoints are rebuilt identically during recovery, so the same state yields the same verification result before and after a restart.
 
 The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}` without reading any state. A missing or extra path segment, an unknown route, or a trailing slash (for example `/v1/replication/snapshot/`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
+
+### Sender-side replication delivery status
+
+`GET /v1/replication/status?peerId=P` is the read-only delivery-status view of one sending peer: it reports how far the peer has consumed the shared accepted log and whether its committed receipts form one seamless confirmation chain. The endpoint is strictly read-only — it never advances or writes the checkpoint, records no receipt, and changes neither candidates, the log, audit streams, metrics, nor the data file.
+
+- `peerId` is a **required** query parameter, appearing exactly once with a non-empty percent-decoded value (the same decoding and non-empty rules as the replication path segments). A missing, repeated, or blank `peerId`, an unknown parameter, a malformed percent escape, or a percent-encoded byte sequence that is not valid UTF-8 returns HTTP 400 with `{"error":"invalid_request"}` without reading any state.
+- A peer that has never registered a checkpoint returns HTTP 404 with `{"error":"not_found"}`. A missing or extra path segment, an unknown route, or a trailing slash (for example `/v1/replication/status/`) likewise returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query check.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly five fields in this order:
+
+```json
+{"peer":"peer-a","pos":2,"left":1,"acks":1,"chain":{"status":"ok","coverage":{"start":0,"end":2},"gaps":[],"overlaps":[],"identityMismatches":[],"cursorRegressions":[]}}
+```
+
+- `peer`: the decoded peer identifier of the request.
+- `pos`: the peer's registered checkpoint cursor.
+- `left`: the number of accepted records past the checkpoint the peer has not yet consumed (`logCursor - pos`).
+- `acks`: the number of the peer's committed receipts.
+- `chain`: the chain-integrity conclusion over the peer's **whole** committed receipt history, exactly the `audit` object of `GET /v1/sync/peers/{peerId}/receipts/audit` — `status` (`"ok"` when every anomaly list is empty, else `"broken"`), `coverage` (`{"start","end"}`, the half-open confirmed segment of the shared accepted log), and the four independent anomaly lists `gaps`, `overlaps`, `identityMismatches`, and `cursorRegressions`. An empty receipt set reports the complete, anomaly-free empty coverage `{"start":0,"end":0}` with `status` `"ok"`.
+
+The checkpoint, the log length, the receipt count, and the chain conclusion are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, checkpoint commits, and acknowledgement commits, so the five fields always describe a single commit even while commits are in flight. Every number in the response is a JSON integer, and strings use the same escaping as the other endpoints. With `--data-file`, the checkpoints, the receipts, and the log are rebuilt identically during recovery, so the same state yields the same status before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route — a missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 with a `Bearer` challenge; in scope-policy mode an authenticated token lacking the read scope is HTTP 403 without a challenge; and `/health` stays anonymous.
 
 ## Tests
 

@@ -587,26 +587,25 @@ def parse_audit_log_verify_query(
 ) -> tuple[int, int, str, int] | None:
     """Validate the global audit-chain verification query string.
 
-    Shares the chain query's paging contract — ``after`` defaults to ``0``
-    and ``limit`` to ``100`` and must be between 1 and 100, both non-
-    negative ASCII decimal integers — and adds two **required** external
-    expectations, each appearing at most once: ``head`` (exactly 64
+    All four parameters are **required**, each appearing exactly once:
+    ``after`` (a non-negative ASCII decimal integer — the number of
+    chain links already skipped, starting at ``0``), ``limit`` (an
+    ASCII decimal integer between 1 and 100), ``head`` (exactly 64
     lowercase hexadecimal characters, the chain-tail digest the caller
-    expects) and ``count`` (a non-negative ASCII decimal integer, the
+    expects), and ``count`` (a non-negative ASCII decimal integer, the
     total chain length the caller expects). A missing, repeated,
     blank-named, or unknown parameter, a blank or malformed ``head``
     (uppercase, non-hex, or the wrong length all rejected), a blank,
-    signed, or non-ASCII-decimal ``count``, and the same malformed
-    ``after``/``limit`` values as :func:`parse_paging_query` return None.
-    The bound on ``after`` against the chain length is checked by the
-    store against the committed snapshot.
+    signed, or non-ASCII-decimal ``count``, and a blank, signed, or
+    non-ASCII-decimal ``after``/``limit`` (or a ``limit`` outside
+    ``1-100``) return None — no defaults are applied. The bound on
+    ``after`` against the chain length is checked by the store against
+    the committed snapshot.
     """
     parsed = parse_qs(query, keep_blank_values=True)
     if any(len(values) != 1 for values in parsed.values()):
         return None
-    if not {"head", "count"} <= set(parsed):
-        return None
-    if not set(parsed) <= {"after", "limit", "head", "count"}:
+    if set(parsed) != {"after", "limit", "head", "count"}:
         return None
     head = parsed["head"][0]
     if not _is_sha256_hex64(head):
@@ -614,18 +613,12 @@ def parse_audit_log_verify_query(
     count = _non_negative_int(parsed["count"][0])
     if count is None:
         return None
-    after = 0
-    limit = SYNC_DEFAULT_LIMIT
-    if "after" in parsed:
-        after_value = _non_negative_int(parsed["after"][0])
-        if after_value is None:
-            return None
-        after = after_value
-    if "limit" in parsed:
-        limit_value = _non_negative_int(parsed["limit"][0])
-        if limit_value is None or not (1 <= limit_value <= SYNC_BATCH_MAX):
-            return None
-        limit = limit_value
+    after = _non_negative_int(parsed["after"][0])
+    if after is None:
+        return None
+    limit = _non_negative_int(parsed["limit"][0])
+    if limit is None or not (1 <= limit <= SYNC_BATCH_MAX):
+        return None
     return after, limit, head, count
 
 
@@ -708,6 +701,58 @@ def parse_scope_policy_audit_verify_query(query: str) -> tuple[int, int] | None:
     to the count is a valid stable empty page).
     """
     return parse_peer_pickup_query(query)
+
+
+def _well_formed_percent_escapes(token: str) -> bool:
+    """Return True when every ``%`` in ``token`` starts a hex escape.
+
+    The replication routes decode path segments and query values with the
+    standard percent-decoding rules; a ``%`` that is not followed by two
+    hexadecimal digits is not an encoding of anything and is rejected as
+    a malformed request rather than passed through literally.
+    """
+    index = 0
+    while index < len(token):
+        if token[index] == "%":
+            pair = token[index + 1 : index + 3]
+            if len(pair) != 2 or any(
+                ch not in "0123456789abcdefABCDEF" for ch in pair
+            ):
+                return False
+            index += 3
+        else:
+            index += 1
+    return True
+
+
+def parse_replication_status_query(query: str) -> str | None:
+    """Validate the replication-status query string, returning the peer id.
+
+    ``peerId`` is the only accepted parameter and is **required**: it must
+    appear exactly once with a non-empty percent-decoded value (percent
+    decoding is applied by ``parse_qs``, following the same decoding and
+    non-empty rules as the replication path segments). A missing,
+    repeated, or blank ``peerId``, any unknown parameter, a malformed
+    percent escape, and a percent-encoded byte sequence that is not valid
+    UTF-8 all return None.
+    """
+    if not _well_formed_percent_escapes(query):
+        return None
+    try:
+        parsed = parse_qs(
+            query, keep_blank_values=True, encoding="utf-8", errors="strict"
+        )
+    except UnicodeDecodeError:
+        return None
+    if set(parsed) != {"peerId"}:
+        return None
+    values = parsed["peerId"]
+    if len(values) != 1:
+        return None
+    peer_id = values[0]
+    if peer_id == "":
+        return None
+    return peer_id
 
 
 CAUSAL_COMPARE_IDENTITY_PARAMS = (
@@ -4582,6 +4627,56 @@ class StateStore:
             "audit": audit,
         }
 
+    def get_replication_status(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one registered peer's sender-side delivery status.
+
+        The peer's registered checkpoint cursor, the shared accepted-log
+        length, and the peer's committed receipts are read together under
+        the same commit lock used by local writes, sync imports, repairs,
+        checkpoint commits, and acknowledgement commits, so the progress,
+        the counts, and the chain conclusion always describe a single
+        commit even while commits are in flight. The query is strictly
+        read-only: it never advances or writes the checkpoint, records no
+        receipt, and mutates neither memory nor the data file.
+
+        Returns ``(404, {"error": "not_found"})`` when the peer has never
+        registered a checkpoint. Otherwise returns ``(200, report)`` with
+        exactly five fields in this order:
+
+        - ``peer``: the decoded peer identifier of the request.
+        - ``pos``: the peer's registered checkpoint cursor.
+        - ``left``: the number of accepted records past the checkpoint
+          the peer has not yet consumed.
+        - ``acks``: the number of the peer's committed receipts.
+        - ``chain``: the chain-integrity conclusion over the peer's
+          **whole** committed receipt history, produced by
+          :func:`_receipt_chain_audit_locked` — an empty receipt set
+          reports the complete, anomaly-free empty coverage
+          (``{"start": 0, "end": 0}``) with ``status`` ``"ok"``.
+
+        With ``--data-file`` the checkpoints, the receipts, and the log
+        are rebuilt identically during recovery, so the same state yields
+        the same status before and after a restart.
+        """
+        with self._lock:
+            cursor = self._checkpoints.get(peer_id)
+            if cursor is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            left = len(self._accepted) - cursor
+            committed = [
+                (ack_id, receipt)
+                for (receipt_peer, ack_id), receipt in self._acks.items()
+                if receipt_peer == peer_id
+            ]
+            chain = _receipt_chain_audit_locked(committed, self._accepted)
+        return HTTPStatus.OK, {
+            "peer": peer_id,
+            "pos": cursor,
+            "left": left,
+            "acks": len(committed),
+            "chain": chain,
+        }
+
     def record_policy_reload(self, digest: str, tokens: int) -> dict[str, Any]:
         """Commit one successful scope-policy hot reload to the audit history.
 
@@ -5304,6 +5399,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_replication_snapshot_get()
             return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "status"
+        ):
+            self._handle_replication_status_get()
+            return
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
@@ -5714,6 +5817,23 @@ class RequestHandler(BaseHTTPRequestHandler):
             HTTPStatus.OK, self._store.get_replication_snapshot()
         )
 
+    def _handle_replication_status_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before any
+        # query check), so a malformed query is rejected here without any
+        # state being read or changed. The success body keeps the
+        # contracted field order (peer, pos, left, acks, chain) as compact
+        # JSON terminated by one newline, with numbers only as JSON
+        # integers.
+        peer_id = parse_replication_status_query(urlsplit(self.path).query)
+        if peer_id is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        status, payload = self._store.get_replication_status(peer_id)
+        self._json_ordered_newline(status, payload)
+
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)
         if params is None:
@@ -5783,8 +5903,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         # The route-shape check in do_GET already ran (missing or extra
         # segments — including a trailing slash — are 404 there, before any
         # query check), so a malformed query is rejected here without any
-        # state being read or changed. Besides the chain query's
-        # after/limit paging, the request requires two external
+        # state being read or changed. The request requires four
+        # parameters, each exactly once: ``after``/``limit`` paging (no
+        # defaults — a missing either one is rejected) and two external
         # expectations, ``head`` (64 lowercase hex chars) and ``count`` (a
         # non-negative ASCII decimal integer); any missing, repeated,
         # unknown, blank, or malformed value is rejected. The response

@@ -3,15 +3,16 @@
     GET /v1/audit/log/verify?after=N&limit=N&head=H&count=N
 
 It pages the shared accepted-operation log exactly like
-``GET /v1/audit/log/chain`` (same optional ``after``/``limit`` rules, same
-link page, resume cursor, remaining flag, and chain-tail ``head``) and
-additionally requires two external expectations — ``head`` (exactly 64
-lowercase hexadecimal characters) and ``count`` (a non-negative ASCII
-decimal integer) — and carries an independent ``verification`` conclusion
-over the *complete* log. The scan checks sequence continuity, predecessor
-closure, per-link digest recomputation, and chain-tail/head-plus-count
-agreement; the status is ``"ok"`` exactly when the internal chain is
-intact and both expectations match, otherwise ``"broken"``.
+``GET /v1/audit/log/chain`` (same link page, resume cursor, remaining
+flag, and chain-tail ``head``) but with **required** ``after``/``limit``
+paging (no defaults), and additionally requires two external expectations
+— ``head`` (exactly 64 lowercase hexadecimal characters) and ``count``
+(a non-negative ASCII decimal integer) — and carries an independent
+``verification`` conclusion over the *complete* log. The scan checks
+sequence continuity, predecessor closure, per-link digest recomputation,
+and chain-tail/head-plus-count agreement; the status is ``"ok"`` exactly
+when the internal chain is intact and both expectations match, otherwise
+``"broken"``.
 
 The tests cover the query parser, the independent anomaly scan (missing,
 duplicate, and out-of-range sequences, broken predecessor closure and
@@ -128,20 +129,25 @@ def materialized_entries(records: list[tuple[str, dict]]) -> list[dict]:
 
 
 class ParseAuditLogVerifyQueryTests(unittest.TestCase):
-    def test_requires_head_and_count(self) -> None:
+    def test_requires_all_four_parameters(self) -> None:
+        head = "a" * 64
         for query in (
             "",
-            "head=" + "a" * 64,
-            "count=0",
-            "after=0&head=" + "a" * 64,
-            "limit=1&count=0",
+            f"after=0&limit=1&head={head}",
+            f"after=0&limit=1&count=0",
+            f"after=0&head={head}&count=0",
+            f"limit=1&head={head}&count=0",
+            f"head={head}&count=0",
+            f"after=0&limit=1",
         ):
             with self.subTest(query=query):
                 self.assertIsNone(parse_audit_log_verify_query(query))
 
-    def test_accepts_head_count_with_default_paging(self) -> None:
+    def test_accepts_all_four_parameters(self) -> None:
         self.assertEqual(
-            parse_audit_log_verify_query("head=" + "a" * 64 + "&count=0"),
+            parse_audit_log_verify_query(
+                "after=0&limit=100&head=" + "a" * 64 + "&count=0"
+            ),
             (0, 100, "a" * 64, 0),
         )
         self.assertEqual(
@@ -172,26 +178,32 @@ class ParseAuditLogVerifyQueryTests(unittest.TestCase):
         for head in bad_heads:
             with self.subTest(head=head):
                 self.assertIsNone(
-                    parse_audit_log_verify_query(f"head={head}&count=0")
+                    parse_audit_log_verify_query(f"after=0&limit=1&head={head}&count=0")
                 )
 
     def test_rejects_malformed_count(self) -> None:
         for count in ("", "-1", "+1", "1.0", " 1", "1 ", "%C2%B9", "0x1"):
             with self.subTest(count=count):
                 self.assertIsNone(
-                    parse_audit_log_verify_query(f"head={'a' * 64}&count={count}")
+                    parse_audit_log_verify_query(
+                        f"after=0&limit=1&head={'a' * 64}&count={count}"
+                    )
                 )
 
-    def test_rejects_bad_after_and_limit_like_the_chain_query(self) -> None:
+    def test_rejects_bad_after_and_limit(self) -> None:
         bad = [
-            "after=&head=" + "a" * 64 + "&count=0",
-            "after=-1&head=" + "a" * 64 + "&count=0",
-            "after=1.0&head=" + "a" * 64 + "&count=0",
-            "limit=0&head=" + "a" * 64 + "&count=0",
-            "limit=101&head=" + "a" * 64 + "&count=0",
-            "limit=&head=" + "a" * 64 + "&count=0",
-            "after=0&after=1&head=" + "a" * 64 + "&count=0",
-            "limit=1&limit=2&head=" + "a" * 64 + "&count=0",
+            "after=&limit=1&head=" + "a" * 64 + "&count=0",
+            "after=-1&limit=1&head=" + "a" * 64 + "&count=0",
+            "after=1.0&limit=1&head=" + "a" * 64 + "&count=0",
+            "after=+1&limit=1&head=" + "a" * 64 + "&count=0",
+            "after=%C2%B9&limit=1&head=" + "a" * 64 + "&count=0",
+            "after=0&limit=0&head=" + "a" * 64 + "&count=0",
+            "after=0&limit=101&head=" + "a" * 64 + "&count=0",
+            "after=0&limit=&head=" + "a" * 64 + "&count=0",
+            "after=0&limit=-1&head=" + "a" * 64 + "&count=0",
+            "after=0&limit=1.0&head=" + "a" * 64 + "&count=0",
+            "after=0&after=1&limit=1&head=" + "a" * 64 + "&count=0",
+            "after=0&limit=1&limit=2&head=" + "a" * 64 + "&count=0",
         ]
         for query in bad:
             with self.subTest(query=query):
@@ -199,12 +211,12 @@ class ParseAuditLogVerifyQueryTests(unittest.TestCase):
 
     def test_rejects_repeated_and_unknown_parameters(self) -> None:
         bad = [
-            "head=" + "a" * 64 + "&head=" + "b" * 64 + "&count=0",
-            "head=" + "a" * 64 + "&count=0&count=1",
-            "head=" + "a" * 64 + "&count=0&x=1",
-            "x=1&head=" + "a" * 64 + "&count=0",
-            "head=" + "a" * 64 + "&count=0&=",
-            "?head=" + "a" * 64 + "&count=0",
+            "after=0&limit=1&head=" + "a" * 64 + "&head=" + "b" * 64 + "&count=0",
+            "after=0&limit=1&head=" + "a" * 64 + "&count=0&count=1",
+            "after=0&limit=1&head=" + "a" * 64 + "&count=0&x=1",
+            "x=1&after=0&limit=1&head=" + "a" * 64 + "&count=0",
+            "after=0&limit=1&head=" + "a" * 64 + "&count=0&=",
+            "?after=0&limit=1&head=" + "a" * 64 + "&count=0",
         ]
         for query in bad:
             with self.subTest(query=query):
@@ -692,7 +704,9 @@ class AuditLogVerifyHttpTests(unittest.TestCase):
         return records, chain_payload["head"]
 
     def test_empty_log_matching_genesis_is_compact_canonical_json(self) -> None:
-        status, payload, raw, headers = self.verify(f"?head={GENESIS}&count=0")
+        status, payload, raw, headers = self.verify(
+            f"?after=0&limit=100&head={GENESIS}&count=0"
+        )
         self.assertEqual(status, 200)
         self.assertEqual(set(payload), VERIFY_FIELDS)
         self.assertEqual(payload["entries"], [])
@@ -747,7 +761,7 @@ class AuditLogVerifyHttpTests(unittest.TestCase):
 
     def test_after_equal_to_chain_length_is_an_empty_verified_page(self) -> None:
         _, head = self.seed(2)
-        status, payload, raw, _ = self.verify(f"?after=2&head={head}&count=2")
+        status, payload, raw, _ = self.verify(f"?after=2&limit=100&head={head}&count=2")
         self.assertEqual(status, 200)
         self.assertTrue(raw.endswith(b"\n"))
         self.assertEqual(payload["entries"], [])
@@ -758,7 +772,7 @@ class AuditLogVerifyHttpTests(unittest.TestCase):
 
     def test_wrong_head_reports_broken_with_external_and_observed(self) -> None:
         _, head = self.seed(2)
-        status, payload, _, _ = self.verify(f"?head={'a' * 64}&count=2")
+        status, payload, _, _ = self.verify(f"?after=0&limit=100&head={'a' * 64}&count=2")
         self.assertEqual(status, 200)
         verification = payload["verification"]
         self.assertEqual(verification["status"], "broken")
@@ -772,7 +786,7 @@ class AuditLogVerifyHttpTests(unittest.TestCase):
 
     def test_wrong_count_reports_broken(self) -> None:
         _, head = self.seed(2)
-        status, payload, _, _ = self.verify(f"?head={head}&count=3")
+        status, payload, _, _ = self.verify(f"?after=0&limit=100&head={head}&count=3")
         self.assertEqual(status, 200)
         self.assertEqual(payload["verification"]["status"], "broken")
         self.assertEqual(
@@ -822,7 +836,7 @@ class AuditLogVerifyHttpTests(unittest.TestCase):
         )
         _, chain_payload = self.chain()
         head = chain_payload["head"]
-        status, payload, _, _ = self.verify(f"?head={head}&count=6")
+        status, payload, _, _ = self.verify(f"?after=0&limit=100&head={head}&count=6")
         self.assertEqual(status, 200)
         self.assertEqual(payload["entries"], expected_chain(records))
         self.assertEqual(payload["verification"]["status"], "ok")
@@ -833,7 +847,7 @@ class AuditLogVerifyHttpTests(unittest.TestCase):
         self.assertEqual(status, 201)
         _, chain_payload = self.chain()
         head = chain_payload["head"]
-        status, before, _, _ = self.verify(f"?head={head}&count=1")
+        status, before, _, _ = self.verify(f"?after=0&limit=100&head={head}&count=1")
         self.assertEqual(status, 200)
         self.post_operation("r1", op)  # replay -> 200
         self.post_operation("r1", operation("o1", "k", "x", {"r1": 1}))  # 409
@@ -841,7 +855,7 @@ class AuditLogVerifyHttpTests(unittest.TestCase):
         self.post_sync(
             {"operations": [record("r1", operation("o1", "k", "y", {"r1": 1}))]}
         )  # 409
-        status, after, _, _ = self.verify(f"?head={head}&count=1")
+        status, after, _, _ = self.verify(f"?after=0&limit=100&head={head}&count=1")
         self.assertEqual(status, 200)
         self.assertEqual(after, before)
         self.assertEqual(len(after["entries"]), 1)
@@ -852,26 +866,30 @@ class AuditLogVerifyHttpTests(unittest.TestCase):
         _, head = self.seed(1)
         bad_queries = [
             "",
-            f"?head={head}",  # missing count
-            f"?count=1",  # missing head
-            f"?head=&count=1",
-            f"?head={head}&count=",
-            f"?head={'A' * 64}&count=1",  # uppercase
-            f"?head={'g' * 64}&count=1",  # non-hex
-            f"?head={head[:-1]}&count=1",  # 63 chars
-            f"?head={head}x&count=1",  # 65 chars
-            f"?head={head}&count=-1",
-            f"?head={head}&count=1.0",
-            f"?head={head}&count=%201",
-            f"?after=&head={head}&count=1",
-            f"?after=-1&head={head}&count=1",
-            f"?limit=0&head={head}&count=1",
-            f"?limit=101&head={head}&count=1",
-            f"?head={head}&count=1&x=1",  # unknown
-            f"?head={head}&head={'b' * 64}&count=1",  # repeated head
-            f"?head={head}&count=1&count=2",  # repeated count
-            f"?after=0&after=1&head={head}&count=1",
-            f"?x&head={head}&count=1",
+            f"?head={head}&count=1",  # missing after and limit
+            f"?after=0&head={head}&count=1",  # missing limit
+            f"?limit=1&head={head}&count=1",  # missing after
+            f"?after=0&limit=1&head={head}",  # missing count
+            f"?after=0&limit=1&count=1",  # missing head
+            f"?after=0&limit=1&head=&count=1",
+            f"?after=0&limit=1&head={head}&count=",
+            f"?after=0&limit=1&head={'A' * 64}&count=1",  # uppercase
+            f"?after=0&limit=1&head={'g' * 64}&count=1",  # non-hex
+            f"?after=0&limit=1&head={head[:-1]}&count=1",  # 63 chars
+            f"?after=0&limit=1&head={head}x&count=1",  # 65 chars
+            f"?after=0&limit=1&head={head}&count=-1",
+            f"?after=0&limit=1&head={head}&count=1.0",
+            f"?after=0&limit=1&head={head}&count=%201",
+            f"?after=&limit=1&head={head}&count=1",
+            f"?after=-1&limit=1&head={head}&count=1",
+            f"?after=0&limit=0&head={head}&count=1",
+            f"?after=0&limit=101&head={head}&count=1",
+            f"?after=0&limit=1&head={head}&count=1&x=1",  # unknown
+            f"?after=0&limit=1&head={head}&head={'b' * 64}&count=1",  # repeated head
+            f"?after=0&limit=1&head={head}&count=1&count=2",  # repeated count
+            f"?after=0&after=1&limit=1&head={head}&count=1",
+            f"?after=0&limit=1&limit=2&head={head}&count=1",
+            f"?x&after=0&limit=1&head={head}&count=1",
         ]
         for query in bad_queries:
             with self.subTest(query=query):
@@ -882,7 +900,7 @@ class AuditLogVerifyHttpTests(unittest.TestCase):
 
     def test_after_past_chain_length_is_400(self) -> None:
         _, head = self.seed(1)
-        status, payload, _, _ = self.verify(f"?after=2&head={head}&count=1")
+        status, payload, _, _ = self.verify(f"?after=2&limit=100&head={head}&count=1")
         self.assertEqual(status, 400)
         self.assertEqual(payload, {"error": "invalid_request"})
 
@@ -935,10 +953,10 @@ class AuditLogVerifyHttpTests(unittest.TestCase):
         _, head = self.seed(2)
         status, metrics_before = self.request("GET", "/v1/metrics")
         status, sync_before = self.request("GET", "/v1/sync/operations")
-        self.verify(f"?head={head}&count=2")
+        self.verify(f"?after=0&limit=100&head={head}&count=2")
         self.verify(f"?after=1&limit=1&head={head}&count=2")
-        self.verify(f"?head={'a' * 64}&count=2")
-        self.verify(f"?head={head}&count=99")
+        self.verify(f"?after=0&limit=100&head={'a' * 64}&count=2")
+        self.verify(f"?after=0&limit=100&head={head}&count=99")
         status, metrics_after = self.request("GET", "/v1/metrics")
         status, sync_after = self.request("GET", "/v1/sync/operations")
         self.assertEqual(metrics_after, metrics_before)
@@ -1030,7 +1048,7 @@ class AuditLogVerifyAuthTests(unittest.TestCase):
         conn.close()
 
     def test_single_token_valid_is_200(self) -> None:
-        path = f"/v1/audit/log/verify?head={'0' * 64}&count=0"
+        path = f"/v1/audit/log/verify?after=0&limit=100&head={'0' * 64}&count=0"
         status, payload, _ = self.get(
             self.single_port, path, [("Authorization", "Bearer s3cret-token")]
         )
@@ -1047,7 +1065,7 @@ class AuditLogVerifyAuthTests(unittest.TestCase):
         self.assertNotIn("WWW-Authenticate", headers)
 
     def test_scope_mode_reader_is_200(self) -> None:
-        path = f"/v1/audit/log/verify?head={'0' * 64}&count=0"
+        path = f"/v1/audit/log/verify?after=0&limit=100&head={'0' * 64}&count=0"
         status, payload, _ = self.get(
             self.scope_port, path, [("Authorization", f"Bearer {READ_TOKEN}")]
         )
