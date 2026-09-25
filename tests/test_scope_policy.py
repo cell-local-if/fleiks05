@@ -616,7 +616,8 @@ class ScopePolicyPersistenceTests(unittest.TestCase):
         document = json.loads(raw.decode("utf-8"))
         self.assertLessEqual(
             set(document.keys()),
-            {"version", "operations", "checkpoints", "policies", "transactions", "acks"},
+            {"version", "operations", "checkpoints", "policies", "transactions", "acks",
+            "scopePolicyEvents"},
         )
         for configured_token in POLICY:
             self.assertNotIn(configured_token.encode("utf-8"), raw)
