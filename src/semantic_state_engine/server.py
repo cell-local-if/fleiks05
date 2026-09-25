@@ -607,6 +607,18 @@ def parse_peer_pickup_query(query: str) -> tuple[int, int] | None:
     return after_value, limit_value
 
 
+def parse_peer_receipts_query(query: str) -> tuple[int, int] | None:
+    """Validate the peer-receipts query string.
+
+    Delegates to :func:`parse_peer_pickup_query` — both ``after`` and
+    ``limit`` are required, with the same rejection rules; kept as a named
+    entry point for the receipts route. The bound on ``after`` against the
+    peer's committed receipt count is checked by the store against the
+    committed snapshot.
+    """
+    return parse_peer_pickup_query(query)
+
+
 CAUSAL_COMPARE_IDENTITY_PARAMS = (
     "leftReplicaId",
     "leftOperationId",
@@ -1023,6 +1035,46 @@ def _replication_snapshot_input(
         parts.append(":")
         parts.append(str(checkpoints[peer_id]))
     parts.append("}]")
+    return "".join(parts).encode("utf-8")
+
+
+def _receipts_digest_input(
+    peer_id: str, receipts: list[tuple[str, dict[str, Any]]]
+) -> bytes:
+    """Serialize one peer's committed receipts to the canonical digest input.
+
+    The result is a compact UTF-8 JSON array with one entry per committed
+    consumption receipt of the peer, in commit (creation) order. Each entry
+    carries its fields in the fixed order ``peerId``, ``ackId``, ``cursor``,
+    ``operations``; the operations keep their confirmation order and each
+    identity carries its fields in the fixed order ``replicaId``,
+    ``operationId``. No whitespace is emitted anywhere, numbers are plain
+    JSON integers, and strings are escaped exactly as in
+    :func:`_escape_digest_string` — only the quote, the backslash, and
+    U+0000-U+001F control characters. An empty receipt set serializes to
+    ``[]``.
+    """
+    parts: list[str] = ["["]
+    for receipt_index, (ack_id, receipt) in enumerate(receipts):
+        if receipt_index:
+            parts.append(",")
+        parts.append('{"peerId":')
+        parts.append(_escape_digest_string(peer_id))
+        parts.append(',"ackId":')
+        parts.append(_escape_digest_string(ack_id))
+        parts.append(',"cursor":')
+        parts.append(str(receipt["cursor"]))
+        parts.append(',"operations":[')
+        for index, identity in enumerate(receipt["operations"]):
+            if index:
+                parts.append(",")
+            parts.append('{"replicaId":')
+            parts.append(_escape_digest_string(identity["replicaId"]))
+            parts.append(',"operationId":')
+            parts.append(_escape_digest_string(identity["operationId"]))
+            parts.append("}")
+        parts.append("]}")
+    parts.append("]")
     return "".join(parts).encode("utf-8")
 
 
@@ -3442,6 +3494,78 @@ class StateStore:
             "hasMore": next_cursor < total,
         }
 
+    def get_peer_receipts(
+        self, peer_id: str, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of a registered peer's consumption receipts.
+
+        The receipt stream is the peer's committed ``(peerId, ackId)``
+        bindings in commit (creation) order — the order the
+        acknowledgements were accepted. Each item preserves the receipt's
+        confirmation-time ``cursor`` and the confirmed identities in their
+        confirmation order, each identity carrying exactly ``replicaId``
+        and ``operationId``.
+
+        ``after`` is the number of the peer's receipts already skipped (a
+        0-based resume cursor) and ``limit`` the page size. The registered
+        checkpoint, the receipt list, the page slice, the returned cursor,
+        ``hasMore``, and the integrity summary are all computed against
+        the same snapshot under the commit lock, so the page and the
+        summary always describe a single commit even while
+        acknowledgements are being committed. The query never advances or
+        writes the checkpoint, records no receipt, and mutates neither
+        memory nor the data file.
+
+        The summary covers the peer's **whole** committed receipt set,
+        never just the page: ``digest`` is the 64-character lowercase
+        hexadecimal SHA-256 of the canonical bytes produced by
+        :func:`_receipts_digest_input` (an empty set hashes ``[]``), and
+        ``receiptsCount`` counts committed receipts, not page items.
+
+        Returns ``(404, {"error": "not_found"})`` when the peer has never
+        registered a checkpoint. Otherwise returns ``(200, report)`` with
+        exactly six fields: ``receipts`` (the page), ``nextCursor`` (the
+        number of receipts skipped after this page — feed it back as the
+        next ``after``), ``hasMore`` (whether further receipts remain),
+        ``algorithm`` (``"sha256"``), ``digest``, and ``receiptsCount``.
+        An ``after`` equal to the receipt count is a valid empty tail.
+        Raises ValueError when ``after`` is past the receipt count of the
+        snapshot. With ``--data-file`` the receipts are rebuilt
+        identically during recovery (a file written before receipts
+        existed recovers with an empty set), so the same state yields the
+        same order, pages, and summary before and after a restart.
+        """
+        with self._lock:
+            if peer_id not in self._checkpoints:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            committed = [
+                (ack_id, receipt)
+                for (receipt_peer, ack_id), receipt in self._acks.items()
+                if receipt_peer == peer_id
+            ]
+            total = len(committed)
+            if after > total:
+                raise ValueError("after is past the end of the peer's receipts")
+            digest_input = _receipts_digest_input(peer_id, committed)
+            page = [
+                {
+                    "peerId": peer_id,
+                    "ackId": ack_id,
+                    "cursor": receipt["cursor"],
+                    "operations": [dict(identity) for identity in receipt["operations"]],
+                }
+                for ack_id, receipt in committed[after : after + limit]
+            ]
+        next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "receipts": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "receiptsCount": total,
+        }
+
     def get_state_explanation(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Explain one key's current candidate state from a single snapshot.
 
@@ -3848,6 +3972,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             return False, ""
         return True, unquote(parts[4])
 
+    def _receipts_route(self) -> tuple[bool, str]:
+        """Match ``/v1/sync/peers/{peerId}/receipts`` on the raw path.
+
+        Returns ``(matched, peer_id)``. As with :meth:`_checkpoint_route`,
+        the empty segment of ``/v1/sync/peers//receipts`` is preserved so
+        the shape still matches and yields an empty ``peer_id``; the
+        receipts contract treats an empty peer id exactly like a shape
+        failure (404), so the handler rejects it before any query check.
+        Any other segment count — missing segments, extra segments such as
+        ``.../receipts/extra``, or a trailing slash — falls through to the
+        generic 404.
+        """
+        parts = urlsplit(self.path).path.split("/")
+        if len(parts) != 6:
+            return False, ""
+        if parts[1:4] != ["v1", "sync", "peers"] or parts[5] != "receipts":
+            return False, ""
+        return True, unquote(parts[4])
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path == "/health":
             # The health probe stays anonymous even when auth is enabled.
@@ -3980,6 +4123,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         if matched:
             self._handle_peer_operations_get(pickup_peer)
             return
+        matched, receipts_peer = self._receipts_route()
+        if matched:
+            self._handle_peer_receipts_get(receipts_peer)
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def _validate_declared_length(self) -> int | None:
@@ -4044,6 +4191,29 @@ class RequestHandler(BaseHTTPRequestHandler):
         after, limit = params
         try:
             status, payload = self._store.get_peer_operations(peer_id, after, limit)
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
+
+    def _handle_peer_receipts_get(self, peer_id: str) -> None:
+        # Route-shape matching ran first in do_GET (missing/extra segments
+        # and trailing slashes never reach here); an empty peer id is a
+        # shape failure and stays 404 even when the query is malformed.
+        if peer_id == "":
+            self._json_canonical_newline(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        params = parse_peer_receipts_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_peer_receipts(peer_id, after, limit)
         except ValueError:
             self._json_canonical_newline(
                 HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
