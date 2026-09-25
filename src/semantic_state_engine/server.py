@@ -349,6 +349,123 @@ def parse_sync_batch(raw: bytes | str | dict[str, Any]) -> list[tuple[str, dict[
     return records
 
 
+TRANSACTION_BATCH_MIN = 1
+TRANSACTION_BATCH_MAX = 100
+
+
+def parse_transaction_apply(raw: bytes | str | dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """Parse and validate a cross-key conditional-write transaction.
+
+    The body must be a JSON object with exactly ``transactionId`` (a
+    non-empty string) and ``operations`` holding between 1 and 100 entries
+    in request order. Each entry must contain exactly ``replicaId``,
+    ``operationId``, ``key``, ``value``, ``clock``, and ``candidates``: the
+    fields of an ordinary write (the key rides in the entry because the
+    route carries no path key) plus the expected pre-commit candidate
+    identity set. ``candidates`` is a list — empty when the target key is
+    expected to hold no current candidates — of distinct
+    ``{"replicaId", "operationId"}`` identities. No two entries may name
+    the same key or the same ``(replicaId, operationId)`` identity. Returns
+    ``(transaction_id, entries)`` with the normalized entries in request
+    order. Raises ValueError on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            document: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        document = raw
+    if not isinstance(document, dict) or set(document.keys()) != {
+        "transactionId",
+        "operations",
+    }:
+        raise ValueError("body must be an object with only transactionId and operations")
+    transaction_id = document["transactionId"]
+    if not isinstance(transaction_id, str) or transaction_id == "":
+        raise ValueError("transactionId must be a non-empty string")
+    entries_raw = document["operations"]
+    if not isinstance(entries_raw, list) or not (
+        TRANSACTION_BATCH_MIN <= len(entries_raw) <= TRANSACTION_BATCH_MAX
+    ):
+        raise ValueError("operations must be a list of 1-100 entries")
+
+    entries: list[dict[str, Any]] = []
+    keys: set[str] = set()
+    identities: set[tuple[str, str]] = set()
+    for entry in entries_raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {
+            "replicaId",
+            "operationId",
+            "key",
+            "value",
+            "clock",
+            "candidates",
+        }:
+            raise ValueError(
+                "each operation must have only replicaId, operationId, key, value, "
+                "clock, candidates"
+            )
+        replica_id = entry["replicaId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise ValueError("replicaId must be a non-empty string")
+        for field in ("operationId", "key", "value"):
+            value = entry[field]
+            if not isinstance(value, str) or value == "":
+                raise ValueError(f"{field} must be a non-empty string")
+        clock = _validate_clock(entry.get("clock"), replica_id)
+
+        candidates_raw = entry["candidates"]
+        if not isinstance(candidates_raw, list):
+            raise ValueError("candidates must be a list")
+        candidates: list[dict[str, str]] = []
+        candidate_identities: set[tuple[str, str]] = set()
+        for candidate in candidates_raw:
+            if not isinstance(candidate, dict) or set(candidate.keys()) != {
+                "replicaId",
+                "operationId",
+            }:
+                raise ValueError("each candidate must have only replicaId and operationId")
+            candidate_replica = candidate["replicaId"]
+            candidate_operation = candidate["operationId"]
+            if not isinstance(candidate_replica, str) or candidate_replica == "":
+                raise ValueError("candidate replicaId must be a non-empty string")
+            if not isinstance(candidate_operation, str) or candidate_operation == "":
+                raise ValueError("candidate operationId must be a non-empty string")
+            candidate_identity = (candidate_replica, candidate_operation)
+            if candidate_identity in candidate_identities:
+                raise ValueError(f"duplicate candidate {candidate_identity!r}")
+            candidate_identities.add(candidate_identity)
+            candidates.append(
+                {"replicaId": candidate_replica, "operationId": candidate_operation}
+            )
+
+        key = entry["key"]
+        if key in keys:
+            raise ValueError(f"duplicate key {key!r} in transaction")
+        identity = (replica_id, entry["operationId"])
+        if identity in identities:
+            raise ValueError(f"duplicate identity {identity!r} in transaction")
+        keys.add(key)
+        identities.add(identity)
+        entries.append(
+            {
+                "replicaId": replica_id,
+                "operationId": entry["operationId"],
+                "key": key,
+                "value": entry["value"],
+                "clock": clock,
+                "candidates": candidates,
+            }
+        )
+    return transaction_id, entries
+
+
 def _non_negative_int(token: str) -> int | None:
     """Parse a base-10 non-negative integer token, or return None.
 
@@ -910,18 +1027,76 @@ def _validate_stored_policies(
     return policies
 
 
-def load_data_file_full(
+def _validate_stored_transactions(
+    document: Any, identities: set[tuple[str, str]]
+) -> dict[str, list[dict[str, Any]]]:
+    """Validate the optional ``transactions`` section of a data file.
+
+    Returns a clean ``{transactionId: [entry, ...]}`` mapping in commit
+    order. The section is optional (a version:1 file written before
+    cross-key transactions existed simply has none); when present it must
+    be a list of ``{"transactionId", "operations"}`` records, one per
+    committed transaction, each transaction satisfying the live request
+    constraints, and every entry identity must name an accepted operation,
+    since a transaction binding is committed atomically together with its
+    operations.
+    """
+    if "transactions" not in document:
+        return {}
+    raw = document["transactions"]
+    if not isinstance(raw, list):
+        raise PersistenceError("data file transactions must be a list")
+    transactions: dict[str, list[dict[str, Any]]] = {}
+    for record in raw:
+        if not isinstance(record, dict) or set(record.keys()) != {
+            "transactionId",
+            "operations",
+        }:
+            raise PersistenceError(
+                "each transaction record must be an object with transactionId and operations"
+            )
+        transaction_id = record["transactionId"]
+        if not isinstance(transaction_id, str) or transaction_id == "":
+            raise PersistenceError("transactionId must be a non-empty string")
+        if transaction_id in transactions:
+            raise PersistenceError(f"duplicate transaction {transaction_id!r} in data file")
+        try:
+            _, entries = parse_transaction_apply(
+                {"transactionId": transaction_id, "operations": record["operations"]}
+            )
+        except ValueError as exc:
+            raise PersistenceError(
+                f"stored transaction violates input constraints: {exc}"
+            ) from exc
+        for entry in entries:
+            identity = (entry["replicaId"], entry["operationId"])
+            if identity not in identities:
+                raise PersistenceError(
+                    f"transaction binding {transaction_id!r} names no accepted operation"
+                )
+        transactions[transaction_id] = entries
+    return transactions
+
+
+def load_data_file_state(
     path: str,
-) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int], dict[tuple[str, str], str]]:
-    """Read and strictly validate a data file.
+) -> tuple[
+    list[tuple[str, dict[str, Any]]],
+    dict[str, int],
+    dict[tuple[str, str], str],
+    dict[str, list[dict[str, Any]]],
+]:
+    """Read and strictly validate a data file, returning its full state.
 
     Returns the accepted operations in their original commit order, the
-    persisted ``{peerId: cursor}`` checkpoints, and the persisted
+    persisted ``{peerId: cursor}`` checkpoints, the persisted
     ``{(replicaId, operationId): policy}`` automatic-resolution policy
-    bindings (both empty for a version:1 file written before those sections
-    existed). Raises PersistenceError when the file is missing-readable, not
-    UTF-8 JSON, has an unexpected structure, or contains records, checkpoints,
-    or policy bindings violating the live constraints.
+    bindings, and the persisted ``{transactionId: [entry, ...]}``
+    transaction bindings (all empty for a version:1 file written before
+    those sections existed). Raises PersistenceError when the file is
+    missing-readable, not UTF-8 JSON, has an unexpected structure, or
+    contains records, checkpoints, policy bindings, or transaction
+    bindings violating the live constraints.
     """
     try:
         with open(path, "rb") as handle:
@@ -940,10 +1115,11 @@ def load_data_file_full(
         "operations",
         "checkpoints",
         "policies",
+        "transactions",
     } or "version" not in document or "operations" not in document:
         raise PersistenceError(
             "data file root must be an object with version and operations "
-            "and optionally checkpoints and policies"
+            "and optionally checkpoints, policies, and transactions"
         )
     version = document["version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != DATA_FORMAT_VERSION:
@@ -963,6 +1139,26 @@ def load_data_file_full(
         records.append((replica_id, operation))
     checkpoints = _validate_stored_checkpoints(document, len(records))
     policies = _validate_stored_policies(document, identities)
+    transactions = _validate_stored_transactions(document, identities)
+    return records, checkpoints, policies, transactions
+
+
+def load_data_file_full(
+    path: str,
+) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int], dict[tuple[str, str], str]]:
+    """Read and strictly validate a data file.
+
+    Returns the accepted operations in their original commit order, the
+    persisted ``{peerId: cursor}`` checkpoints, and the persisted
+    ``{(replicaId, operationId): policy}`` automatic-resolution policy
+    bindings (both empty for a version:1 file written before those sections
+    existed). Persisted transaction bindings are validated the same way but
+    not returned; use :func:`load_data_file_state` when they are needed.
+    Raises PersistenceError when the file is missing-readable, not UTF-8
+    JSON, has an unexpected structure, or contains records, checkpoints,
+    or policy bindings violating the live constraints.
+    """
+    records, checkpoints, policies, _ = load_data_file_state(path)
     return records, checkpoints, policies
 
 
@@ -979,13 +1175,18 @@ def load_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
 
 def ensure_data_file(
     path: str,
-) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int], dict[tuple[str, str], str]]:
+) -> tuple[
+    list[tuple[str, dict[str, Any]]],
+    dict[str, int],
+    dict[tuple[str, str], str],
+    dict[str, list[dict[str, Any]]],
+]:
     """Validate the data-file location and return its committed state.
 
     A missing target file is accepted (its parent directory must exist and
     be writable); an existing target must be a regular, parseable data
-    file. Returns ``(records, checkpoints, policies)``. Anything else raises
-    PersistenceError.
+    file. Returns ``(records, checkpoints, policies, transactions)``.
+    Anything else raises PersistenceError.
     """
     parent = os.path.dirname(os.path.abspath(path))
     if not os.path.isdir(parent):
@@ -999,8 +1200,8 @@ def ensure_data_file(
     if exists:
         if not stat.S_ISREG(mode):
             raise PersistenceError(f"data file path is not a regular file: {path!r}")
-        return load_data_file_full(path)
-    return [], {}, {}
+        return load_data_file_state(path)
+    return [], {}, {}, {}
 
 
 def _fsync_directory(directory: str) -> None:
@@ -1205,6 +1406,12 @@ class StateStore:
         # operation identity. An identity absent here (a plain write, a
         # manual resolution, or an imported operation) carries no policy.
         self._policies: dict[tuple[str, str], str] = {}
+        # Transaction bindings of committed cross-key conditional writes,
+        # keyed by the transaction identifier and holding the normalized
+        # entry list exactly as committed. The binding is local to this
+        # replica: it is persisted to the data file but never exported via
+        # sync.
+        self._transactions: dict[str, list[dict[str, Any]]] = {}
         self._data_file: str | None = None
         if data_file is not None:
             path = os.path.abspath(data_file)
@@ -1212,12 +1419,13 @@ class StateStore:
             # file is never touched by the probe and is opened only for
             # reading afterwards.
             preflight_data_file_directory(path)
-            records, checkpoints, policies = ensure_data_file(path)
+            records, checkpoints, policies, transactions = ensure_data_file(path)
             with self._lock:
                 for replica_id, operation in records:
                     self._commit_locked(replica_id, operation)
                 self._checkpoints = dict(checkpoints)
                 self._policies = dict(policies)
+                self._transactions = dict(transactions)
                 self._data_file = path
                 if not records and not os.path.exists(path):
                     # The target is missing and the preflight proved the
@@ -1281,6 +1489,14 @@ class StateStore:
                 }
                 for replica_id, operation in self._accepted
                 if (replica_id, operation["operationId"]) in self._policies
+            ],
+            # Transaction bindings ride along in commit order, so each
+            # binding is durable in the same atomic commit as its
+            # operations. The binding is local to this replica and is never
+            # part of the exported sync records.
+            "transactions": [
+                {"transactionId": transaction_id, "operations": entries}
+                for transaction_id, entries in self._transactions.items()
             ],
         }
         data = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -1661,6 +1877,176 @@ class StateStore:
                     self._candidates.get(op_key, []), replica_id, operation
                 )
             return HTTPStatus.CREATED, results, accepted, replayed, None
+
+    def apply_transaction(
+        self, transaction_id: str, entries: list[dict[str, Any]]
+    ) -> tuple[HTTPStatus, list[dict[str, Any]], int, int, str | None]:
+        """Apply a validated cross-key conditional-write transaction.
+
+        The parser already guarantees 1-100 entries with distinct keys,
+        distinct identities, and a structurally legal clock (containing the
+        initiating replica) per entry. The whole transaction is validated
+        against a staged view before anything is persisted or made visible:
+
+        - a known ``transactionId`` with exactly the same entries is a
+          replay: it is answered from the committed binding without
+          touching the log or re-checking any state;
+        - a known ``transactionId`` with any difference in the entries is
+          an operation conflict;
+        - an entry ``(replicaId, operationId)`` already committed with
+          different content is an operation conflict; the same identity
+          with identical content is a replayed entry and is answered from
+          the committed operation without re-checking its expectation;
+        - a new entry whose expected candidate set is not exactly the
+          target key's current candidate identities (an empty set expects
+          no current candidates) is a transaction conflict;
+        - a new entry whose clock does not strictly dominate every
+          expected candidate (missing components count as 0) is an invalid
+          request, raised as ValueError.
+
+        Any failure rejects the entire transaction unchanged. Otherwise all
+        new operations and the transaction binding commit together in one
+        atomic commit in the shared global commit order, exactly like a
+        sync-import batch: the operations are exported, audited, counted,
+        archived, and persisted like any other accepted operations, while
+        the binding stays local to this replica.
+
+        Returns ``(status, results, accepted, replayed, error)``: 201 when
+        at least one entry was newly committed or 200 when every entry was
+        a replay, with ``results`` in request order (each carrying ``key``,
+        ``replicaId``, and ``operationId``); or 409 with
+        ``"operation_conflict"`` / ``"transaction_conflict"`` and an
+        unchanged store. Raises ValueError when a clock fails to dominate
+        its expected candidates; raises PersistenceError when the durable
+        commit fails, in which case memory, the identity index, the
+        transaction bindings, and the file are unchanged and the request
+        can be retried.
+        """
+        with self._lock:
+            binding = self._transactions.get(transaction_id)
+            if binding is not None:
+                if binding == entries:
+                    results = [
+                        {
+                            "key": entry["key"],
+                            "replicaId": entry["replicaId"],
+                            "operationId": entry["operationId"],
+                        }
+                        for entry in entries
+                    ]
+                    return HTTPStatus.OK, results, 0, len(entries), None
+                return HTTPStatus.CONFLICT, [], 0, 0, "operation_conflict"
+
+            # Staged copies keep the whole validation off the visible
+            # state: the transaction is fixed in its entirety before the
+            # single commit.
+            staged_operations = dict(self._operations)
+            new_records: list[tuple[str, dict[str, Any]]] = []
+            results = []
+            accepted = 0
+            replayed = 0
+            for entry in entries:
+                replica_id = entry["replicaId"]
+                identity = (replica_id, entry["operationId"])
+                operation = {
+                    "operationId": entry["operationId"],
+                    "key": entry["key"],
+                    "value": entry["value"],
+                    "clock": entry["clock"],
+                }
+                seen = staged_operations.get(identity)
+                if seen is not None:
+                    # Same replay rule as ordinary writes: identical
+                    # content is answered from the committed operation in
+                    # whatever position it occurs; any difference is an
+                    # operation conflict.
+                    if seen == operation:
+                        replayed += 1
+                        results.append(
+                            {
+                                "key": entry["key"],
+                                "replicaId": replica_id,
+                                "operationId": entry["operationId"],
+                            }
+                        )
+                        continue
+                    return HTTPStatus.CONFLICT, [], 0, 0, "operation_conflict"
+
+                # The expected candidate set must be exactly the key's
+                # current candidate identities: an empty expectation means
+                # the key currently holds no candidates.
+                current = self._candidates.get(entry["key"], [])
+                current_identities = {
+                    (c["replicaId"], c["operationId"]) for c in current
+                }
+                expected_identities = {
+                    (c["replicaId"], c["operationId"]) for c in entry["candidates"]
+                }
+                if current_identities != expected_identities:
+                    return HTTPStatus.CONFLICT, [], 0, 0, "transaction_conflict"
+
+                # The expectation now equals the current set, so the entry
+                # clock must strictly dominate each of those candidates
+                # (missing components count as 0). A structurally illegal
+                # clock was already rejected by the parser; a legal clock
+                # that fails to dominate its own expectation makes the
+                # whole request invalid.
+                if not all(
+                    clock_dominates(operation["clock"], c["clock"]) for c in current
+                ):
+                    raise ValueError("clock does not dominate every expected candidate")
+
+                staged_operations[identity] = operation
+                new_records.append((replica_id, operation))
+                accepted += 1
+                results.append(
+                    {
+                        "key": entry["key"],
+                        "replicaId": replica_id,
+                        "operationId": entry["operationId"],
+                    }
+                )
+
+            # Commit every new operation and the transaction binding
+            # together. The atomic rename is the single durable commit
+            # point; memory, the identity index, and the bindings move only
+            # after it succeeds, so a failed durable commit leaves
+            # everything exactly as before. The binding is recorded (and
+            # persisted) even when every entry was a replay, so the
+            # transaction identifier keeps its idempotency meaning after a
+            # restart.
+            binding_record = [
+                {
+                    "replicaId": entry["replicaId"],
+                    "operationId": entry["operationId"],
+                    "key": entry["key"],
+                    "value": entry["value"],
+                    "clock": dict(entry["clock"]),
+                    "candidates": [dict(candidate) for candidate in entry["candidates"]],
+                }
+                for entry in entries
+            ]
+            if self._data_file is not None:
+                previous_length = len(self._accepted)
+                self._accepted.extend(new_records)
+                self._transactions[transaction_id] = binding_record
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    del self._accepted[previous_length:]
+                    del self._transactions[transaction_id]
+                    raise
+            else:
+                self._accepted.extend(new_records)
+                self._transactions[transaction_id] = binding_record
+            for replica_id, operation in new_records:
+                self._operations[(replica_id, operation["operationId"])] = operation
+                op_key = operation["key"]
+                self._candidates[op_key] = self._next_candidates(
+                    self._candidates.get(op_key, []), replica_id, operation
+                )
+            status = HTTPStatus.CREATED if accepted else HTTPStatus.OK
+            return status, results, accepted, replayed, None
 
     def get_sync_operations(
         self, after: int, limit: int
@@ -3516,6 +3902,48 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_transaction_apply_post(self) -> None:
+        # The route accepts no query parameters; any parameter — repeated,
+        # blank-named, or blank-valued — is an invalid request. Route-shape
+        # mismatches (missing, empty, or extra segments, including a
+        # trailing slash) never reach this handler: they fall through to
+        # the generic 404 first. The response follows the batch contract:
+        # compact JSON, one trailing newline, counts only as integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            transaction_id, entries = parse_transaction_apply(raw)
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status, results, accepted, replayed, error = self._store.apply_transaction(
+                transaction_id, entries
+            )
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        except PersistenceError:
+            self._json_newline(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json_newline(status, {"error": error})
+            return
+        self._json_newline(
+            status,
+            {
+                "status": "created" if status is HTTPStatus.CREATED else "ok",
+                "transactionId": transaction_id,
+                "operations": results,
+                "accepted": accepted,
+                "replayed": replayed,
+            },
+        )
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
         segments = self._path_segments()
@@ -3551,6 +3979,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "auto"
             and segments[3] == "batch"
         )
+        is_transaction_apply_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "transactions"
+            and segments[2] == "apply"
+        )
         if (
             matched
             or is_operation_post
@@ -3558,6 +3992,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_auto_resolve_post
             or is_sync_post
             or is_auto_resolve_batch_post
+            or is_transaction_apply_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication.
@@ -3612,6 +4047,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_auto_resolve_batch_post:
             self._handle_auto_resolve_batch_post()
+            return
+        if is_transaction_apply_post:
+            self._handle_transaction_apply_post()
             return
         self._handle_sync_post()
 

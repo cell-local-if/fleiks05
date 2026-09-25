@@ -466,7 +466,8 @@ class AuthPersistenceTests(unittest.TestCase):
         with open(self.data_path, "rb") as handle:
             document = json.loads(handle.read().decode("utf-8"))
         self.assertLessEqual(
-            set(document.keys()), {"version", "operations", "checkpoints", "policies"}
+            set(document.keys()),
+            {"version", "operations", "checkpoints", "policies", "transactions"},
         )
         self.assertNotIn(TOKEN, json.dumps(document))
 

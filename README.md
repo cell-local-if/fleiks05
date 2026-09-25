@@ -22,7 +22,7 @@ Unknown routes return HTTP 404 with `{"error":"not_found"}`. Responses use UTF-8
 
 ### Request body limits
 
-All six POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/sync/peers/{peerId}/checkpoint`) share one body-size contract:
+All seven POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/transactions/apply`, `POST /v1/sync/peers/{peerId}/checkpoint`) share one body-size contract:
 
 - The request body is limited to **1,048,576 raw UTF-8 bytes** (1 MiB). A body whose declared length is exactly the limit is processed by the normal endpoint semantics.
 - `Content-Length` is required and validated before anything else. It must be a plain ASCII decimal integer: a missing header, an empty value, a sign, whitespace, a negative number, non-ASCII digits, or multiple headers declaring conflicting lengths all return HTTP 400 with `{"error":"invalid_request"}` — the request is never treated as having an empty body. (Multiple headers are accepted only when every occurrence declares the same length.)
@@ -53,10 +53,10 @@ PYTHONPATH=src python3 -m semantic_state_engine.server --data-file ./var/state.j
 The data file is a single UTF-8 JSON document, e.g.:
 
 ```json
-{"checkpoints":{"peer-a":2},"operations":[{"replicaId":"r1","operation":{"clock":{"r1":1},"key":"color","operationId":"op-1","value":"blue"}}],"policies":[{"operationId":"fix-1","policy":"lowest_identity","replicaId":"r3"}],"version":1}
+{"checkpoints":{"peer-a":2},"operations":[{"replicaId":"r1","operation":{"clock":{"r1":1},"key":"color","operationId":"op-1","value":"blue"}}],"policies":[{"operationId":"fix-1","policy":"lowest_identity","replicaId":"r3"}],"transactions":[{"operations":[{"candidates":[],"clock":{"r1":1},"key":"color","operationId":"op-1","replicaId":"r1","value":"blue"}],"transactionId":"tx-1"}],"version":1}
 ```
 
-The `checkpoints` section is optional and holds sender-side replication cursors (see below); a file written before checkpoints existed contains only `version` and `operations`, and recovers with no registered checkpoints. The `policies` section is likewise optional and holds the automatic-resolution policy bindings (see below): one `{"replicaId","operationId","policy"}` record per accepted automatic resolution, committed atomically with its operation. `version` stays `1`: the supplemented format is backward compatible, and an old file is upgraded on disk the first time a checkpoint (or any other new commit) is persisted.
+The `checkpoints` section is optional and holds sender-side replication cursors (see below); a file written before checkpoints existed contains only `version` and `operations`, and recovers with no registered checkpoints. The `policies` section is likewise optional and holds the automatic-resolution policy bindings (see below): one `{"replicaId","operationId","policy"}` record per accepted automatic resolution, committed atomically with its operation. The `transactions` section is likewise optional and holds the cross-key transaction bindings (see below): one `{"transactionId","operations"}` record per committed transaction, committed atomically with its operations. `version` stays `1`: the supplemented format is backward compatible, and an old file is upgraded on disk the first time a checkpoint (or any other new commit) is persisted.
 
 ### Optional bearer-token authentication
 
@@ -69,7 +69,7 @@ PYTHONPATH=src python3 -m semantic_state_engine.server --auth-token-file ./var/t
 - The token file is read and validated **before the service begins listening**. It must be a readable regular file whose entire content is exactly one non-empty ASCII printable token — no whitespace, no newlines, nothing before or after it. A missing, unreadable, or non-regular target (for example a directory) and any format violation make startup fail with exit code 2, exactly like a rejected data file: no port is bound and the token is never printed.
 - `GET /health` stays anonymous. Every other route — known or unknown, GET or POST — requires the request to carry **exactly one** `Authorization` header whose value is exactly `Bearer ` (one space) followed by the token. A missing, duplicated, or malformed header and any token mismatch return HTTP 401 with `{"error":"unauthorized"}` and a `WWW-Authenticate: Bearer` response header — before route matching, query parsing, the commit lock, any state read, any data-file access, and any POST body read. The comparison uses the standard library's constant-time primitive.
 - A rejected request changes nothing: it creates no temporary file and leaves memory, logs, checkpoints, audit streams, and the data file exactly as they were; the token is never leaked in responses or logs.
-- The six POST endpoints keep their Content-Length priority: a missing/malformed declaration still returns 400 and an over-limit declaration still returns 413 **before** authentication is checked. When the declared length is valid but the request is unauthorized, the 401 is sent **without reading the body** and the connection is closed.
+- The seven POST endpoints keep their Content-Length priority: a missing/malformed declaration still returns 400 and an over-limit declaration still returns 413 **before** authentication is checked. When the declared length is valid but the request is unauthorized, the 401 is sent **without reading the body** and the connection is closed.
 - Once a request is authenticated, every existing behavior — success codes, 400/404/409/500, paging, digests, idempotency, concurrency, and recovery — is exactly as documented for the anonymous service.
 - The authentication configuration is never written to the data file: a `--data-file` restart recovers only operations and checkpoints, and the token is supplied again (or not) via the command line on each start.
 
@@ -260,6 +260,30 @@ Entries are processed **in request order**, each with exactly the single-key sem
 - All new operations commit together once, so batch repairs share the single global commit order: they are exported by `GET /v1/sync/operations`, appear in per-key audit streams and audit digests, move every metrics counter and the verification digest, are addressable in the per-operation archive, are persisted to `--data-file` (with their policy bindings) in one atomic commit, and recover identically after a restart. The policy binding stays local to the resolving replica: an importing replica holds the operation without the binding, so replaying the batch entry there is an operation conflict.
 - The response body is compact JSON with no insignificant whitespace and ends with exactly one newline; every numeric field is a JSON integer.
 - With `--data-file`, the whole batch (operations and bindings together) is persisted before the 201 response; a durable failure returns HTTP 500 `{"error":"internal_error"}` and leaves memory and the file exactly as they were — the batch can be retried. After a restart the results, replay `200`, and conflict `409` are identical to a process that never restarted.
+
+### Cross-key conditional-write transactions
+
+`POST /v1/transactions/apply` commits between 1 and 100 conditional writes — each naming a different key — as one atomic transaction. The body is a JSON object with exactly two keys:
+
+```json
+{"transactionId":"tx-1","operations":[{"replicaId":"r1","operationId":"op-9","key":"color","value":"blue","clock":{"r1":2},"candidates":[{"replicaId":"r1","operationId":"op-1"}]}]}
+```
+
+- `transactionId` is a non-empty string identifying the transaction; it is the idempotency key for the whole request.
+- `operations` must contain between 1 and 100 entries, kept in request order. Each entry has exactly `replicaId`, `operationId`, `key`, `value`, `clock`, and `candidates`: the fields of an ordinary write (the key rides in the entry because the route carries no path key) plus the expected pre-commit candidate identity set. Every field obeys the write constraints: non-empty strings and a clock of non-boolean non-negative integer components containing the entry's `replicaId`.
+- `candidates` is a list — possibly empty — of distinct `{"replicaId","operationId"}` identities naming the candidates the key is expected to hold before the commit. An empty list expects the key to currently hold no candidates; a non-empty list must be exactly the key's current candidate identities.
+- Each entry's clock must strictly dominate every candidate in its expected set (missing components count as 0, exactly as in the write semantics).
+- No two entries may name the same `key`, and no two may carry the same `(replicaId, operationId)` identity.
+- A malformed body, an invalid `transactionId`, an empty or oversized batch, a duplicate key or identity, a duplicate or malformed candidate, an unknown field at the root or on an entry, a structurally illegal clock, or a legal clock that does not dominate every expected candidate all return HTTP 400 with `{"error":"invalid_request"}`; the whole transaction is unchanged. Extra path segments (for example `/v1/transactions/apply/extra`) return HTTP 404 with `{"error":"not_found"}`, and any query parameter returns HTTP 400 with `{"error":"invalid_request"}`.
+
+Only when every entry's expectation matches the current state and every clock dominates its expectation do the operations enter the shared log as one accepted batch. Any entry whose expected set is not exactly the key's current candidate identities — including a set that moved between validation and commit — rejects the whole transaction with HTTP 409 `{"error":"transaction_conflict"}`; nothing changes. An entry identity already committed with different content, or a known `transactionId` replayed with different entries, returns HTTP 409 `{"error":"operation_conflict"}`; nothing changes.
+
+- Success: HTTP 201 with `{"status":"created","transactionId":T,"operations":[...],"accepted":A,"replayed":R}` when at least one entry newly commits, or HTTP 200 with `"status":"ok"` when every entry is a replay. `operations` has one result per entry, in request order, each carrying `key`, `replicaId`, and `operationId`; `accepted`/`replayed` are integer counts.
+- The same `transactionId` replayed with exactly the same entries returns HTTP 200 with the same shape: no new log records are appended and no state is re-checked — the response is answered from the committed transaction binding. An entry whose `(replicaId, operationId)` is already committed with identical content counts as a replay in whatever position it occurs.
+- All new operations commit together once, so transactions share the single global commit order with local writes, sync imports, repairs, and checkpoints: the operations are exported by `GET /v1/sync/operations`, appear in per-key audit streams and audit digests, move every metrics counter and the verification digest, and are addressable in the per-operation archive. A concurrent reader sees either the old or the new complete state, never half a transaction.
+- The transaction binding (`transactionId` plus its entries) is local to the committing replica: it is persisted to `--data-file` but is not part of the exported sync records, so an importing replica holds the operations without the binding.
+- The response body is compact JSON with no insignificant whitespace and ends with exactly one newline; every numeric field is a JSON integer.
+- With `--data-file`, the whole transaction (operations and binding together) is persisted in one atomic commit before the success response — including a pure-replay transaction, whose binding-only commit writes the unchanged log together with the new binding. A durable failure returns HTTP 500 `{"error":"internal_error"}` and leaves memory, the identity index, the transaction bindings, and the file exactly as they were — the request can be retried. After a restart the `201`/`200`/`409` judgments are identical to a process that never restarted.
 
 ### Incremental sync between replicas
 
