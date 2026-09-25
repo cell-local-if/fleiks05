@@ -125,6 +125,31 @@ Only successful reloads create events: authentication/permission rejections, mal
 
 With `--data-file`, events live in the optional `policyEvents` section described above: a successful reload is made durable in the same atomic commit protocol (`write temp file → fsync → rename → fsync directory`) before its `200`, and the history is rebuilt identically on restart with stable sequence numbers and digests; an old file without the section recovers with an empty history. The policy tokens and scopes themselves are still never written to the data file — an event records only the sequence, the raw-byte digest, and the entry count. The audit query itself is read-only: it creates no temporary file and changes neither memory nor the data file.
 
+#### Verifying scope-policy change history: `GET /v1/admin/scope-policy/audit/verify`
+
+In scope policy mode an administrator can incrementally export the same successful-reload history as the change-audit endpoint **and** independently verify its internal integrity in one read-only query. The endpoint is published **only** in scope policy mode: single-token mode and anonymous mode answer it with `404 {"error":"not_found"}` (after the single-token authentication check, exactly like the audit and reload endpoints).
+
+- The request must carry an `admin` token, under exactly the same authentication contract as the change-audit endpoint: a missing, duplicated, or malformed `Authorization` header, or a token mismatch, is HTTP 401 with `{"error":"unauthorized"}` and the `WWW-Authenticate: Bearer` challenge; an authenticated token without the `admin` scope is HTTP 403 with `{"error":"forbidden"}` and **no** challenge. The scope decision runs before the query is parsed, so a bad query for a non-admin token is still 403.
+- The path must be exactly `/v1/admin/scope-policy/audit/verify`. A missing segment, an extra segment, a trailing slash, or any unknown route is `404 {"error":"not_found"}`, decided **before** any query check — a wrong path shape together with an invalid query is still 404.
+- `after` and `limit` jointly control the incremental export and are **both required**: `after` is the number of successful events already skipped (a 0-based resume cursor that starts at `0`) and `limit` accepts only an ASCII decimal integer between `1` and `100`. A missing parameter, an empty value, a sign, whitespace, a decimal point, non-ASCII numerals, a repeated `after`/`limit`, an unknown parameter, a `limit` outside `1-100`, or an `after` past the current event count is HTTP 400 with `{"error":"invalid_request"}`. An `after` equal to the event count is a valid stable empty page (the boundary request returns no events). Parameter errors change no state.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly seven fields:
+
+```json
+{"events":[{"sequence":1,"digest":"<64 lowercase hex chars>","tokens":3}],"nextCursor":1,"hasMore":false,"algorithm":"sha256","digest":"<64 lowercase hex chars>","eventsCount":1,"verification":{"status":"ok","missingSequences":[],"duplicates":[],"outOfRange":[],"digestMismatches":[]}}
+```
+
+- `events`, `nextCursor`, and `hasMore` are exactly one incremental page of the change-audit endpoint: the events are exported along the commit order of successful hot reloads, each carrying exactly `sequence`, `digest`, and `tokens`; `nextCursor` is the cumulative number of events skipped **after this page** (feed it back as the next `after`), and `hasMore` reports whether further events remain.
+- `algorithm` is always `"sha256"`, `digest` is the 64-character lowercase hexadecimal SHA-256 of the same canonical compact UTF-8 array the change-audit endpoint uses (fixed field order `sequence`, `digest`, `tokens`, plain JSON integers, strings escaping only the quote, the backslash, and U+0000-U+001F control characters, no whitespace), and `eventsCount` counts the **complete** history. The digest and count are recomputed over the full history on every request — they never cover just the page, and an empty history hashes the empty array `[]`. Paging trims only the exported event page.
+- `verification` carries the integrity conclusion over the **whole** history, also independent of the page. Its `status` is `"ok"` exactly when every anomaly list below is empty, otherwise `"broken"`:
+  - `missingSequences`: a sequence number in `1..eventsCount` claimed by no event — each entry is `{"eventsIndex":I,"sequence":N}` with the 0-based position `N - 1` that should carry the missing number.
+  - `duplicates`: every occurrence of a sequence number after its first, marked with the repeating event's 0-based `eventsIndex` and 1-based `sequence`.
+  - `outOfRange`: an event whose sequence is below `1` or past `eventsCount`.
+  - `digestMismatches`: an event whose recorded digest is not exactly 64 lowercase hexadecimal characters.
+  The conclusion cross-checks sequence numbering, digest shape, and the event count together; an empty history is a complete, anomaly-free `"ok"`.
+
+The page slice, cursors, full-history digest, event count, and verification conclusion are computed from one snapshot of the complete history under the same serialization as reloads, so a query arriving during a concurrent hot reload observes only the complete old history or the complete new one — never a mix. The query is strictly read-only: it changes neither memory nor the data file and creates no temporary file. With `--data-file`, the history recovered on restart yields the same event pages, the same full-history digest, and the same integrity conclusion as a process that never restarted. Every count and cursor in the response is a JSON integer. The README startup entry and the existing audit, reload, persistence, anonymous-health, and Content-Length length-priority behaviors are unchanged.
+
 #### Shared authentication contract
 
 Both enabled modes share one request contract:

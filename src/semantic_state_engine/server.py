@@ -648,6 +648,22 @@ def parse_scope_policy_audit_query(query: str) -> tuple[int, int] | None:
     return parse_peer_pickup_query(query)
 
 
+def parse_scope_policy_audit_verify_query(query: str) -> tuple[int, int] | None:
+    """Validate the scope-policy change-audit integrity-verify query string.
+
+    Shares the change-audit route's contract exactly: both ``after`` and
+    ``limit`` are required non-repeated ASCII decimal integers, ``after``
+    a 0-based resume cursor starting at ``0`` and ``limit`` between 1 and
+    100, and any unknown parameter is rejected. The bound on ``after``
+    against the committed event count is checked by the store against the
+    committed snapshot (``after`` equal to the count is a valid empty
+    page). Paging trims only the exported event page; the integrity
+    conclusion, full-history digest, and event count always cover the
+    complete history.
+    """
+    return parse_peer_pickup_query(query)
+
+
 CAUSAL_COMPARE_IDENTITY_PARAMS = (
     "leftReplicaId",
     "leftOperationId",
@@ -1180,6 +1196,73 @@ def _policy_events_digest_input(events: list[dict[str, Any]]) -> bytes:
         parts.append("}")
     parts.append("]")
     return "".join(parts).encode("utf-8")
+
+
+def _policy_events_verification_locked(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Audit the complete scope-policy change history for internal integrity.
+
+    Returns the integrity conclusion, always computed over the whole
+    event history, never the current page::
+
+        {"status": "ok" | "broken",
+         "missingSequences": [...], "duplicates": [...],
+         "outOfRange": [...], "digestMismatches": [...]}
+
+    A healthy history numbers its events ``1..N`` continuously (N is the
+    history length), each number used exactly once, and every event
+    carries a 64-character lowercase hexadecimal digest. The four
+    anomaly lists are independent (one event may appear in more than
+    one) and every entry retains where the anomaly occurred with a
+    0-based ``eventsIndex`` and the 1-based ``sequence``:
+
+    - ``missingSequences``: a number in ``1..N`` claimed by no event —
+      the position that should carry it is ``eventsIndex`` ``k - 1``.
+    - ``duplicates``: every occurrence of a sequence number after its
+      first, marked at the repeating event's own index.
+    - ``outOfRange``: an event whose sequence is below ``1`` or past the
+      history length ``N`` — a numbering position that cannot exist in a
+      history of this size.
+    - ``digestMismatches``: an event whose recorded digest is not exactly
+      64 lowercase hexadecimal characters.
+
+    An empty history is the complete, anomaly-free conclusion
+    (``"ok"`` with four empty lists). ``status`` is ``"ok"`` exactly
+    when all four lists are empty.
+    """
+    missing: list[dict[str, int]] = []
+    duplicates: list[dict[str, int]] = []
+    out_of_range: list[dict[str, int]] = []
+    digest_mismatches: list[dict[str, int]] = []
+    total = len(events)
+    seen: set[int] = set()
+    for events_index, event in enumerate(events):
+        sequence = event.get("sequence")
+        if not isinstance(sequence, bool) and isinstance(sequence, int):
+            if sequence < 1 or sequence > total:
+                out_of_range.append(
+                    {"eventsIndex": events_index, "sequence": sequence}
+                )
+            if sequence in seen:
+                duplicates.append(
+                    {"eventsIndex": events_index, "sequence": sequence}
+                )
+            else:
+                seen.add(sequence)
+        if not _is_sha256_hex64(event.get("digest")):
+            digest_mismatches.append(
+                {"eventsIndex": events_index, "sequence": sequence}
+            )
+    for expected in range(1, total + 1):
+        if expected not in seen:
+            missing.append({"eventsIndex": expected - 1, "sequence": expected})
+    broken = bool(missing or duplicates or out_of_range or digest_mismatches)
+    return {
+        "status": "broken" if broken else "ok",
+        "missingSequences": missing,
+        "duplicates": duplicates,
+        "outOfRange": out_of_range,
+        "digestMismatches": digest_mismatches,
+    }
 
 
 def _receipt_chain_audit_locked(
@@ -4264,6 +4347,60 @@ class StateStore:
             "eventsCount": total,
         }
 
+    def get_policy_events_verification(
+        self, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one incremental page of the change history with an integrity check.
+
+        This is the operational integrity view over the same successful
+        hot-reload history :meth:`get_policy_events` pages. The event
+        page follows the identical commit order, paging, cursor, and
+        page-shape rules — ``after`` events already skipped (a 0-based
+        resume cursor starting at ``0``) and ``limit`` the page size —
+        but the response additionally carries a ``verification``
+        conclusion over the **whole** history, and the full-history
+        ``digest``/``eventsCount`` always cover every event regardless
+        of the page: paging trims only ``events``.
+
+        The page slice, cursors, summary, count, and conclusion are all
+        computed against one snapshot under the commit lock, so a
+        concurrent reload is observed only as the whole old or the whole
+        new history; the query is strictly read-only (no temporary
+        file, no memory or data-file change).
+
+        Returns ``(200, report)`` with exactly seven fields: ``events``
+        (the page, each item carrying exactly ``sequence``, ``digest``,
+        ``tokens``), ``nextCursor`` (the cumulative number of events
+        skipped after this page — feed it back as the next ``after``),
+        ``hasMore``, ``algorithm`` (``"sha256"``), ``digest`` (the
+        SHA-256 of the canonical compact JSON array produced by
+        :func:`_policy_events_digest_input` over the whole history, an
+        empty history hashing ``[]``), ``eventsCount`` (the full history
+        length), and ``verification`` (produced by
+        :func:`_policy_events_verification_locked`). An ``after`` equal
+        to the event count is a valid empty tail whose verification
+        still covers the complete history; an empty history verifies
+        ``"ok"``. Raises ValueError when ``after`` is past the event
+        count of the snapshot.
+        """
+        with self._lock:
+            total = len(self._policy_events)
+            if after > total:
+                raise ValueError("after is past the end of the policy event history")
+            digest_input = _policy_events_digest_input(self._policy_events)
+            verification = _policy_events_verification_locked(self._policy_events)
+            page = [dict(event) for event in self._policy_events[after : after + limit]]
+        next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "events": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "eventsCount": total,
+            "verification": verification,
+        }
+
     def get_state_explanation(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Explain one key's current candidate state from a single snapshot.
 
@@ -4807,21 +4944,33 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "scope-policy"
             and segments[3] == "audit"
         )
-        if is_scope_policy_audit_get:
-            # The change-audit entry is admin-gated, like the reload
-            # endpoint, and exists only in scope-policy mode. Authentication
-            # still runs before the mode gate, so a missing or bad
-            # credential is 401 in every mode, a valid token without the
-            # admin scope is 403 without a challenge, and single-token plus
-            # anonymous modes answer 404 exactly like an unpublished route.
-            # Path-shape mismatches never reach here, so they still fall
-            # through to the generic 404 below.
+        is_scope_policy_audit_verify_get = (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "scope-policy"
+            and segments[3] == "audit"
+            and segments[4] == "verify"
+        )
+        if is_scope_policy_audit_get or is_scope_policy_audit_verify_get:
+            # The change-audit and its integrity-verify entry are
+            # admin-gated, like the reload endpoint, and exist only in
+            # scope-policy mode. Authentication still runs before the
+            # mode gate, so a missing or bad credential is 401 in every
+            # mode, a valid token without the admin scope is 403 without
+            # a challenge, and single-token plus anonymous modes answer
+            # 404 exactly like an unpublished route. Path-shape
+            # mismatches never reach here, so they still fall through to
+            # the generic 404 below.
             if not self._require_scope(SCOPE_ADMIN):
                 return
             if getattr(self.server, "scope_policy", None) is None:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                 return
-            self._handle_scope_policy_audit_get()
+            if is_scope_policy_audit_verify_get:
+                self._handle_scope_policy_audit_verify_get()
+            else:
+                self._handle_scope_policy_audit_get()
             return
         # Every other route — known or unknown — authenticates and checks
         # the read scope before route matching, query parsing, or any state
@@ -5688,6 +5837,32 @@ class RequestHandler(BaseHTTPRequestHandler):
         # The response keeps the payload's contracted field order: events,
         # nextCursor, hasMore, algorithm, digest, eventsCount (and per event
         # sequence, digest, tokens), terminated by one newline.
+        self._json_ordered_newline(status, payload)
+
+    def _handle_scope_policy_audit_verify_get(self) -> None:
+        # Authentication, the admin scope, and the scope-mode gate all ran
+        # in do_GET; route-shape mismatches — a missing or extra segment,
+        # or a trailing slash — fall through to the generic 404 before
+        # this handler runs. The query is the same required after/limit
+        # pair as the change-audit route.
+        params = parse_scope_policy_audit_verify_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_policy_events_verification(after, limit)
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        # The response keeps the payload's contracted field order: events,
+        # nextCursor, hasMore, algorithm, digest, eventsCount, verification
+        # (and within verification status, missingSequences, duplicates,
+        # outOfRange, digestMismatches), terminated by one newline.
         self._json_ordered_newline(status, payload)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
