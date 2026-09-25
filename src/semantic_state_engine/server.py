@@ -582,6 +582,53 @@ def parse_sync_query(query: str) -> tuple[int, int] | None:
     return parse_paging_query(query)
 
 
+def parse_audit_log_verify_query(
+    query: str,
+) -> tuple[int, int, str, int] | None:
+    """Validate the global audit-chain verification query string.
+
+    Shares the chain query's paging contract — ``after`` defaults to ``0``
+    and ``limit`` to ``100`` and must be between 1 and 100, both non-
+    negative ASCII decimal integers — and adds two **required** external
+    expectations, each appearing at most once: ``head`` (exactly 64
+    lowercase hexadecimal characters, the chain-tail digest the caller
+    expects) and ``count`` (a non-negative ASCII decimal integer, the
+    total chain length the caller expects). A missing, repeated,
+    blank-named, or unknown parameter, a blank or malformed ``head``
+    (uppercase, non-hex, or the wrong length all rejected), a blank,
+    signed, or non-ASCII-decimal ``count``, and the same malformed
+    ``after``/``limit`` values as :func:`parse_paging_query` return None.
+    The bound on ``after`` against the chain length is checked by the
+    store against the committed snapshot.
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if not {"head", "count"} <= set(parsed):
+        return None
+    if not set(parsed) <= {"after", "limit", "head", "count"}:
+        return None
+    head = parsed["head"][0]
+    if not _is_sha256_hex64(head):
+        return None
+    count = _non_negative_int(parsed["count"][0])
+    if count is None:
+        return None
+    after = 0
+    limit = SYNC_DEFAULT_LIMIT
+    if "after" in parsed:
+        after_value = _non_negative_int(parsed["after"][0])
+        if after_value is None:
+            return None
+        after = after_value
+    if "limit" in parsed:
+        limit_value = _non_negative_int(parsed["limit"][0])
+        if limit_value is None or not (1 <= limit_value <= SYNC_BATCH_MAX):
+            return None
+        limit = limit_value
+    return after, limit, head, count
+
+
 def parse_peer_pickup_query(query: str) -> tuple[int, int] | None:
     """Validate the peer-progress pickup query string.
 
@@ -1096,6 +1143,172 @@ def _audit_chain_link(
         + _audit_record_bytes(replica_id, operation)
     )
     return hashlib.sha256(hash_input).hexdigest()
+
+
+def _audit_log_verification_locked(
+    accepted: list[tuple[str, dict[str, Any]]],
+    entries: list[dict[str, Any]],
+    expected_head: str,
+    expected_count: int,
+) -> dict[str, Any]:
+    """Independently verify the whole global audit chain in one pass.
+
+    ``accepted`` is the complete shared accepted-operation log in global
+    commit order (the raw source of truth) and ``entries`` is the full
+    materialized chain of claimed links — one per log position, each
+    ``{"sequence", "prevDigest", "digest"}`` (exactly what the chain query
+    computes for the whole log). The scan never pages: it independently
+    re-walks the raw log, recomputing every link with
+    :func:`_audit_chain_link`, and validates each claimed link against that
+    recomputation:
+
+    - **sequence continuity** — claimed sequences must form the continuous
+      range ``1..N`` with no missing, duplicate, or out-of-range claim;
+    - **predecessor closure** (``prevDigest``) — the first link closes
+      against the 64-zero genesis and every later link against the previous
+      link's recomputed digest;
+    - **digest recomputation** — each claimed ``digest`` must equal the
+      independently recomputed value;
+    - **chain-tail agreement** — the recomputed last-link digest (the
+      ``head``, 64 zeros for an empty log) must equal the external
+      ``head``, and the full length ``N`` must equal the external
+      ``count``.
+
+    It returns the conclusion, always over the complete log::
+
+        {"status": "ok" | "broken",
+         "missingSequences": [...], "duplicateSequences": [...],
+         "outOfRangeSequences": [...], "brokenLinks": [...],
+         "digestMismatches": [...],
+         "headMismatches": [...], "countMismatches": [...]}
+
+    Every marker keeps the 0-based chain-link position (``linkIndex``),
+    the link's 1-based ``sequence``, and the observed value:
+
+    - ``missingSequences``: a position ``S`` in ``1..N`` no link claims —
+      ``{"linkIndex": S - 1, "sequence": S}``.
+    - ``duplicateSequences``: a link whose claimed sequence an earlier link
+      already claimed (the later occurrence only) —
+      ``{"linkIndex": I, "sequence": S}``.
+    - ``outOfRangeSequences``: a link whose ``sequence`` is not an integer
+      in ``1..N`` — ``{"linkIndex": I, "sequence": S}``.
+    - ``brokenLinks``: the predecessor-closure failure (断链) — a link
+      whose claimed ``prevDigest`` is not the predecessor link's
+      recomputed digest (the genesis for the first link) —
+      ``{"linkIndex": I, "sequence": S, "expected": D, "observed": D}``
+      with the recomputed predecessor first and the claimed one second.
+    - ``digestMismatches``: the digest-recomputation failure — a link whose
+      claimed ``digest`` is not the value independently recomputed from the
+      record's canonical bytes and the running predecessor —
+      ``{"linkIndex": I, "sequence": S, "expected": D, "observed": D}``
+      with the recomputed digest first and the claimed one second.
+    - ``headMismatches``: at most one marker
+      ``{"expected": H, "observed": H}`` (external first, recomputed tail
+      second); empty on agreement.
+    - ``countMismatches``: at most one marker
+      ``{"expected": C, "observed": N}`` (external first, actual length
+      second); empty on agreement.
+
+    ``status`` is ``"ok"`` exactly when the internal chain is intact (the
+    first five lists empty) **and** both external expectations match;
+    otherwise ``"broken"``. The live store materializes ``entries`` from
+    ``accepted`` in the same committed snapshot, so a healthy committed
+    history is internally intact by construction and verifies ``"ok"``
+    exactly when ``head`` and ``count`` match; the scan exists to expose a
+    damaged chain. An empty log is intact with a 64-zero tail and verifies
+    ``"ok"`` for the genesis head and count ``0``.
+    """
+    missing: list[dict[str, Any]] = []
+    duplicate: list[dict[str, Any]] = []
+    out_of_range: list[dict[str, Any]] = []
+    broken_links: list[dict[str, Any]] = []
+    digest_mismatches: list[dict[str, Any]] = []
+    total = len(accepted)
+    seen: set[int] = set()
+    recomputed_previous = _AUDIT_CHAIN_GENESIS
+    for index in range(max(total, len(entries))):
+        claimed = entries[index] if index < len(entries) else None
+        raw_sequence = claimed.get("sequence") if isinstance(claimed, dict) else None
+        valid_sequence = isinstance(raw_sequence, int) and not isinstance(
+            raw_sequence, bool
+        )
+        if not valid_sequence or raw_sequence < 1 or raw_sequence > total:
+            out_of_range.append({"linkIndex": index, "sequence": raw_sequence})
+        elif raw_sequence in seen:
+            # Only the later occurrence is a duplicate; the first keeps its
+            # claim on the sequence position.
+            duplicate.append({"linkIndex": index, "sequence": raw_sequence})
+        else:
+            seen.add(raw_sequence)
+        if index < total:
+            replica_id, operation = accepted[index]
+            recomputed = _audit_chain_link(
+                recomputed_previous, index + 1, replica_id, operation
+            )
+            claimed_previous = (
+                claimed.get("prevDigest") if isinstance(claimed, dict) else None
+            )
+            claimed_digest = (
+                claimed.get("digest") if isinstance(claimed, dict) else None
+            )
+            if claimed_previous != recomputed_previous:
+                # Broken predecessor closure: the link does not close off
+                # the predecessor's recomputed digest. The marker carries
+                # the recomputed predecessor first and the claimed one
+                # second.
+                broken_links.append(
+                    {
+                        "linkIndex": index,
+                        "sequence": raw_sequence,
+                        "expected": recomputed_previous,
+                        "observed": claimed_previous,
+                    }
+                )
+            if claimed_digest != recomputed:
+                # Digest recomputation mismatch: the claimed digest is not
+                # the SHA-256 recomputed from the record and the running
+                # predecessor. The marker carries the recomputed digest
+                # first and the claimed one second.
+                digest_mismatches.append(
+                    {
+                        "linkIndex": index,
+                        "sequence": raw_sequence,
+                        "expected": recomputed,
+                        "observed": claimed_digest,
+                    }
+                )
+            recomputed_previous = recomputed
+    for expected_sequence in range(1, total + 1):
+        if expected_sequence not in seen:
+            missing.append(
+                {"linkIndex": expected_sequence - 1, "sequence": expected_sequence}
+            )
+    head = recomputed_previous
+    head_mismatches: list[dict[str, Any]] = []
+    if head != expected_head:
+        head_mismatches.append({"expected": expected_head, "observed": head})
+    count_mismatches: list[dict[str, Any]] = []
+    if total != expected_count:
+        count_mismatches.append({"expected": expected_count, "observed": total})
+    broken = bool(
+        missing
+        or duplicate
+        or out_of_range
+        or broken_links
+        or digest_mismatches
+        or head_mismatches
+        or count_mismatches
+    )
+    return {
+        "status": "broken" if broken else "ok",
+        "missingSequences": missing,
+        "duplicateSequences": duplicate,
+        "outOfRangeSequences": out_of_range,
+        "brokenLinks": broken_links,
+        "digestMismatches": digest_mismatches,
+        "headMismatches": head_mismatches,
+        "countMismatches": count_mismatches,
+    }
 
 
 def _replication_snapshot_input(
@@ -3307,6 +3520,75 @@ class StateStore:
         next_cursor = after + len(entries)
         return entries, next_cursor, next_cursor < total, head
 
+    def get_audit_log_verify(
+        self, after: int, limit: int, expected_head: str, expected_count: int
+    ) -> dict[str, Any]:
+        """Return one chain page plus an independent whole-chain verification.
+
+        This is the read-only integrity-verification companion to
+        :meth:`get_audit_log_chain`. The ``entries`` page, ``nextCursor``,
+        ``hasMore``, and the chain-tail ``head`` are produced exactly as for
+        the plain chain query — same paging, same link shape, same genesis —
+        and the only addition is ``verification``, the independent
+        conclusion produced by :func:`_audit_log_verification_locked`,
+        passed the external ``expected_head``/``expected_count``.
+
+        Paging trims only the returned ``entries`` page: the ``head``, the
+        full length used for the count comparison, and the ``verification``
+        conclusion always cover the complete log. The page slice, cursors,
+        head, full materialized links, and verification are all computed
+        from one snapshot under the commit lock, so a concurrent commit is
+        observed only as the whole old or the whole new history — the page,
+        the expectations comparison, and the conclusion can never disagree
+        across commits. The scan strictly re-walks the log and recomputes
+        every link rather than trusting the materialized page; it mutates
+        neither memory nor the data file and creates no temporary file.
+
+        Returns a report with exactly five fields: ``entries``,
+        ``nextCursor``, ``hasMore``, ``head`` (identical in meaning to
+        :meth:`get_audit_log_chain`), and ``verification`` (whose ``status``
+        is ``"ok"`` exactly when the internal chain is intact and both
+        external expectations match, otherwise ``"broken"``). An ``after``
+        equal to the chain length is a valid stable empty page whose
+        verification still covers the complete log. Raises ValueError when
+        ``after`` is past the chain length of the snapshot. With
+        ``--data-file`` the log is rebuilt identically during recovery, so
+        the same history yields the same page, head, and verification
+        before and after a restart.
+        """
+        with self._lock:
+            total = len(self._accepted)
+            if after > total:
+                raise ValueError("after is past the end of the audit chain")
+            page_end = min(after + limit, total)
+            previous = _AUDIT_CHAIN_GENESIS
+            all_entries: list[dict[str, Any]] = []
+            page: list[dict[str, Any]] = []
+            for index, (replica_id, operation) in enumerate(self._accepted):
+                sequence = index + 1
+                digest = _audit_chain_link(previous, sequence, replica_id, operation)
+                link = {
+                    "sequence": sequence,
+                    "prevDigest": previous,
+                    "digest": digest,
+                }
+                all_entries.append(link)
+                if after <= index < page_end:
+                    page.append(dict(link))
+                previous = digest
+            head = previous
+            verification = _audit_log_verification_locked(
+                self._accepted, all_entries, expected_head, expected_count
+            )
+        next_cursor = after + len(page)
+        return {
+            "entries": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "head": head,
+            "verification": verification,
+        }
+
     def import_operations(
         self, records: list[tuple[str, dict[str, Any]]]
     ) -> tuple[HTTPStatus, int, int]:
@@ -5060,6 +5342,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_audit_chain_get()
             return
         if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "audit"
+            and segments[2] == "log"
+            and segments[3] == "verify"
+        ):
+            self._handle_audit_log_verify_get()
+            return
+        if (
             len(segments) == 5
             and segments[0] == "v1"
             and segments[1] == "audit"
@@ -5487,6 +5778,35 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "head": head,
             },
         )
+
+    def _handle_audit_log_verify_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before any
+        # query check), so a malformed query is rejected here without any
+        # state being read or changed. Besides the chain query's
+        # after/limit paging, the request requires two external
+        # expectations, ``head`` (64 lowercase hex chars) and ``count`` (a
+        # non-negative ASCII decimal integer); any missing, repeated,
+        # unknown, blank, or malformed value is rejected. The response
+        # follows the chain query's compact-single-line contract exactly,
+        # adding only the ``verification`` conclusion.
+        params = parse_audit_log_verify_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit, expected_head, expected_count = params
+        try:
+            payload = self._store.get_audit_log_verify(
+                after, limit, expected_head, expected_count
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(HTTPStatus.OK, payload)
 
     def _handle_audit_digest_get(self, key: str) -> None:
         if not parse_metrics_query(urlsplit(self.path).query):

@@ -575,6 +575,44 @@ Paging follows the sync-export rules: `after` is the number of links already ski
 
 The page slice, `nextCursor`, `hasMore`, and `head` are computed from a single snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the four values always agree even while commits are in flight: a read can never observe half an import batch or a partially applied repair. The request is strictly read-only — it changes no metrics, candidates, audit streams, checkpoints, or logs, modifies neither memory nor the data file, and creates no temporary file. With `--data-file`, the log is rebuilt identically during recovery, so the same history yields the same record order, chain digests, cursors, and head before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
 
+### Global audit-chain integrity verification
+
+`GET /v1/audit/log/verify?after=N&limit=N&head=H&count=N` is the read-only integrity-verification companion to the global audit-chain query. It is a separate entry point that does not change the chain query in any way; it uses the same read permission, the same accepted-operation log, and the same `after`/`limit` paging. The chain links are returned in global commit order and cover exactly what the chain query covers — ordinary writes, stale writes whose clock was already dominated, accepted conflict repairs, and sync-imported records — while identical replays (`200`), rejected requests (`409`/`400`), uncommitted requests, failed batches, and records whose durable commit failed never enter the log and so never enter verification.
+
+Besides the chain query's paging, the request carries two **required external expectations**:
+
+- `head`: exactly 64 lowercase hexadecimal characters — the chain-tail digest the caller expects (the `head` previously returned by the chain query). Uppercase, non-hex, blank, or wrong-length values are rejected.
+- `count`: a non-negative ASCII decimal integer — the total chain length the caller expects (the full log length, not the page length). Signs, decimals, whitespace, and non-ASCII numerals are rejected.
+
+`after` and `limit` keep the chain query's defaults (`0` and `100`, with `limit` between `1` and `100`). A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly five fields — the chain query's four fields plus `verification`:
+
+```json
+{"entries":[{"sequence":1,"prevDigest":"<64 zeros>","digest":"<64 lowercase hex chars>"}],"nextCursor":1,"hasMore":false,"head":"<64 lowercase hex chars>","verification":{"status":"ok","missingSequences":[],"duplicateSequences":[],"outOfRangeSequences":[],"brokenLinks":[],"digestMismatches":[],"headMismatches":[],"countMismatches":[]}}
+```
+
+The `entries` page, `nextCursor`, `hasMore`, and `head` are produced exactly as for the chain query. The `verification` object is an independent scan of the **complete** log — it never pages and never trusts a materialized link, recomputing every link itself — and always covers the whole history even when the page is empty or partial. Its checks are:
+
+- **Sequence continuity** — the claimed links form the continuous 1-based range `1..N` with no missing, duplicate, or out-of-range sequence.
+- **Predecessor closure** — the first link closes against the 64-`0` genesis and every later link closes against the previous link's digest.
+- **Digest recomputation** — each link digest is recomputed from the record's canonical bytes (the per-key audit digest record encoding) and the predecessor digest.
+- **Chain-tail agreement** — the recomputed last-link digest (the `head`, 64 zeros for an empty log) must equal the external `head`, and the full length must equal the external `count`.
+
+Each anomaly list is independent and every entry keeps the chain-link position (the 0-based `linkIndex`), the link's 1-based `sequence`, and the observed value:
+
+- `missingSequences`: `{"linkIndex":I,"sequence":S}` — a position in `1..N` no link claims.
+- `duplicateSequences`: `{"linkIndex":I,"sequence":S}` — a sequence an earlier link already claims (the later occurrence only).
+- `outOfRangeSequences`: `{"linkIndex":I,"sequence":S}` — a sequence that is not an integer in `1..N`.
+- `brokenLinks`: `{"linkIndex":I,"sequence":S,"expected":D,"observed":D}` — a predecessor-closure failure: the claimed `prevDigest` is not the predecessor link's recomputed digest (the genesis for the first link); the recomputed predecessor is first and the claimed one second.
+- `digestMismatches`: `{"linkIndex":I,"sequence":S,"expected":D,"observed":D}` — a digest-recomputation failure: the claimed `digest` is not the value independently recomputed from the record's canonical bytes and the running predecessor; the recomputed digest is first and the claimed one second.
+- `headMismatches`: at most one `{"expected":H,"observed":H}` — the external `head` first, the recomputed chain tail second.
+- `countMismatches`: at most one `{"expected":C,"observed":N}` — the external `count` first, the actual full length second.
+
+`status` is `"ok"` exactly when the internal chain is intact (the first five lists empty) **and** both external expectations match; otherwise it is `"broken"`. An empty log is intact with a 64-zero head and verifies `"ok"` for `head` equal to 64 zeros and `count` `0`.
+
+Paging trims only the `entries` page: the `head`, the count comparison, and the whole `verification` conclusion always cover the complete history on every page, including a stable empty page returned when `after` equals the chain length. A missing, repeated, or unknown parameter, a blank value, a malformed `head`/`count`/`after`/`limit`, a `limit` outside `1-100`, or an `after` past the chain length returns HTTP 400 with `{"error":"invalid_request"}`. A missing or extra path segment (for example `/v1/audit/log`, `/v1/audit/log/verify/extra`, or a trailing slash) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query check.
+
+The page, the expectation comparison, and the verification conclusion are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so they always describe a single commit even while commits are in flight. The request is strictly read-only — it changes no candidates, operation logs, checkpoints, receipts, transactions, policy audits, metrics, or data files, and creates no temporary file. With `--data-file`, the log is rebuilt identically during recovery, so the same recovery history yields the same page, head, count comparison, and verification before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 with a `Bearer` challenge; in scope-policy mode an authenticated token lacking the read scope is HTTP 403 without a challenge; and `/health` stays anonymous.
+
 ### Per-operation archive query
 
 `GET /v1/replicas/{replicaId}/operations/{operationId}` locates one **first-accepted operation** by its `(replicaId, operationId)` identity. Both path segments are percent-decoded like every other route and must be non-empty after decoding.
