@@ -663,6 +663,41 @@ def parse_scope_policy_audit_verify_query(query: str) -> tuple[int, int] | None:
     return parse_peer_pickup_query(query)
 
 
+def parse_audit_log_verify_query(query: str) -> tuple[int, int, str, int] | None:
+    """Validate the audit-chain verification query string.
+
+    All four parameters are required, each exactly once: ``after`` and
+    ``limit`` page the exported chain links exactly as on the chain query
+    (``after`` is a 0-based resume cursor, ``limit`` between 1 and 100),
+    ``head`` is the expected chain head (exactly 64 lowercase hexadecimal
+    characters), and ``count`` the expected total chain length (a
+    non-negative ASCII decimal integer). A missing or repeated name, a
+    blank, signed, whitespace-bearing, decimal-point, or
+    non-ASCII-decimal value, a malformed ``head``, and any unknown
+    parameter are rejected. The bound on ``after`` against the committed
+    chain length is checked by the store against the committed snapshot
+    (``after`` equal to the chain length is a valid stable empty page).
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if set(parsed) != {"after", "limit", "head", "count"}:
+        return None
+    after_value = _non_negative_int(parsed["after"][0])
+    if after_value is None:
+        return None
+    limit_value = _non_negative_int(parsed["limit"][0])
+    if limit_value is None or not (1 <= limit_value <= SYNC_BATCH_MAX):
+        return None
+    head_value = parsed["head"][0]
+    if not _is_sha256_hex64(head_value):
+        return None
+    count_value = _non_negative_int(parsed["count"][0])
+    if count_value is None:
+        return None
+    return after_value, limit_value, head_value, count_value
+
+
 CAUSAL_COMPARE_IDENTITY_PARAMS = (
     "leftReplicaId",
     "leftOperationId",
@@ -1096,6 +1131,175 @@ def _audit_chain_link(
         + _audit_record_bytes(replica_id, operation)
     )
     return hashlib.sha256(hash_input).hexdigest()
+
+
+def _audit_chain_verification_locked(
+    links: list[dict[str, Any]],
+    expected_head: str,
+    expected_count: int,
+) -> dict[str, Any]:
+    """Verify the complete global audit chain in one pass.
+
+    ``links`` is the complete chain in global commit order (a snapshot
+    taken under the commit lock): one dict per link carrying ``sequence``,
+    ``prevDigest``, ``digest``, and the link's record (``replicaId`` and
+    ``operation``). The conclusion is always computed over the complete
+    chain, never the current page::
+
+        {"status": "ok" | "broken",
+         "missingSequences": [...], "duplicateSequences": [...],
+         "outOfRangeSequences": [...], "brokenLinks": [...],
+         "digestMismatches": [...], "expectationMismatches": [...]}
+
+    Every link anomaly is marked with the link's 0-based ``linkIndex`` in
+    the complete chain and its claimed 1-based ``sequence``:
+
+    - ``missingSequences``: a position ``S`` in ``1..len(links)`` that no
+      link claims. The marker points at the index where that sequence is
+      missing: ``{"linkIndex": S - 1, "sequence": S}``.
+    - ``duplicateSequences``: a link whose claimed sequence was already
+      claimed by an earlier link — ``{"linkIndex": I, "sequence": S}``
+      for the repeated occurrence only.
+    - ``outOfRangeSequences``: a link whose ``sequence`` is not an
+      integer in ``1..len(links)`` (a non-integer, a boolean, zero, a
+      negative value, or a value past the chain length) —
+      ``{"linkIndex": I, "sequence": S}``.
+    - ``brokenLinks``: a link whose ``prevDigest`` is not exactly the
+      previous link's digest (64 ``"0"`` characters for the first link),
+      so the chain no longer closes on its predecessor —
+      ``{"linkIndex": I, "sequence": S, "expected": P, "observed": Q}``.
+    - ``digestMismatches``: a link whose ``digest`` is not the SHA-256
+      recomputed by :func:`_audit_chain_link` from the link's own
+      ``prevDigest``, ``sequence``, and record bytes —
+      ``{"linkIndex": I, "sequence": S, "expected": D, "observed": E}``;
+      ``expected`` is null when the link carries no serializable record
+      to recompute from.
+    - ``expectationMismatches``: an externally supplied expectation that
+      does not match the complete chain —
+      ``{"expectation": "head", "expected": H, "observed": A}`` when the
+      expected head differs from the digest of the chain's last link (64
+      ``"0"`` characters for an empty chain), and
+      ``{"expectation": "count", "expected": C, "observed": N}`` when the
+      expected count differs from the complete chain length.
+
+    ``status`` is ``"ok"`` exactly when all six lists are empty: the
+    sequences form the continuous range ``1..N``, every link closes on
+    its predecessor, every digest recomputes, and both external
+    expectations match the complete chain. An empty chain is complete and
+    intact — ``"ok"`` exactly when the expectations name the genesis head
+    and a zero count. The live chain is derived from the committed log,
+    so the internal lists are empty by construction; the scan exists to
+    detect a damaged chain (and paging never influences it — the page,
+    the head, and the conclusion are all derived from the same complete
+    snapshot).
+    """
+    missing: list[dict[str, Any]] = []
+    duplicate: list[dict[str, Any]] = []
+    out_of_range: list[dict[str, Any]] = []
+    broken_links: list[dict[str, Any]] = []
+    digest_mismatches: list[dict[str, Any]] = []
+    expectation_mismatches: list[dict[str, Any]] = []
+    count = len(links)
+    # First index at which each in-range claimed sequence was seen.
+    seen: set[int] = set()
+    previous = _AUDIT_CHAIN_GENESIS
+    for link_index, link in enumerate(links):
+        raw_sequence = link.get("sequence") if isinstance(link, dict) else None
+        valid_sequence = (
+            isinstance(raw_sequence, int)
+            and not isinstance(raw_sequence, bool)
+        )
+        if not valid_sequence or raw_sequence < 1 or raw_sequence > count:
+            out_of_range.append(
+                {"linkIndex": link_index, "sequence": raw_sequence}
+            )
+        elif raw_sequence in seen:
+            # Only the later occurrence is a duplicate; the first keeps
+            # its claim on the sequence position.
+            duplicate.append(
+                {"linkIndex": link_index, "sequence": raw_sequence}
+            )
+        else:
+            seen.add(raw_sequence)
+        observed_prev = link.get("prevDigest") if isinstance(link, dict) else None
+        if observed_prev != previous:
+            broken_links.append(
+                {
+                    "linkIndex": link_index,
+                    "sequence": raw_sequence,
+                    "expected": previous,
+                    "observed": observed_prev,
+                }
+            )
+        # Recompute the digest from the link's own claimed prevDigest,
+        # sequence, and record bytes; a link without a serializable
+        # record cannot be recomputed, so its expected digest is null.
+        recomputed: str | None = None
+        if (
+            isinstance(link, dict)
+            and valid_sequence
+            and isinstance(observed_prev, str)
+            and isinstance(link.get("replicaId"), str)
+            and isinstance(link.get("operation"), dict)
+        ):
+            try:
+                recomputed = _audit_chain_link(
+                    observed_prev,
+                    raw_sequence,
+                    link["replicaId"],
+                    link["operation"],
+                )
+            except (KeyError, TypeError, AttributeError):
+                recomputed = None
+        observed_digest = link.get("digest") if isinstance(link, dict) else None
+        if recomputed is None or observed_digest != recomputed:
+            digest_mismatches.append(
+                {
+                    "linkIndex": link_index,
+                    "sequence": raw_sequence,
+                    "expected": recomputed,
+                    "observed": observed_digest,
+                }
+            )
+        previous = observed_digest
+    for expected_sequence in range(1, count + 1):
+        if expected_sequence not in seen:
+            missing.append(
+                {
+                    "linkIndex": expected_sequence - 1,
+                    "sequence": expected_sequence,
+                }
+            )
+    head = previous if count else _AUDIT_CHAIN_GENESIS
+    if expected_head != head:
+        expectation_mismatches.append(
+            {"expectation": "head", "expected": expected_head, "observed": head}
+        )
+    if expected_count != count:
+        expectation_mismatches.append(
+            {
+                "expectation": "count",
+                "expected": expected_count,
+                "observed": count,
+            }
+        )
+    broken = bool(
+        missing
+        or duplicate
+        or out_of_range
+        or broken_links
+        or digest_mismatches
+        or expectation_mismatches
+    )
+    return {
+        "status": "broken" if broken else "ok",
+        "missingSequences": missing,
+        "duplicateSequences": duplicate,
+        "outOfRangeSequences": out_of_range,
+        "brokenLinks": broken_links,
+        "digestMismatches": digest_mismatches,
+        "expectationMismatches": expectation_mismatches,
+    }
 
 
 def _replication_snapshot_input(
@@ -3307,6 +3511,83 @@ class StateStore:
         next_cursor = after + len(entries)
         return entries, next_cursor, next_cursor < total, head
 
+    def get_audit_log_chain_verify(
+        self, after: int, limit: int, expected_head: str, expected_count: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one audit-chain page plus an independent verification.
+
+        This is the integrity-verification companion to
+        :meth:`get_audit_log_chain`. The link page, the resume cursor,
+        the remaining-link flag, and the chain ``head`` are produced
+        exactly as for the plain chain query; the additions are
+        ``chainLength`` (the total number of links in the complete chain)
+        and ``verification``, the independent integrity conclusion
+        produced by :func:`_audit_chain_verification_locked` over the
+        complete chain, checked against the externally supplied
+        ``expected_head`` and ``expected_count``.
+
+        Paging trims only the exported ``entries`` page: the
+        ``verification`` conclusion, the ``head``, and the
+        ``chainLength`` always cover the complete history, an empty log
+        reporting the genesis head and verifying against a zero count.
+        The page slice, cursors, head, length, and conclusion are
+        computed from one snapshot under the commit lock, so a concurrent
+        commit is observed only as the whole old or the whole new chain;
+        the query is strictly read-only — it mutates neither memory nor
+        the data file and creates no temporary file.
+
+        Returns ``(200, report)`` with exactly six fields: ``entries``,
+        ``nextCursor``, ``hasMore``, ``head`` (identical in meaning to
+        :meth:`get_audit_log_chain`), ``chainLength``, and
+        ``verification``. An ``after`` equal to the chain length is a
+        valid stable empty page whose verification still covers the
+        complete chain. Raises ValueError when ``after`` is past the
+        chain length of the snapshot. With ``--data-file`` the log is
+        rebuilt identically during recovery, so the same history yields
+        the same page, head, length, and verification conclusion before
+        and after a restart.
+        """
+        with self._lock:
+            total = len(self._accepted)
+            if after > total:
+                raise ValueError("after is past the end of the audit chain")
+            links: list[dict[str, Any]] = []
+            previous = _AUDIT_CHAIN_GENESIS
+            for index, (replica_id, operation) in enumerate(self._accepted):
+                sequence = index + 1
+                digest = _audit_chain_link(previous, sequence, replica_id, operation)
+                links.append(
+                    {
+                        "sequence": sequence,
+                        "prevDigest": previous,
+                        "digest": digest,
+                        "replicaId": replica_id,
+                        "operation": operation,
+                    }
+                )
+                previous = digest
+            head = previous
+            verification = _audit_chain_verification_locked(
+                links, expected_head, expected_count
+            )
+            entries = [
+                {
+                    "sequence": link["sequence"],
+                    "prevDigest": link["prevDigest"],
+                    "digest": link["digest"],
+                }
+                for link in links[after : after + limit]
+            ]
+        next_cursor = after + len(entries)
+        return HTTPStatus.OK, {
+            "entries": entries,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "head": head,
+            "chainLength": total,
+            "verification": verification,
+        }
+
     def import_operations(
         self, records: list[tuple[str, dict[str, Any]]]
     ) -> tuple[HTTPStatus, int, int]:
@@ -5060,6 +5341,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_audit_chain_get()
             return
         if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "audit"
+            and segments[2] == "log"
+            and segments[3] == "verify"
+        ):
+            self._handle_audit_log_verify_get()
+            return
+        if (
             len(segments) == 5
             and segments[0] == "v1"
             and segments[1] == "audit"
@@ -5487,6 +5777,31 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "head": head,
             },
         )
+
+    def _handle_audit_log_verify_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before any
+        # query check), so a malformed query is rejected here without any
+        # state being read or changed. The response follows the
+        # compact-single-line contract: canonical JSON, one trailing
+        # newline, counts only as JSON integers.
+        params = parse_audit_log_verify_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit, head, count = params
+        try:
+            status, payload = self._store.get_audit_log_chain_verify(
+                after, limit, head, count
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
 
     def _handle_audit_digest_get(self, key: str) -> None:
         if not parse_metrics_query(urlsplit(self.path).query):
