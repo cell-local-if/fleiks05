@@ -18,6 +18,9 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 DATA_FORMAT_VERSION = 1
 
+#: Scopes accepted in a ``--auth-policy-file`` policy document.
+AUTH_SCOPES = ("read", "write", "admin")
+
 
 def health_payload() -> dict[str, str]:
     return {"service": "semantic-state-engine", "status": "ok"}
@@ -1297,6 +1300,91 @@ def load_auth_token(path: str) -> str:
             "printable token without whitespace or newlines"
         )
     return raw.decode("ascii")
+
+
+class AuthPolicyError(Exception):
+    """Raised when an auth scope-policy file cannot be used.
+
+    Always a startup failure: the service refuses to start before it begins
+    listening, exactly like a rejected token or data file. The file's tokens
+    and scopes are never included in the error message.
+    """
+
+
+def _valid_auth_token_key(value: str) -> bool:
+    """A policy key is one non-empty ASCII printable token without whitespace."""
+    return bool(value) and all(" " < ch < "\x7f" for ch in value)
+
+
+def load_auth_policy(path: str) -> dict[str, frozenset[str]]:
+    """Read and strictly validate the bearer-token scope-policy file.
+
+    The target must be a readable regular UTF-8 file containing exactly one
+    complete JSON object whose keys are non-empty ASCII printable tokens
+    without whitespace (bytes 0x21-0x7E) and whose values are non-empty
+    arrays of the distinct scope strings ``read``, ``write``, and
+    ``admin``. A missing, unreadable, or non-regular target, an incomplete
+    or invalid JSON document, a non-object root, an illegal token key, a
+    null/empty/duplicated/unknown scope, or any other shape violation
+    raises AuthPolicyError (startup failure); the error never echoes the
+    file's tokens or scopes.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except OSError as exc:
+        raise AuthPolicyError(f"cannot access auth policy file {path!r}: {exc}") from exc
+    if not stat.S_ISREG(mode):
+        raise AuthPolicyError(f"auth policy path is not a regular file: {path!r}")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise AuthPolicyError(f"cannot read auth policy file {path!r}: {exc}") from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AuthPolicyError("auth policy file must be UTF-8 JSON") from exc
+    try:
+        # A complete document is required: trailing content after the value
+        # (and a truncated document) is rejected by the custom decoder.
+        def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+            seen: set[Any] = set()
+            for key, _ in pairs:
+                if key in seen:
+                    raise ValueError("duplicate token key")
+                seen.add(key)
+            return dict(pairs)
+
+        document, end = json.JSONDecoder(
+            object_pairs_hook=reject_duplicate_keys
+        ).raw_decode(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise AuthPolicyError("auth policy file must be one complete JSON object") from exc
+    if text[end:].strip(" \t\r\n"):
+        raise AuthPolicyError("auth policy file must be one complete JSON object")
+    if not isinstance(document, dict):
+        raise AuthPolicyError("auth policy document must be a JSON object")
+    allowed = set(AUTH_SCOPES)
+    policy: dict[str, frozenset[str]] = {}
+    for token, scopes in document.items():
+        if not isinstance(token, str) or not _valid_auth_token_key(token):
+            raise AuthPolicyError(
+                "auth policy keys must be non-empty ASCII printable tokens "
+                "without whitespace"
+            )
+        if (
+            not isinstance(scopes, list)
+            or not scopes
+            or any(not isinstance(scope, str) for scope in scopes)
+            or len(set(scopes)) != len(scopes)
+            or not set(scopes) <= allowed
+        ):
+            raise AuthPolicyError(
+                "each auth policy value must be a non-empty array of the "
+                "distinct scopes read, write, and admin"
+            )
+        policy[token] = frozenset(scopes)
+    return policy
 
 
 def _validate_stored_operation(entry: Any) -> tuple[str, dict[str, Any]]:
@@ -4067,16 +4155,28 @@ class SemanticStateServer(ThreadingHTTPServer):
         data_file: str | None = None,
         store: StateStore | None = None,
         auth_token: str | None = None,
+        auth_policy: dict[str, frozenset[str]] | None = None,
     ) -> None:
         # Build (and thus preflight/recover) the store before binding and
         # listening, so a rejected data file fails startup before any port is
         # open rather than surfacing on the first accepted write.
         resolved_store = store if store is not None else StateStore(data_file=data_file)
+        if auth_token is not None and auth_policy is not None:
+            # The CLI makes the two options mutually exclusive; keep the
+            # invariant for callers that construct the server directly.
+            raise ValueError(
+                "auth_token and auth_policy are mutually exclusive "
+                "authentication configurations"
+            )
         super().__init__(server_address, handler_class or RequestHandler)
         self.store = resolved_store
         # The bearer token clients must present, or None when authentication
         # is disabled. It is never written to the data file or any log.
         self.auth_token = auth_token
+        # The optional token -> scopes policy. Exactly one of auth_token and
+        # auth_policy is configured (the CLI rejects both options); with the
+        # policy each request additionally needs the scope its method needs.
+        self.auth_policy = auth_policy
 
 
 _FALLBACK_STORE = StateStore()
@@ -4125,26 +4225,59 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _require_auth(self) -> bool:
-        """Enforce bearer-token authentication when it is configured.
+    def _require_auth(self, required_scope: str) -> bool:
+        """Enforce bearer-token authentication and the scope policy.
 
-        Returns True when the request may proceed (authentication disabled,
-        or the request carries exactly one Authorization header whose value
-        is exactly ``Bearer <token>``). Otherwise sends HTTP 401 with
-        ``WWW-Authenticate: Bearer`` and returns False. The comparison uses
-        the standard library's constant-time primitive, the request body is
-        never read here (so the connection is closed because an unread body
-        can no longer be framed), and neither memory nor the data file is
-        touched.
+        Returns True when the request may proceed: authentication disabled;
+        the single-token mode with exactly one ``Authorization`` header
+        whose value is exactly ``Bearer <token>`` (the token grants every
+        route, as before); or the scope-policy mode with a matching token
+        whose scopes include ``required_scope`` (``admin`` covers both
+        ``read`` and ``write``).
+
+        A missing, duplicated, or malformed header and any token mismatch
+        send HTTP 401 with ``WWW-Authenticate: Bearer``. A valid token that
+        lacks the required scope sends HTTP 403 with only an ``error`` field
+        and no challenge header. Either rejection precedes route matching,
+        query validation, the commit lock, state and data-file access, and
+        any POST body read: the body is never read here and the connection
+        is closed because an unread body can no longer be framed. The
+        comparison uses the standard library's constant-time primitive and
+        every configured token is compared regardless of an earlier match.
         """
         token = getattr(self.server, "auth_token", None)
-        if token is None:
+        policy = getattr(self.server, "auth_policy", None)
+        if token is None and policy is None:
             return True
         values = self.headers.get_all("Authorization")
-        if values is not None and len(values) == 1 and hmac.compare_digest(
-            values[0].encode("utf-8"), f"Bearer {token}".encode("utf-8")
-        ):
-            return True
+        header_ok = values is not None and len(values) == 1
+        if token is not None:
+            # Single-token mode: the one token grants every non-health
+            # route exactly as it did before scope policies existed.
+            if header_ok and hmac.compare_digest(
+                values[0].encode("utf-8"), f"Bearer {token}".encode("utf-8")
+            ):
+                return True
+        else:
+            assert policy is not None
+            granted: frozenset[str] | None = None
+            if header_ok:
+                presented = values[0].encode("utf-8")
+                for candidate, scopes in policy.items():
+                    # No early break: every configured token is compared in
+                    # constant time.
+                    if hmac.compare_digest(
+                        presented, f"Bearer {candidate}".encode("utf-8")
+                    ):
+                        granted = scopes
+            if granted is not None:
+                if "admin" in granted or required_scope in granted:
+                    return True
+                # Authenticated but not authorized: the 403 carries only the
+                # error field and deliberately no Bearer challenge.
+                self.close_connection = True
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return False
         self.close_connection = True
         self._json(
             HTTPStatus.UNAUTHORIZED,
@@ -4265,9 +4398,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             # The health probe stays anonymous even when auth is enabled.
             self._json(HTTPStatus.OK, health_payload())
             return
-        # Every other route — known or unknown — authenticates before route
-        # matching, query parsing, or any state access.
-        if not self._require_auth():
+        # Every other route — known or unknown — authenticates (and, under a
+        # scope policy, requires read/admin) before route matching, query
+        # parsing, or any state access.
+        if not self._require_auth("read"):
             return
         segments = self._path_segments()
         if len(segments) == 2 and segments[0] == "v1" and segments[1] == "metrics":
@@ -5114,17 +5248,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication.
-            # Authentication then runs before the body is read, the commit
-            # lock is taken, or any state or data file is touched; an
-            # unauthorized request leaves the body unread and the
-            # connection closed.
+            # Authentication and the write/admin scope then run before the
+            # body is read, the commit lock is taken, or any state or
+            # data-file state is touched; a 401/403 leaves the body unread
+            # and the connection closed.
             if self._validate_declared_length() is None:
                 return
-            if not self._require_auth():
+            if not self._require_auth("write"):
                 return
         else:
-            # Every other route authenticates before anything else.
-            if not self._require_auth():
+            # Every other route authenticates (and requires write/admin)
+            # before anything else.
+            if not self._require_auth("write"):
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
@@ -5190,7 +5325,11 @@ def main(argv: list[str] | None = None) -> None:
             "recover them on startup; without it the service stays purely in memory"
         ),
     )
-    parser.add_argument(
+    # The two authentication options are alternative configurations of one
+    # boundary: supplying both is a usage error, which argparse ends with
+    # exit code 2 before any file is read or port bound.
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument(
         "--auth-token-file",
         default=None,
         help=(
@@ -5199,9 +5338,20 @@ def main(argv: list[str] | None = None) -> None:
             "anonymous except that /health always is"
         ),
     )
+    auth_group.add_argument(
+        "--auth-policy-file",
+        default=None,
+        help=(
+            "optional path to a readable regular UTF-8 JSON file mapping "
+            "bearer tokens to non-empty arrays of distinct scopes chosen "
+            "from read, write, and admin; mutually exclusive with "
+            "--auth-token-file"
+        ),
+    )
     args = parser.parse_args(argv)
 
     auth_token = None
+    auth_policy = None
     if args.auth_token_file is not None:
         # Read and validate the token before binding any port; a rejected
         # file fails startup exactly like a rejected data file, and the
@@ -5211,6 +5361,14 @@ def main(argv: list[str] | None = None) -> None:
         except AuthTokenError as exc:
             print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
+    elif args.auth_policy_file is not None:
+        # The scope policy is likewise validated before any port is bound;
+        # its tokens and scopes are never printed.
+        try:
+            auth_policy = load_auth_policy(args.auth_policy_file)
+        except AuthPolicyError as exc:
+            print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
 
     try:
         store = StateStore(data_file=args.data_file)
@@ -5218,7 +5376,12 @@ def main(argv: list[str] | None = None) -> None:
         print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    server = SemanticStateServer((args.host, args.port), store=store, auth_token=auth_token)
+    server = SemanticStateServer(
+        (args.host, args.port),
+        store=store,
+        auth_token=auth_token,
+        auth_policy=auth_policy,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

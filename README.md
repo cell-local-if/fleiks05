@@ -60,18 +60,43 @@ The `checkpoints` section is optional and holds sender-side replication cursors 
 
 ### Optional bearer-token authentication
 
-The service is anonymous by default: without authentication options every documented behavior above is unchanged. Pass `--auth-token-file PATH` to require a bearer token on every endpoint except the health probe:
+The service is anonymous by default: without authentication options every documented behavior above is unchanged. Authentication is configured in exactly one of two mutually exclusive modes, and the chosen configuration is read and validated **before the service begins listening**. Passing both options together makes startup fail with exit code 2 — no port is bound and neither the token nor the policy is printed.
+
+#### Single-token mode: `--auth-token-file PATH`
+
+Pass `--auth-token-file PATH` to require one bearer token on every endpoint except the health probe:
 
 ```bash
 PYTHONPATH=src python3 -m semantic_state_engine.server --auth-token-file ./var/token
 ```
 
-- The token file is read and validated **before the service begins listening**. It must be a readable regular file whose entire content is exactly one non-empty ASCII printable token — no whitespace, no newlines, nothing before or after it. A missing, unreadable, or non-regular target (for example a directory) and any format violation make startup fail with exit code 2, exactly like a rejected data file: no port is bound and the token is never printed.
-- `GET /health` stays anonymous. Every other route — known or unknown, GET or POST — requires the request to carry **exactly one** `Authorization` header whose value is exactly `Bearer ` (one space) followed by the token. A missing, duplicated, or malformed header and any token mismatch return HTTP 401 with `{"error":"unauthorized"}` and a `WWW-Authenticate: Bearer` response header — before route matching, query parsing, the commit lock, any state read, any data-file access, and any POST body read. The comparison uses the standard library's constant-time primitive.
-- A rejected request changes nothing: it creates no temporary file and leaves memory, logs, checkpoints, audit streams, and the data file exactly as they were; the token is never leaked in responses or logs.
-- The seven POST endpoints keep their Content-Length priority: a missing/malformed declaration still returns 400 and an over-limit declaration still returns 413 **before** authentication is checked. When the declared length is valid but the request is unauthorized, the 401 is sent **without reading the body** and the connection is closed.
+- The token file must be a readable regular file whose entire content is exactly one non-empty ASCII printable token — no whitespace, no newlines, nothing before or after it. A missing, unreadable, or non-regular target (for example a directory) and any format violation make startup fail with exit code 2, exactly like a rejected data file: no port is bound and the token is never printed.
+- The one token grants every non-health route. `GET /health` stays anonymous. Every other route — known or unknown, GET or POST — requires the request to carry **exactly one** `Authorization` header whose value is exactly `Bearer ` (one space) followed by the token. A missing, duplicated, or malformed header and any token mismatch return HTTP 401 with `{"error":"unauthorized"}` and a `WWW-Authenticate: Bearer` response header — before route matching, query parsing, the commit lock, any state read, any data-file access, and any POST body read. The comparison uses the standard library's constant-time primitive.
+- A rejected request changes nothing: it creates no temporary file and leaves memory, logs, checkpoints, audit streams, candidates, and the data file exactly as they were; the token is never leaked in responses or logs.
+- The POST endpoints keep their Content-Length priority: a missing/malformed declaration still returns 400 and an over-limit declaration still returns 413 **before** authentication is checked. When the declared length is valid but the request is unauthorized, the 401 is sent **without reading the body** and the connection is closed.
 - Once a request is authenticated, every existing behavior — success codes, 400/404/409/500, paging, digests, idempotency, concurrency, and recovery — is exactly as documented for the anonymous service.
-- The authentication configuration is never written to the data file: a `--data-file` restart recovers only operations and checkpoints, and the token is supplied again (or not) via the command line on each start.
+
+#### Scope-policy mode: `--auth-policy-file PATH`
+
+Pass `--auth-policy-file PATH` to require a bearer token that carries an explicit scope set:
+
+```bash
+PYTHONPATH=src python3 -m semantic_state_engine.server --auth-policy-file ./var/policy.json
+```
+
+- The policy file must be a readable **regular** UTF-8 file containing exactly one complete JSON **object**: each key is one non-empty ASCII printable token without whitespace (the same character rules as the single-token file), and each value is a **non-empty array of distinct scope strings**. The only scopes are `"read"`, `"write"`, and `"admin"`; a missing or unreadable target, a non-regular target (for example a directory or a named pipe), an incomplete or invalid JSON document, a non-object root, trailing content, a duplicate token key, an illegal token, a null or non-array value, an empty array, a repeated scope, or an unknown scope value all make startup fail with exit code 2 — no port is bound and no token or scope is ever printed. An empty object `{}` is a valid document that simply configures no tokens (so every non-health request is unauthorized).
+- Scopes are method-wide: `"read"` authorizes every `GET`, `"write"` authorizes every `POST`, and `"admin"` authorizes both. A token may carry any non-empty subset, for example `["read","write"]`.
+- `GET /health` stays anonymous. Every other request must carry **exactly one** `Authorization` header whose value is exactly `Bearer ` (one space) followed by a configured token. A missing, duplicated, or malformed header and any token mismatch return HTTP 401 with `{"error":"unauthorized"}` and the `WWW-Authenticate: Bearer` challenge header, exactly as in single-token mode.
+- A request whose token is valid but whose scopes lack the required one returns HTTP 403 with `{"error":"forbidden"}` — the body contains only the `error` field and the response deliberately carries **no** `WWW-Authenticate` header. Every configured token is compared with the standard library's constant-time primitive.
+- The scope decision is made before route matching and query validation: a `GET` without `read`/`admin` is 403 even on an unknown route (never 404) or with an invalid query string (never 400), and a `POST` without `write`/`admin` is 403 without entering any endpoint's 400/404/409 business logic. Such a request never takes the commit lock, never reads the body, and creates no temporary file: memory, logs, checkpoints, audit streams, candidates, and the data file are unchanged.
+- The POST Content-Length contract keeps priority: a missing/malformed declaration returns 400 and an over-limit declaration returns 413 **before** authentication and the scope check; only a request with a valid declared length can reach them. When the length is valid but the token is missing/unknown (401) or under-scoped (403), the response is sent without reading the body and the connection is closed.
+- A request carrying the required scope follows every existing behavior unchanged — success codes, paging, persistence, idempotency, conflicts, the atomic commit, and the restart/recovery semantics.
+- The policy is never written to the data file: a `--data-file` restart recovers only operations, checkpoints, policy bindings, transactions, and receipts, and the scope policy must be supplied again (or omitted) via the command line on each start. Existing data files keep their format and stay compatible; the policy configuration is purely a startup option.
+
+#### Common to both modes
+
+- The eight POST endpoints share the same ordering: Content-Length (400/413) first, then authentication (401), then the scope check (403, policy mode only), then the endpoint's own validation.
+- No authentication configuration is ever written to the data file, and a restart requires it to be supplied again.
 
 ### Writing operations
 
