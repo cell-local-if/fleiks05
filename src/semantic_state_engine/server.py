@@ -582,6 +582,31 @@ def parse_sync_query(query: str) -> tuple[int, int] | None:
     return parse_paging_query(query)
 
 
+def parse_peer_pickup_query(query: str) -> tuple[int, int] | None:
+    """Validate the peer-progress pickup query string.
+
+    Unlike :func:`parse_paging_query`, both ``after`` and ``limit`` are
+    required parameters: a request missing either one (including a bare
+    request with no query string) is rejected, as are repeated names,
+    unknown parameters, blank, negative, or non-ASCII-decimal values,
+    and a ``limit`` outside ``1-100``. The bound on ``after`` against
+    the peer's unconsumed record count is checked by the store against
+    the committed snapshot.
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if set(parsed) != {"after", "limit"}:
+        return None
+    after_value = _non_negative_int(parsed["after"][0])
+    if after_value is None:
+        return None
+    limit_value = _non_negative_int(parsed["limit"][0])
+    if limit_value is None or not (1 <= limit_value <= SYNC_BATCH_MAX):
+        return None
+    return after_value, limit_value
+
+
 CAUSAL_COMPARE_IDENTITY_PARAMS = (
     "leftReplicaId",
     "leftOperationId",
@@ -3083,6 +3108,71 @@ class StateStore:
             return HTTPStatus.NOT_FOUND, {"error": "not_found"}
         return HTTPStatus.OK, {"peerId": peer_id, "cursor": cursor}
 
+    def get_peer_operations(
+        self, peer_id: str, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of a registered peer's unconsumed operations.
+
+        The pickup stream is the shared accepted-operation log starting
+        after the peer's registered checkpoint cursor — the accepted
+        operations the peer has not yet consumed — in global commit
+        order. The peer only selects the progress anchor: every accepted
+        record past the checkpoint is returned whatever its ``replicaId``
+        (each item keeps the committed sync record's own replica
+        identity), exactly like the sync-export tail beginning at the
+        checkpoint. It therefore reads only the shared *accepted* log:
+        stale writes (which add no candidate), sync-imported records,
+        and manual and automatic repairs are ordinary accepted records
+        and appear like any other, while identical replays, rejected
+        (400/409) requests, uncommitted requests, and requests whose
+        durable commit failed never enter the log and so never appear.
+
+        ``after`` is the number of unconsumed records already skipped
+        relative to the checkpoint (a 0-based resume cursor, not an
+        absolute log position) and ``limit`` the page size. The
+        registered cursor, the slice, the returned cursor, and
+        ``has_more`` are all computed against the same snapshot under
+        the commit lock, so pages interleave cleanly with concurrent
+        commits and never observe half an import batch or a checkpoint
+        commit halfway through its durable update. The query never
+        advances or writes the checkpoint and mutates neither memory
+        nor the data file.
+
+        Returns ``(404, {"error": "not_found"})`` when the peer has never
+        registered a checkpoint. Otherwise returns
+        ``(200, {"operations", "nextCursor", "hasMore"})`` where
+        ``operations`` preserves the committed record shape
+        ``{"replicaId", "operation"}`` and ``nextCursor`` is the number
+        of unconsumed records skipped after this page (relative to the
+        checkpoint) — feed it back as the next ``after``. An ``after``
+        equal to the unconsumed record count is a valid empty tail.
+        Raises ValueError when ``after`` is past that count of the
+        snapshot. With ``--data-file`` the checkpoints and the log are
+        rebuilt identically during recovery, so the same recovered state
+        yields the same pages before and after a restart; a recovered
+        cursor past the log length is a corrupt file and makes startup
+        fail rather than reaching here.
+        """
+        with self._lock:
+            start = self._checkpoints.get(peer_id)
+            if start is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            total = len(self._accepted) - start
+            if after > total:
+                raise ValueError("after is past the end of the peer's unconsumed log")
+            page = [
+                {"replicaId": replica_id, "operation": operation}
+                for replica_id, operation in self._accepted[
+                    start + after : start + after + limit
+                ]
+            ]
+        next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "operations": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+        }
+
     def get_state_explanation(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Explain one key's current candidate state from a single snapshot.
 
@@ -3451,6 +3541,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             return False, ""
         return True, unquote(parts[4])
 
+    def _peer_operations_route(self) -> tuple[bool, str]:
+        """Match ``/v1/sync/peers/{peerId}/operations`` on the raw path.
+
+        Returns ``(matched, peer_id)``. As with :meth:`_checkpoint_route`,
+        the empty segment of ``/v1/sync/peers//operations`` is preserved
+        so the shape still matches and yields an empty ``peer_id``; the
+        pickup contract treats an empty peer id exactly like a shape
+        failure (404), so the handler rejects it before any query check.
+        Any other segment count — missing segments, extra segments such
+        as ``.../operations/extra``, or a trailing slash — falls through
+        to the generic 404.
+        """
+        parts = urlsplit(self.path).path.split("/")
+        if len(parts) != 6:
+            return False, ""
+        if parts[1:4] != ["v1", "sync", "peers"] or parts[5] != "operations":
+            return False, ""
+        return True, unquote(parts[4])
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path == "/health":
             # The health probe stays anonymous even when auth is enabled.
@@ -3579,6 +3688,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         if matched:
             self._handle_checkpoint_get(checkpoint_peer)
             return
+        matched, pickup_peer = self._peer_operations_route()
+        if matched:
+            self._handle_peer_operations_get(pickup_peer)
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def _validate_declared_length(self) -> int | None:
@@ -3626,6 +3739,29 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         status, payload = self._store.get_checkpoint(peer_id)
         self._json(status, payload)
+
+    def _handle_peer_operations_get(self, peer_id: str) -> None:
+        # Route-shape matching ran first in do_GET (missing/extra segments
+        # and trailing slashes never reach here); an empty peer id is a
+        # shape failure and stays 404 even when the query is malformed.
+        if peer_id == "":
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        params = parse_peer_pickup_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_peer_operations(peer_id, after, limit)
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
 
     def _handle_checkpoint_post(self, peer_id: str) -> None:
         if peer_id == "":
