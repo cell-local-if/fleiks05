@@ -587,26 +587,25 @@ def parse_audit_log_verify_query(
 ) -> tuple[int, int, str, int] | None:
     """Validate the global audit-chain verification query string.
 
-    Shares the chain query's paging contract — ``after`` defaults to ``0``
-    and ``limit`` to ``100`` and must be between 1 and 100, both non-
-    negative ASCII decimal integers — and adds two **required** external
-    expectations, each appearing at most once: ``head`` (exactly 64
-    lowercase hexadecimal characters, the chain-tail digest the caller
-    expects) and ``count`` (a non-negative ASCII decimal integer, the
-    total chain length the caller expects). A missing, repeated,
-    blank-named, or unknown parameter, a blank or malformed ``head``
-    (uppercase, non-hex, or the wrong length all rejected), a blank,
-    signed, or non-ASCII-decimal ``count``, and the same malformed
-    ``after``/``limit`` values as :func:`parse_paging_query` return None.
-    The bound on ``after`` against the chain length is checked by the
-    store against the committed snapshot.
+    All four parameters are **required**, each appearing exactly once:
+    the paging parameters ``after`` (a non-negative ASCII decimal
+    integer — there is no default) and ``limit`` (between 1 and 100),
+    plus the two external expectations ``head`` (exactly 64 lowercase
+    hexadecimal characters, the chain-tail digest the caller expects)
+    and ``count`` (a non-negative ASCII decimal integer, the total chain
+    length the caller expects). A missing, repeated, blank-named, or
+    unknown parameter, a blank or malformed ``head`` (uppercase,
+    non-hex, or the wrong length all rejected), a blank, signed, or
+    non-ASCII-decimal ``count``, and a blank, signed, non-ASCII-decimal,
+    or out-of-range ``after``/``limit`` return None. The bound on
+    ``after`` against the chain length is checked by the store against
+    the committed snapshot (``after`` equal to the chain length is a
+    valid empty page).
     """
     parsed = parse_qs(query, keep_blank_values=True)
     if any(len(values) != 1 for values in parsed.values()):
         return None
-    if not {"head", "count"} <= set(parsed):
-        return None
-    if not set(parsed) <= {"after", "limit", "head", "count"}:
+    if set(parsed) != {"after", "limit", "head", "count"}:
         return None
     head = parsed["head"][0]
     if not _is_sha256_hex64(head):
@@ -614,18 +613,12 @@ def parse_audit_log_verify_query(
     count = _non_negative_int(parsed["count"][0])
     if count is None:
         return None
-    after = 0
-    limit = SYNC_DEFAULT_LIMIT
-    if "after" in parsed:
-        after_value = _non_negative_int(parsed["after"][0])
-        if after_value is None:
-            return None
-        after = after_value
-    if "limit" in parsed:
-        limit_value = _non_negative_int(parsed["limit"][0])
-        if limit_value is None or not (1 <= limit_value <= SYNC_BATCH_MAX):
-            return None
-        limit = limit_value
+    after = _non_negative_int(parsed["after"][0])
+    if after is None:
+        return None
+    limit = _non_negative_int(parsed["limit"][0])
+    if limit is None or not (1 <= limit <= SYNC_BATCH_MAX):
+        return None
     return after, limit, head, count
 
 
@@ -677,6 +670,59 @@ def parse_peer_receipts_audit_query(query: str) -> tuple[int, int] | None:
     receipt count is checked by the store against the committed snapshot.
     """
     return parse_peer_pickup_query(query)
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _valid_percent_escapes(raw: str) -> bool:
+    """Return True when every ``%`` in ``raw`` starts a two-hex-digit escape.
+
+    Anything else — a trailing ``%``, a single hex digit, or a non-hex
+    escape like ``%GG`` — is an illegal encoding rather than a literal
+    character, so the caller rejects it instead of silently treating the
+    percent sign as data.
+    """
+    index = 0
+    while index < len(raw):
+        if raw[index] == "%":
+            if (
+                index + 2 >= len(raw)
+                or raw[index + 1] not in _HEX_DIGITS
+                or raw[index + 2] not in _HEX_DIGITS
+            ):
+                return False
+            index += 3
+        else:
+            index += 1
+    return True
+
+
+def parse_replication_status_query(query: str) -> str | None:
+    """Validate the replication-status query string, returning the peer id.
+
+    Requires exactly one parameter, ``peerId``, appearing exactly once
+    with a non-empty percent-decoded value — the same percent-decoding
+    and non-empty rules the replication routes apply to their ``peerId``
+    path segment, here applied to the query value. A missing or repeated
+    parameter, an unknown parameter, a blank name or value, and an
+    illegal encoding — a malformed percent escape or an escape sequence
+    that is not valid UTF-8 — return None.
+    """
+    if not _valid_percent_escapes(query):
+        return None
+    try:
+        parsed = parse_qs(query, keep_blank_values=True, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if set(parsed) != {"peerId"}:
+        return None
+    peer_id = parsed["peerId"][0]
+    if peer_id == "":
+        return None
+    return peer_id
 
 
 def parse_scope_policy_audit_query(query: str) -> tuple[int, int] | None:
@@ -4582,6 +4628,63 @@ class StateStore:
             "audit": audit,
         }
 
+    def get_replication_status(
+        self, peer_id: str
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one registered peer's sender-side delivery status.
+
+        The peer's registered checkpoint cursor, the count of accepted
+        records the peer has not yet consumed, the peer's committed
+        receipt count, and the receipt chain-audit conclusion are all
+        read together under the same commit lock used by local writes,
+        sync imports, repairs, checkpoint commits, and acknowledgement
+        commits, so the progress, the counts, and the conclusion always
+        describe a single commit even while commits are in flight. The
+        query is strictly read-only: it never advances or writes the
+        checkpoint, records no receipt, and mutates neither memory nor
+        the data file.
+
+        Returns ``(404, {"error": "not_found"})`` when the peer has never
+        registered a checkpoint. Otherwise returns ``(200, status)``
+        with exactly five fields, in this order:
+
+        - ``peer``: the decoded peer id the request selected.
+        - ``pos``: the peer's registered checkpoint cursor — the number
+          of accepted records the peer has consumed.
+        - ``left``: the number of accepted records past the checkpoint
+          the peer has not yet consumed.
+        - ``acks``: the number of the peer's committed receipts.
+        - ``chain``: the chain-audit conclusion produced by
+          :func:`_receipt_chain_audit_locked` over the peer's whole
+          committed receipt set — the status, the coverage interval, and
+          the gap, overlap, identity-mismatch, and cursor-regression
+          lists. An empty receipt set reports a complete, anomaly-free
+          empty coverage (``{"start": 0, "end": 0}``) with status
+          ``"ok"``.
+
+        With ``--data-file`` the log, the checkpoints, and the receipts
+        are rebuilt identically during recovery, so the same state
+        yields the same status before and after a restart.
+        """
+        with self._lock:
+            cursor = self._checkpoints.get(peer_id)
+            if cursor is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            committed = [
+                (ack_id, receipt)
+                for (receipt_peer, ack_id), receipt in self._acks.items()
+                if receipt_peer == peer_id
+            ]
+            left = len(self._accepted) - cursor
+            chain = _receipt_chain_audit_locked(committed, self._accepted)
+        return HTTPStatus.OK, {
+            "peer": peer_id,
+            "pos": cursor,
+            "left": left,
+            "acks": len(committed),
+            "chain": chain,
+        }
+
     def record_policy_reload(self, digest: str, tokens: int) -> dict[str, Any]:
         """Commit one successful scope-policy hot reload to the audit history.
 
@@ -5304,6 +5407,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_replication_snapshot_get()
             return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "status"
+        ):
+            self._handle_replication_status_get()
+            return
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
@@ -5713,6 +5824,23 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._json_canonical_newline(
             HTTPStatus.OK, self._store.get_replication_snapshot()
         )
+
+    def _handle_replication_status_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before
+        # any query check), so a malformed query is rejected here without
+        # any state being read or changed. The success body fixes the
+        # field order (peer, pos, left, acks, chain) and follows the
+        # compact-single-line contract: one trailing newline, numbers
+        # only as JSON integers.
+        peer_id = parse_replication_status_query(urlsplit(self.path).query)
+        if peer_id is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        status, payload = self._store.get_replication_status(peer_id)
+        self._json_ordered_newline(status, payload)
 
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)
