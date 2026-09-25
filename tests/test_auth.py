@@ -467,7 +467,14 @@ class AuthPersistenceTests(unittest.TestCase):
             document = json.loads(handle.read().decode("utf-8"))
         self.assertLessEqual(
             set(document.keys()),
-            {"version", "operations", "checkpoints", "policies", "transactions"},
+            {
+                "version",
+                "operations",
+                "checkpoints",
+                "policies",
+                "transactions",
+                "acknowledgments",
+            },
         )
         self.assertNotIn(TOKEN, json.dumps(document))
 
