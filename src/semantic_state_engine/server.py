@@ -582,6 +582,26 @@ def parse_sync_query(query: str) -> tuple[int, int] | None:
     return parse_paging_query(query)
 
 
+def parse_state_at_query(query: str) -> int | None:
+    """Validate the history-query query string, returning the cursor.
+
+    Exactly one parameter is accepted: ``cursor``, which is required and
+    must appear exactly once with a non-negative ASCII decimal integer
+    value (signs, decimals, whitespace, blanks, and non-ASCII numerals
+    rejected). A missing, repeated, blank, or malformed ``cursor`` and any
+    unknown parameter return None. The bound against the accepted-log
+    length is checked by the store against the committed snapshot, not
+    here, because the cursor is only meaningful against one.
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if set(parsed) != {"cursor"}:
+        return None
+    values = parsed["cursor"]
+    if len(values) != 1:
+        return None
+    return _non_negative_int(values[0])
+
+
 def parse_audit_log_verify_query(
     query: str,
 ) -> tuple[int, int, str, int] | None:
@@ -5053,6 +5073,68 @@ class StateStore:
             ],
         }
 
+    def get_state_at(self, key: str, cursor: int) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Replay the accepted log up to ``cursor`` and report one key's state.
+
+        ``cursor`` is the number of accepted-log records replayed from the
+        empty state, so 0 is always the empty state and the log length is
+        exactly the current state. The replay covers every first-accepted
+        record in commit order — ordinary writes, stale writes whose clock
+        was already dominated, accepted conflict repairs, and sync-imported
+        records — and nothing else, because identical replays, conflicting
+        or malformed requests, uncommitted requests, and failed durable
+        commits never enter the log. The whole replay runs against one
+        committed snapshot under the commit lock, so a concurrent commit
+        is either fully below or fully above the answered position; the
+        read mutates neither memory, the data file, logs, nor checkpoints
+        and creates no files.
+
+        Returns ``(404, {"error": "not_found"})`` when the key holds no
+        candidate at that position — whether it never appeared or appears
+        only later in the log. Otherwise returns ``(200, report)`` with
+        exactly four fields: ``cursor`` (the replayed position as a JSON
+        integer), ``key``, ``status`` (``"resolved"`` when every candidate
+        at that position agrees on the value, ``"conflict"`` otherwise —
+        the same classification as :meth:`get_state`), and ``candidates``
+        (always an array, even when resolved: every candidate still
+        present at that position in the existing query order, sorted by
+        ``(replicaId, operationId)`` ascending, each carrying exactly
+        ``value``, ``clock``, ``replicaId``, and ``operationId``). The
+        first candidate is therefore the same value and clock the current
+        state query would choose for the same candidate set.
+
+        Raises ValueError when ``cursor`` is past the accepted-log length.
+        With ``--data-file`` the log is recovered identically on restart,
+        so the same cursor answers the same report before and after.
+        """
+        with self._lock:
+            total = len(self._accepted)
+            if cursor > total:
+                raise ValueError("cursor is past the end of the operation log")
+            candidates: list[dict[str, Any]] = []
+            for replica_id, operation in self._accepted[:cursor]:
+                if operation["key"] == key:
+                    candidates = self._next_candidates(candidates, replica_id, operation)
+            ordered = sorted(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
+            present = [
+                {
+                    "value": c["value"],
+                    "clock": dict(c["clock"]),
+                    "replicaId": c["replicaId"],
+                    "operationId": c["operationId"],
+                }
+                for c in ordered
+            ]
+        if not present:
+            return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+        status = "resolved" if all(c["value"] == present[0]["value"] for c in present) else "conflict"
+        return HTTPStatus.OK, {
+            "cursor": cursor,
+            "key": key,
+            "status": status,
+            "candidates": present,
+        }
+
 
 class SemanticStateServer(ThreadingHTTPServer):
     """Threading HTTP server carrying its own StateStore."""
@@ -5423,6 +5505,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             len(segments) == 4
             and segments[0] == "v1"
             and segments[1] == "states"
+            and segments[3] == "at"
+        ):
+            self._handle_state_at_get(segments[2])
+            return
+        if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "states"
             and segments[3] == "why"
         ):
             self._handle_state_why_get(segments[2])
@@ -5740,6 +5830,24 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         self._json(HTTPStatus.OK, self._store.get_metrics())
+
+    def _handle_state_at_get(self, key: str) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before any
+        # query check), so a malformed query is rejected here without any
+        # state being read or changed. The history report follows the
+        # compact-single-line contract: compact UTF-8 JSON, one trailing
+        # newline, numbers only as JSON integers.
+        cursor = parse_state_at_query(urlsplit(self.path).query)
+        if cursor is None:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status, payload = self._store.get_state_at(key, cursor)
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json_newline(status, payload)
 
     def _handle_state_why_get(self, key: str) -> None:
         # The route-shape check in do_GET already ran, so a query parameter
