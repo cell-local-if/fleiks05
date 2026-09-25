@@ -860,6 +860,27 @@ def parse_metrics_query(query: str) -> bool:
     return not parse_qs(query, keep_blank_values=True)
 
 
+def parse_state_at_query(query: str) -> int | None:
+    """Validate the historical-state query string's required ``cursor``.
+
+    The historical state endpoint takes exactly one parameter: ``cursor``,
+    which must appear exactly once and hold a non-negative ASCII decimal
+    integer — the number of accepted operations replayed from the empty
+    state, counted from zero. A missing parameter (including a bare request
+    with no query string), a repeated or unknown name, a blank or empty
+    value, a sign, whitespace, a decimal point, or non-ASCII numerals are
+    all rejected. The bound against the current log length is checked by
+    the store against the committed snapshot (a cursor past the log length
+    is rejected there).
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if set(parsed) != {"cursor"}:
+        return None
+    return _non_negative_int(parsed["cursor"][0])
+
+
 def parse_checkpoint_payload(raw: bytes | str | dict[str, Any]) -> int:
     """Parse and validate a checkpoint body, returning the cursor.
 
@@ -5025,6 +5046,84 @@ class StateStore:
             "hasMore": next_cursor < total,
         }
 
+    def get_state_at(self, key: str, cursor: int) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one key's state as it stood after ``cursor`` accepts.
+
+        The historical view is produced by replaying the first ``cursor``
+        records of the accepted-operation log in commit order starting from
+        the empty state, using exactly the same candidate evolution as live
+        commits (:meth:`_next_candidates`). Because the log contains only
+        first-accepted operations, the replay naturally includes ordinary
+        writes, stale writes that added no candidate, sync imports, and
+        conflict repairs, while identical replays (``200``), rejected
+        requests (``400``/``409``), uncommitted writes, and records whose
+        durable commit failed never enter it.
+
+        ``cursor`` is the number of accepted operations replayed and is
+        counted from zero: a cursor of zero replays nothing, so no business
+        key can have a candidate and every key is answered ``404``. A
+        cursor equal to the current log length replays the tail, which must
+        agree with :meth:`get_state`. A cursor past the log length raises
+        ValueError for the caller to reject as an invalid request.
+
+        Returns ``(404, {"error": "not_found"})`` when the key holds no
+        candidate at that position — whether it has not appeared yet, even
+        if it appears later, or an earlier candidate was already dominated
+        away. Otherwise returns ``(200, state)`` with exactly four fields,
+        in this order: ``cursor`` (the replayed record count), ``key`` (the
+        requested key), ``status`` (``"resolved"`` when every surviving
+        candidate agrees on the value, ``"conflict"`` otherwise — the same
+        classification as :meth:`get_state`), and ``candidates`` (always an
+        array; the candidates still present at that position in the current
+        identity order, sorted by ``(replicaId, operationId)`` ascending,
+        each carrying exactly ``value``, ``clock``, ``replicaId``, and
+        ``operationId``). A resolved state still lists every candidate: the
+        historical response never collapses into the current resolved
+        response's single ``value``/``clock`` shape. The first candidate is
+        therefore the existing selection-rule winner — the same ``value``
+        and ``clock`` :meth:`get_state` reports at the tail.
+
+        The replay reads one snapshot of the log under the same commit lock
+        used by writes, imports, repairs, and checkpoint commits, so the
+        cursor, candidates, and status always describe one commit. The
+        replay is purely functional: it mutates neither memory nor the data
+        file and creates no file. With ``--data-file`` the log is rebuilt
+        identically during recovery, so the same cursor yields the same
+        state before and after a restart.
+        """
+        with self._lock:
+            log_length = len(self._accepted)
+            if cursor > log_length:
+                raise ValueError("cursor is past the end of the accepted log")
+            replay: dict[str, list[dict[str, Any]]] = {}
+            for replica_id, operation in self._accepted[:cursor]:
+                replayed_key = operation["key"]
+                replay[replayed_key] = self._next_candidates(
+                    replay.get(replayed_key, []), replica_id, operation
+                )
+            ordered = sorted(
+                replay.get(key, []),
+                key=lambda c: (c["replicaId"], c["operationId"]),
+            )
+            candidates = [
+                {
+                    "value": c["value"],
+                    "clock": dict(c["clock"]),
+                    "replicaId": c["replicaId"],
+                    "operationId": c["operationId"],
+                }
+                for c in ordered
+            ]
+        if not candidates:
+            return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+        agreed = all(c["value"] == candidates[0]["value"] for c in candidates)
+        return HTTPStatus.OK, {
+            "cursor": cursor,
+            "key": key,
+            "status": "resolved" if agreed else "conflict",
+            "candidates": candidates,
+        }
+
     def get_state(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
         with self._lock:
             candidates = list(self._candidates.get(key, []))
@@ -5431,6 +5530,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             len(segments) == 4
             and segments[0] == "v1"
             and segments[1] == "states"
+            and segments[3] == "at"
+        ):
+            self._handle_state_at_get(segments[2])
+            return
+        if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "states"
             and segments[3] == "impact"
         ):
             self._handle_state_impact_get(segments[2])
@@ -5751,6 +5858,29 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         status, payload = self._store.get_state_explanation(key)
         self._json_newline(status, payload)
+
+    def _handle_state_at_get(self, key: str) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there), so a
+        # malformed query is rejected here without any state being read or
+        # changed. The success body fixes the field order (cursor, key,
+        # status, candidates) and follows the compact-single-line contract:
+        # one trailing newline, the cursor and clock ticks only as JSON
+        # integers.
+        cursor = parse_state_at_query(urlsplit(self.path).query)
+        if cursor is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        try:
+            status, payload = self._store.get_state_at(key, cursor)
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_ordered_newline(status, payload)
 
     def _json_canonical_newline(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         """Respond with canonical compact JSON terminated by one newline.

@@ -188,6 +188,26 @@ Candidates are stored per key with vector-clock semantics (missing components co
 
 Keys are isolated from each other, and reads reflect the latest writes.
 
+### Reading historical state
+
+`GET /v1/states/{key}/at?cursor=N` returns a read-only view of one key's state at a position in the accepted-operation log. The historical state is produced by replaying the first `cursor` accepted operations in global commit order starting from the empty state, applying the same candidate evolution as live commits — so the replay includes every first-accepted ordinary write (including stale writes whose clock was already dominated and which therefore added no candidate), sync-imported records, and conflict repairs accepted through the resolve endpoints, while identical replays (`200`), rejected requests (`400`/`409`), uncommitted writes, and records whose durable commit failed never enter it.
+
+- `cursor` is **required** and is the number of accepted operations replayed from the empty state, counted from zero. It must appear exactly once and hold a non-negative ASCII decimal integer; `cursor=0` replays no records. A missing, repeated, unknown, blank, or empty parameter, a sign, whitespace, a decimal point, non-ASCII numerals, or a cursor greater than the current log length returns HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state. A cursor equal to the log length is valid and returns the tail history.
+- At `cursor=0` no business key has a candidate, so every key returns HTTP 404 with `{"error":"not_found"}`. A target key that holds no candidate at the requested position likewise returns HTTP 404 — even when the same key first appears at a later cursor, or an earlier candidate has already been dominated away by that position.
+- A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly four fields in this fixed order:
+
+```json
+{"cursor":2,"key":"color","status":"conflict","candidates":[{"value":"blue","clock":{"r1":1},"replicaId":"r1","operationId":"op-1"},{"value":"red","clock":{"r2":1},"replicaId":"r2","operationId":"op-2"}]}
+```
+
+- `cursor` echoes the replayed record count and `key` the requested key (the path segment is percent-decoded like every route).
+- `status` is `"resolved"` when every candidate surviving at that position agrees on the value and `"conflict"` otherwise — the same classification as `GET /v1/states/{key}`. At the tail cursor the candidates and the classification are identical to a current query.
+- `candidates` is always an array holding the candidates still present at that position, in the current identity order (sorted by `(replicaId, operationId)` ascending), each carrying exactly `value`, `clock`, `replicaId`, and `operationId`. A resolved historical state still lists **all** candidates — it never copies the current resolved response's single `value`/`clock` shape — so its first entry is exactly the candidate the current selection rule picks: at the tail cursor that first candidate's `value` and `clock` are the `value` and `clock` a current resolved query reports.
+
+Every number in the response is a JSON integer (the cursor and the vector-clock ticks); no float, negative zero, or non-finite value can appear. A missing, empty, or extra path segment (for example `/v1/states/{key}/at/extra`, `/v1/states//at`, or a trailing slash) or any unknown route returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check.
+
+The log prefix and the replayed candidate set are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit. The query is strictly read-only — it modifies neither memory nor the data file and creates no temporary file. With `--data-file`, the log is rebuilt identically during recovery, so the same cursor yields the identical state before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 `{"error":"unauthorized"}` with the `Bearer` challenge and never reads or changes state; in scope-policy mode an authenticated token lacking the `read` (or `admin`) scope is HTTP 403 without a challenge; and `/health` stays anonymous.
+
 ### Explaining a key's candidate state
 
 `GET /v1/states/{key}/why` returns a read-only causal explanation of one key's current candidate state. A key with no current candidates — one that never appeared, or one whose history leaves no current candidate — returns HTTP 404 with `{"error":"not_found"}`.
