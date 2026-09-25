@@ -765,6 +765,30 @@ def parse_checkpoint_payload(raw: bytes | str | dict[str, Any]) -> int:
     return cursor
 
 
+def parse_empty_object_payload(raw: bytes | str | dict[str, Any]) -> None:
+    """Validate a request body that must be exactly the empty object.
+
+    The body must be a complete JSON document whose parsed value is an
+    object with no fields: only ``{}`` (with optional JSON whitespace)
+    passes. Malformed JSON, a non-object document, ``null``, and any
+    object carrying a field — known or unknown — raise ValueError.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            payload: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or payload:
+        raise ValueError("body must be an empty JSON object")
+
+
 ACK_MAX_OPERATIONS = 100
 
 
@@ -1315,18 +1339,31 @@ class ScopePolicyError(Exception):
     """
 
 
-def load_scope_policy(path: str) -> dict[str, frozenset[str]]:
-    """Read and strictly validate the token-to-scopes policy file.
+class ScopePolicyReloadError(Exception):
+    """Raised when a runtime scope-policy reload cannot be completed.
 
-    The target must be a readable regular UTF-8 JSON file whose whole
-    content is one JSON object: every key is a non-empty ASCII printable
-    token (bytes 0x21-0x7E, no whitespace) and every value is a non-empty
-    array containing only the scopes ``"read"``, ``"write"``, and
-    ``"admin"`` without repetition. A missing, unreadable, or non-regular
-    target, malformed or incomplete JSON, a non-object document, a
-    duplicate token key, an illegal token, or an unknown/empty/duplicated
-    scope value raises ScopePolicyError; the error never echoes the file's
-    tokens or contents.
+    ``kind`` classifies the failure for the HTTP boundary: ``"unavailable"``
+    means the configured file is missing, unreadable, not a regular file, or
+    could not be read (HTTP 503 ``policy_unavailable``); ``"conflict"``
+    means the file was readable but its content failed the same UTF-8 JSON
+    and token/scope validation as startup (HTTP 409 ``policy_conflict``).
+    Either way the live policy stays in force and the error never echoes the
+    file's tokens or contents.
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def read_scope_policy_bytes(path: str) -> bytes:
+    """Read the raw bytes of the scope policy file at ``path``.
+
+    The target must be a readable regular file. A missing, unreadable, or
+    non-regular target (for example a directory) and any read failure raise
+    ScopePolicyError; the error never echoes the file's content. The bytes
+    themselves are neither decoded nor validated here, so a reload can tell
+    an unreadable file (503) apart from an invalid document (409).
     """
     try:
         mode = os.stat(path).st_mode
@@ -1336,9 +1373,22 @@ def load_scope_policy(path: str) -> dict[str, frozenset[str]]:
         raise ScopePolicyError(f"scope policy path is not a regular file: {path!r}")
     try:
         with open(path, "rb") as handle:
-            raw = handle.read()
+            return handle.read()
     except OSError as exc:
         raise ScopePolicyError(f"cannot read scope policy file {path!r}: {exc}") from exc
+
+
+def parse_scope_policy(raw: bytes) -> dict[str, frozenset[str]]:
+    """Validate raw scope-policy bytes and return the token-to-scopes mapping.
+
+    The bytes must encode one UTF-8 JSON object: every key is a non-empty
+    ASCII printable token (bytes 0x21-0x7E, no whitespace) and every value
+    is a non-empty array containing only the scopes ``"read"``,
+    ``"write"``, and ``"admin"`` without repetition. Malformed or
+    incomplete JSON, a non-object document, a duplicate token key, an
+    illegal token, or an unknown/empty/duplicated scope value raises
+    ScopePolicyError; the error never echoes the file's tokens or contents.
+    """
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -1380,6 +1430,96 @@ def load_scope_policy(path: str) -> dict[str, frozenset[str]]:
             scopes.add(scope)
         policy[token] = frozenset(scopes)
     return policy
+
+
+def load_scope_policy(path: str) -> dict[str, frozenset[str]]:
+    """Read and strictly validate the token-to-scopes policy file.
+
+    The target must be a readable regular UTF-8 JSON file whose whole
+    content is one JSON object: every key is a non-empty ASCII printable
+    token (bytes 0x21-0x7E, no whitespace) and every value is a non-empty
+    array containing only the scopes ``"read"``, ``"write"``, and
+    ``"admin"`` without repetition. A missing, unreadable, or non-regular
+    target, malformed or incomplete JSON, a non-object document, a
+    duplicate token key, an illegal token, or an unknown/empty/duplicated
+    scope value raises ScopePolicyError; the error never echoes the file's
+    tokens or contents.
+    """
+    return parse_scope_policy(read_scope_policy_bytes(path))
+
+
+class ScopePolicyManager:
+    """Thread-safe holder of the live token-to-scopes policy.
+
+    The manager owns the immutable policy mapping and the path of the file
+    given at startup. Authentication takes a snapshot of the mapping under
+    the manager's lock; a reload re-reads and validates that same configured
+    file and only then swaps the mapping, so the replacement is one atomic
+    commit: concurrent reloads run strictly one after another as complete
+    read-validate-swap units, and every request authenticates against
+    either the whole old policy or the whole new one, never a partial
+    state. A failed reload leaves the live mapping untouched.
+    """
+
+    def __init__(
+        self, path: str | None, policy: dict[str, frozenset[str]]
+    ) -> None:
+        # The path comes from the startup configuration; reloads may only
+        # ever re-read this exact file, never a request-supplied path. It is
+        # None only for servers assembled directly without a policy file, in
+        # which case a reload reports the policy as unavailable.
+        self._path = os.path.abspath(path) if path is not None else None
+        self._lock = threading.Lock()
+        self._policy = dict(policy)
+
+    @property
+    def path(self) -> str | None:
+        return self._path
+
+    def snapshot(self) -> dict[str, frozenset[str]]:
+        """Return a point-in-time copy of the live policy mapping."""
+        with self._lock:
+            return dict(self._policy)
+
+    def reload(self) -> tuple[str, int]:
+        """Atomically reload the policy from the startup-configured file.
+
+        Re-reads the same file the service started with (the request may
+        not name another path), validates it under exactly the startup
+        constraints, and swaps the live mapping in one commit serialized
+        against concurrent reloads and authentication snapshots. On
+        success returns ``(policy_digest, tokens)`` where
+        ``policy_digest`` is the 64-character lowercase hexadecimal
+        SHA-256 of the file's raw UTF-8 bytes and ``tokens`` is the
+        non-negative number of token entries. A missing, unreadable,
+        non-regular, or otherwise unreadable file raises
+        ScopePolicyReloadError(kind="unavailable"); readable-but-invalid
+        content raises ScopePolicyReloadError(kind="conflict") and leaves
+        the live policy complete and in force. No temporary file is
+        created.
+        """
+        path = self._path
+        if path is None:
+            raise ScopePolicyReloadError(
+                "unavailable", "no scope policy file was configured at startup"
+            )
+        # Hold the lock across read, validation, and the swap, so each
+        # reload is one complete commit serialized against other reloads
+        # and against authentication snapshots: while a reload is reading
+        # or validating, every request still sees the old policy, and once
+        # it releases every request sees the new one.
+        with self._lock:
+            try:
+                raw = read_scope_policy_bytes(path)
+            except ScopePolicyError as exc:
+                raise ScopePolicyReloadError("unavailable", str(exc)) from exc
+            try:
+                policy = parse_scope_policy(raw)
+            except ScopePolicyError as exc:
+                raise ScopePolicyReloadError("conflict", str(exc)) from exc
+            digest = hashlib.sha256(raw).hexdigest()
+            self._policy = policy
+        return digest, len(policy)
 
 
 def _validate_stored_operation(entry: Any) -> tuple[str, dict[str, Any]]:
@@ -4151,6 +4291,7 @@ class SemanticStateServer(ThreadingHTTPServer):
         store: StateStore | None = None,
         auth_token: str | None = None,
         auth_scopes: dict[str, frozenset[str]] | None = None,
+        scope_policy_file: str | None = None,
     ) -> None:
         # Build (and thus preflight/recover) the store before binding and
         # listening, so a rejected data file fails startup before any port is
@@ -4166,6 +4307,16 @@ class SemanticStateServer(ThreadingHTTPServer):
         # when authentication is disabled. Like the single token, the policy
         # is never written to the data file or any log.
         self.auth_scopes = auth_scopes
+        # The manager owns the live policy and its startup-configured file so
+        # the admin reload endpoint can atomically swap the mapping without a
+        # restart. It exists only in scope-policy mode; None means the
+        # endpoint is not published (single-token mode and anonymous mode
+        # answer it with 404).
+        self.scope_policy = (
+            ScopePolicyManager(scope_policy_file, auth_scopes)
+            if auth_scopes is not None
+            else None
+        )
 
 
 _FALLBACK_STORE = StateStore()
@@ -4214,6 +4365,27 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _json_ordered(
+        self,
+        status: HTTPStatus,
+        payload: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        """Respond with compact JSON in the payload's field order.
+
+        Same compact encoding as :meth:`_json` but object fields keep their
+        insertion order rather than being sorted, for endpoints whose
+        contract fixes the response field order.
+        """
+        body = _ordered_json_bytes(payload)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
     def _authenticate(self) -> tuple[bool, frozenset[str] | None]:
         """Authenticate the request's bearer credential when auth is enabled.
 
@@ -4234,8 +4406,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         neither memory nor the data file is touched.
         """
         token = getattr(self.server, "auth_token", None)
-        policy = getattr(self.server, "auth_scopes", None)
-        if token is None and policy is None:
+        manager = getattr(self.server, "scope_policy", None)
+        if token is None and manager is None:
             return True, None
         values = self.headers.get_all("Authorization")
         if values is not None and len(values) == 1:
@@ -4249,7 +4421,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if hmac.compare_digest(credential, token.encode("ascii")):
                         return True, frozenset(ALLOWED_SCOPES)
                 else:
-                    assert policy is not None
+                    # Take one point-in-time copy of the live policy so the
+                    # whole authentication runs against a single committed
+                    # revision even if a reload swaps the mapping meanwhile:
+                    # a request is authorized entirely by the policy in force
+                    # when it authenticated, never by a later revision.
+                    policy = manager.snapshot()
                     for configured_token, granted_scopes in policy.items():
                         if hmac.compare_digest(credential, configured_token.encode("ascii")):
                             return True, granted_scopes
@@ -5190,6 +5367,46 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_scope_policy_reload_post(self) -> None:
+        # The declared-length check (400/413), authentication, the admin
+        # scope, and the scope-mode gate (404) all ran in do_POST, none of
+        # them reading the body; route-shape mismatches — missing, extra, or
+        # a trailing slash — fall through to the generic 404 before any of
+        # those. The route accepts no query parameters, and that check
+        # precedes the body check even on a correct route.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            parse_empty_object_payload(raw)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        manager = getattr(self.server, "scope_policy", None)
+        if manager is None:
+            # Defensive: the mode gate already ran in do_POST. This keeps a
+            # missing manager a not-found rather than a server error.
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        try:
+            digest, tokens = manager.reload()
+        except ScopePolicyReloadError as exc:
+            if exc.kind == "unavailable":
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE, {"error": "policy_unavailable"}
+                )
+            else:
+                self._json(HTTPStatus.CONFLICT, {"error": "policy_conflict"})
+            return
+        # Field order is part of the contract: status, policyDigest, tokens.
+        self._json_ordered(
+            HTTPStatus.OK,
+            {"status": "reloaded", "policyDigest": digest, "tokens": tokens},
+        )
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
         matched_ack, acknowledge_peer = self._acknowledge_route()
@@ -5232,6 +5449,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "transactions"
             and segments[2] == "apply"
         )
+        is_scope_policy_reload_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "scope-policy"
+            and segments[3] == "reload"
+        )
         if (
             matched
             or matched_ack
@@ -5241,6 +5465,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_sync_post
             or is_auto_resolve_batch_post
             or is_transaction_apply_post
+            or is_scope_policy_reload_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -5250,7 +5475,19 @@ class RequestHandler(BaseHTTPRequestHandler):
             # closed.
             if self._validate_declared_length() is None:
                 return
-            if not self._require_scope(SCOPE_WRITE):
+            if is_scope_policy_reload_post:
+                # The reload endpoint shares the length-first priority but
+                # is admin-gated rather than write-gated. Authentication
+                # still runs before the mode gate, so a missing or bad
+                # credential is 401 in every mode; the endpoint then exists
+                # only in scope-policy mode — single-token and anonymous
+                # modes answer 404, exactly like an unpublished route.
+                if not self._require_scope(SCOPE_ADMIN):
+                    return
+                if getattr(self.server, "scope_policy", None) is None:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+            elif not self._require_scope(SCOPE_WRITE):
                 return
         else:
             # Every other route authenticates and checks the write scope
@@ -5302,6 +5539,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_transaction_apply_post:
             self._handle_transaction_apply_post()
+            return
+        if is_scope_policy_reload_post:
+            self._handle_scope_policy_reload_post()
             return
         self._handle_sync_post()
 
@@ -5386,6 +5626,7 @@ def main(argv: list[str] | None = None) -> None:
         store=store,
         auth_token=auth_token,
         auth_scopes=auth_scopes,
+        scope_policy_file=args.scope_policy_file,
     )
     try:
         server.serve_forever()
