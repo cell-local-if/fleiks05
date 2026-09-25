@@ -376,6 +376,33 @@ A receipt is not an operation. It changes neither the accepted-operation log nor
 
 With `--data-file`, the receipt and the advanced checkpoint are written to the data file in the same atomic commit protocol (`write temp file → fsync → rename → fsync directory`) before the HTTP 201; receipts live in the optional `acks` section, one `{"peerId","ackId","cursor","operations"}` record per accepted receipt. A durable failure returns HTTP 500 `{"error":"internal_error"}` and leaves memory, the checkpoint, the bindings, and the file exactly as they were — the request is safely retryable. A version:1 file written before receipts existed (without the `acks` section) recovers with no receipt bindings and otherwise unchanged semantics; after a restart the create `201`, replay `200`, and conflict `409` decisions are identical to a process that never restarted. The endpoint shares the common request contract: Content-Length is validated before authentication (400/413 first), an invalid or missing bearer token returns HTTP 401 `{"error":"unauthorized"}` without reading the body, and `/health` stays anonymous.
 
+#### Querying consumption receipts
+
+`GET /v1/sync/peers/{peerId}/receipts?after=N&limit=N` lets the sending side read back the confirmed consumption results for one peer: a read-only page of the receipts that peer previously committed with `POST .../acknowledge`, in their commit (creation) order, together with an integrity summary over the peer's whole committed receipt set.
+
+- `{peerId}` must be a non-empty percent-decoded path segment, following the same path rules as the checkpoint, pickup, and acknowledge routes; an empty segment (`/v1/sync/peers//receipts`) is a route-shape failure and returns HTTP 404 with `{"error":"not_found"}`.
+- `after` is the number of this peer's receipts already skipped (a 0-based resume cursor); it defaults to `0`. `limit` defaults to `100` and must be between `1` and `100`; both accept only ASCII decimal integers. A missing, unknown, or repeated parameter, a blank, negative, or non-ASCII-decimal value, a `limit` outside `1-100`, or an `after` past the peer's receipt count returns HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state. An `after` equal to the receipt count is a valid empty page.
+- A peer that has never registered a checkpoint returns HTTP 404 with `{"error":"not_found"}` — a peer is known exactly through its checkpoint, and receipts only ever exist for a registered peer. A registered peer with no receipts returns HTTP 200 with an empty page, `receiptsCount` 0, and the hash of the empty array.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with an explicit `Content-Length` and exactly seven fields:
+
+```json
+{"algorithm":"sha256","digest":"<64 lowercase hex chars>","hasMore":false,"nextCursor":2,"receipts":[{"ackId":"ack-1","cursor":2,"operations":[{"operationId":"op-1","replicaId":"r1"},{"operationId":"op-2","replicaId":"r2"}],"peerId":"peer-a"},{"ackId":"ack-2","cursor":2,"operations":[],"peerId":"peer-a"}],"receiptsCount":2}
+```
+
+- `receipts`: one page of the peer's receipts in stable commit (creation) order — never sorted. Each receipt has exactly `peerId`, `ackId`, `cursor`, and `operations`, preserving the `cursor` and the operations it was confirmed with, however the peer's checkpoint has moved since; identical acknowledgement replays add no receipt. `operations` keeps the confirmed order, and each identity carries only `replicaId` and `operationId`.
+- `nextCursor`: the number of this peer's receipts skipped after this page — feed it back as the next `after`.
+- `hasMore`: whether further receipts remain past the page.
+- `algorithm`: always `"sha256"`.
+- `digest`: the 64-character lowercase hexadecimal SHA-256 of the canonical receipt-array bytes described below, covering the peer's **whole** committed receipt set — never just the page.
+- `receiptsCount`: the total number of the peer's receipts, also counting receipts outside the page (it equals the digest input's array length), not the page length.
+
+The list page and the summary are produced from the **same committed snapshot** under the commit lock used by local writes, sync imports, repairs, checkpoint commits, and acknowledgements, so the page, `nextCursor`, `hasMore`, the digest, and the count always describe one commit even while receipts are being committed; the digest and count never vary with paging.
+
+The digest input is a compact UTF-8 JSON **array** of the peer's receipts in creation order (not sorted, not paged): each receipt is written with fields in the fixed order `peerId`, `ackId`, `cursor`, `operations`, and each identity with fields in the fixed order `replicaId`, `operationId` (keeping the confirmed order). No whitespace appears anywhere. Strings escape only the quote (`\"`), the backslash (`\\`), and control characters U+0000–U+001F (always as `\u00XX` with lowercase hex); every other Unicode code point is written literally. Numbers are plain JSON integers. The SHA-256 is computed over exactly those bytes; an empty receipt set hashes the empty array `[]`.
+
+The query is strictly read-only: it advances no checkpoint, changes no binding, modifies neither memory nor the data file, and creates no temporary file; repeated GETs return the same page until the peer separately posts another acknowledgement. A missing, empty, or extra path segment (for example `/v1/sync/peers/{peerId}/receipts/extra` or a trailing slash) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check. With `--data-file`, receipts are rebuilt from the recovered `acks` section in file order on startup, so after a restart the receipt order, page boundaries, cursor resume, count, and digest are identical to a process that never restarted; a version:1 file without the `acks` section recovers as the empty receipt set. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
+
 ### Per-key operation audit
 
 `GET /v1/audit/keys/{key}/operations?after=N&limit=N` returns the history of **accepted operations for one key**, reusing the same commit order, record shape (`{"replicaId","operation"}`), and paging rules as sync export — the stream is simply the shared accepted-operation log filtered to records whose `operation.key` equals the path key.
