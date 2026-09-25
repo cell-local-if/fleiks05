@@ -13,7 +13,7 @@ import tempfile
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlsplit
 
 DATA_FORMAT_VERSION = 1
@@ -632,6 +632,22 @@ def parse_peer_receipts_audit_query(query: str) -> tuple[int, int] | None:
     return parse_peer_pickup_query(query)
 
 
+def parse_scope_policy_audit_query(query: str) -> tuple[int, int] | None:
+    """Validate the scope-policy change-audit query string.
+
+    Both ``after`` and ``limit`` are required non-repeated ASCII decimal
+    integers: ``after`` is a 0-based resume cursor into the reload
+    history and ``limit`` must be between 1 and 100. A missing or
+    repeated name, a blank, signed, whitespace-bearing, decimal-point,
+    or non-ASCII-decimal value, and any unknown parameter are rejected
+    exactly as on the other audited paging routes. The bound on ``after``
+    against the committed event count is checked by the store against
+    the committed snapshot (``after`` equal to the count is a valid
+    empty page).
+    """
+    return parse_peer_pickup_query(query)
+
+
 CAUSAL_COMPARE_IDENTITY_PARAMS = (
     "leftReplicaId",
     "leftOperationId",
@@ -1138,6 +1154,34 @@ def _receipts_digest_input(
     return "".join(parts).encode("utf-8")
 
 
+def _policy_events_digest_input(events: list[dict[str, Any]]) -> bytes:
+    """Serialize the policy-change event history to the canonical digest input.
+
+    The result is a compact UTF-8 JSON array with one entry per successful
+    scope-policy hot reload, in the order the reloads committed. Each entry
+    carries its fields in the fixed order ``sequence``, ``digest``,
+    ``tokens``: the event's 1-based history position, the 64-character
+    lowercase hexadecimal SHA-256 of the reloaded policy file's raw UTF-8
+    bytes, and the new policy's entry count. No whitespace is emitted
+    anywhere, numbers are plain JSON integers, and strings are escaped
+    exactly as in :func:`_escape_digest_string`. An empty history
+    serializes to ``[]``.
+    """
+    parts: list[str] = ["["]
+    for index, event in enumerate(events):
+        if index:
+            parts.append(",")
+        parts.append('{"sequence":')
+        parts.append(str(event["sequence"]))
+        parts.append(',"digest":')
+        parts.append(_escape_digest_string(event["digest"]))
+        parts.append(',"tokens":')
+        parts.append(str(event["tokens"]))
+        parts.append("}")
+    parts.append("]")
+    return "".join(parts).encode("utf-8")
+
+
 def _receipt_chain_audit_locked(
     committed: list[tuple[str, dict[str, Any]]],
     accepted: list[tuple[str, dict[str, Any]]],
@@ -1481,7 +1525,10 @@ class ScopePolicyManager:
         with self._lock:
             return dict(self._policy)
 
-    def reload(self) -> tuple[str, int]:
+    def reload(
+        self,
+        recorder: "Callable[[str, int], Any] | None" = None,
+    ) -> tuple[str, int]:
         """Atomically reload the policy from the startup-configured file.
 
         Re-reads the same file the service started with (the request may
@@ -1497,17 +1544,26 @@ class ScopePolicyManager:
         content raises ScopePolicyReloadError(kind="conflict") and leaves
         the live policy complete and in force. No temporary file is
         created.
+
+        When ``recorder`` is given it is called with
+        ``(policy_digest, tokens)`` *before* the live mapping is swapped,
+        still under this manager's lock, so the durable audit commit and
+        the policy swap are one commit serialized against other reloads.
+        Any exception the recorder raises (for example a failed durable
+        write) propagates unchanged and prevents the swap: the old policy
+        stays fully in force and the failed reload records no event.
         """
         path = self._path
         if path is None:
             raise ScopePolicyReloadError(
                 "unavailable", "no scope policy file was configured at startup"
             )
-        # Hold the lock across read, validation, and the swap, so each
-        # reload is one complete commit serialized against other reloads
-        # and against authentication snapshots: while a reload is reading
-        # or validating, every request still sees the old policy, and once
-        # it releases every request sees the new one.
+        # Hold the lock across read, validation, the durable audit record,
+        # and the swap, so each reload is one complete commit serialized
+        # against other reloads and against authentication snapshots:
+        # while a reload is reading, validating, or recording, every
+        # request still sees the old policy, and once it releases every
+        # request sees the new one.
         with self._lock:
             try:
                 raw = read_scope_policy_bytes(path)
@@ -1518,8 +1574,14 @@ class ScopePolicyManager:
             except ScopePolicyError as exc:
                 raise ScopePolicyReloadError("conflict", str(exc)) from exc
             digest = hashlib.sha256(raw).hexdigest()
+            entries = len(policy)
+            if recorder is not None:
+                # Durably commit the change event before swapping the live
+                # boundary: if this raises, the line below never runs, so
+                # the old policy and the old history both survive.
+                recorder(digest, entries)
             self._policy = policy
-        return digest, len(policy)
+        return digest, entries
 
 
 def _validate_stored_operation(entry: Any) -> tuple[str, dict[str, Any]]:
@@ -1750,6 +1812,60 @@ def _validate_stored_acks(
     return acks
 
 
+def _is_sha256_hex64(value: Any) -> bool:
+    """Return True for exactly 64 lowercase hexadecimal characters."""
+    return isinstance(value, str) and len(value) == 64 and all(
+        ("0" <= ch <= "9") or ("a" <= ch <= "f") for ch in value
+    )
+
+
+def _validate_stored_policy_events(document: Any) -> list[dict[str, Any]]:
+    """Validate the optional ``policyEvents`` section of a data file.
+
+    Returns a clean ordered list of policy-change events, each
+    ``{"sequence", "digest", "tokens"}``. The section is optional (a
+    version:1 file written before scope-policy change auditing existed
+    simply has none, and recovers with an empty history); when present it
+    must be a list whose entries carry exactly those three keys:
+    ``sequence`` is a non-boolean positive integer starting at 1 and
+    increasing without gaps, ``digest`` is 64 lowercase hexadecimal
+    characters (the SHA-256 recorded at reload time), and ``tokens`` is a
+    non-boolean non-negative integer (the reloaded policy's entry count).
+    Anything else is a corrupt file.
+    """
+    if "policyEvents" not in document:
+        return []
+    raw = document["policyEvents"]
+    if not isinstance(raw, list):
+        raise PersistenceError("data file policyEvents must be a list")
+    events: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {
+            "sequence",
+            "digest",
+            "tokens",
+        }:
+            raise PersistenceError(
+                "each policy event must be an object with sequence, digest, tokens"
+            )
+        sequence = entry["sequence"]
+        tokens = entry["tokens"]
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+            raise PersistenceError("policy event sequence must be a positive integer")
+        if sequence != len(events) + 1:
+            raise PersistenceError(
+                "policy event sequences must start at 1 and continue without gaps"
+            )
+        if not _is_sha256_hex64(entry["digest"]):
+            raise PersistenceError("policy event digest must be 64 lowercase hex characters")
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise PersistenceError("policy event tokens must be a non-negative integer")
+        events.append(
+            {"sequence": sequence, "digest": entry["digest"], "tokens": tokens}
+        )
+    return events
+
+
 def _load_data_file_complete(
     path: str,
 ) -> tuple[
@@ -1758,6 +1874,7 @@ def _load_data_file_complete(
     dict[tuple[str, str], str],
     dict[str, list[dict[str, Any]]],
     dict[tuple[str, str], dict[str, Any]],
+    list[dict[str, Any]],
 ]:
     """Read and strictly validate a data file, returning every section.
 
@@ -1765,12 +1882,13 @@ def _load_data_file_complete(
     persisted ``{peerId: cursor}`` checkpoints, the persisted
     ``{(replicaId, operationId): policy}`` automatic-resolution policy
     bindings, the persisted ``{transactionId: entries}`` transaction
-    bindings, and the persisted ``{(peerId, ackId): receipt}`` consumption
-    receipts (each empty for a version:1 file written before that section
-    existed). Raises PersistenceError when the file is missing-readable,
-    not UTF-8 JSON, has an unexpected structure, or contains records,
-    checkpoints, policy bindings, transaction bindings, or receipts
-    violating the live constraints.
+    bindings, the persisted ``{(peerId, ackId): receipt}`` consumption
+    receipts, and the persisted scope-policy change events (each empty for
+    a version:1 file written before that section existed). Raises
+    PersistenceError when the file is missing-readable, not UTF-8 JSON,
+    has an unexpected structure, or contains records, checkpoints, policy
+    bindings, transaction bindings, receipts, or policy events violating
+    the live constraints.
     """
     try:
         with open(path, "rb") as handle:
@@ -1791,10 +1909,12 @@ def _load_data_file_complete(
         "policies",
         "transactions",
         "acks",
+        "policyEvents",
     } or "version" not in document or "operations" not in document:
         raise PersistenceError(
             "data file root must be an object with version and operations "
-            "and optionally checkpoints, policies, transactions, and acks"
+            "and optionally checkpoints, policies, transactions, acks, and "
+            "policyEvents"
         )
     version = document["version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != DATA_FORMAT_VERSION:
@@ -1816,7 +1936,8 @@ def _load_data_file_complete(
     policies = _validate_stored_policies(document, identities)
     transactions = _validate_stored_transactions(document, identities)
     acks = _validate_stored_acks(document, checkpoints, records)
-    return records, checkpoints, policies, transactions, acks
+    policy_events = _validate_stored_policy_events(document)
+    return records, checkpoints, policies, transactions, acks, policy_events
 
 
 def load_data_file_full(
@@ -1828,13 +1949,13 @@ def load_data_file_full(
     persisted ``{peerId: cursor}`` checkpoints, and the persisted
     ``{(replicaId, operationId): policy}`` automatic-resolution policy
     bindings (both empty for a version:1 file written before those sections
-    existed). Persisted transaction bindings and consumption receipts are
-    validated the same way but not returned here. Raises PersistenceError
-    when the file is missing-readable, not UTF-8 JSON, has an unexpected
-    structure, or contains records, checkpoints, or policy bindings
-    violating the live constraints.
+    existed). Persisted transaction bindings, consumption receipts, and
+    scope-policy change events are validated the same way but not returned
+    here. Raises PersistenceError when the file is missing-readable, not
+    UTF-8 JSON, has an unexpected structure, or contains records,
+    checkpoints, or policy bindings violating the live constraints.
     """
-    records, checkpoints, policies, _, _ = _load_data_file_complete(path)
+    records, checkpoints, policies, _, _, _ = _load_data_file_complete(path)
     return records, checkpoints, policies
 
 
@@ -1845,7 +1966,7 @@ def load_data_file_transactions(path: str) -> dict[str, list[dict[str, Any]]]:
     only need the persisted ``{transactionId: entries}`` bindings; every
     other section is validated the same way but not returned.
     """
-    _, _, _, transactions, _ = _load_data_file_complete(path)
+    _, _, _, transactions, _, _ = _load_data_file_complete(path)
     return transactions
 
 
@@ -1857,7 +1978,7 @@ def load_data_file_acks(path: str) -> dict[tuple[str, str], dict[str, Any]]:
     receipts; every other section is validated the same way but not
     returned.
     """
-    _, _, _, _, acks = _load_data_file_complete(path)
+    _, _, _, _, acks, _ = _load_data_file_complete(path)
     return acks
 
 
@@ -1872,6 +1993,17 @@ def load_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
     return records
 
 
+def load_data_file_policy_events(path: str) -> list[dict[str, Any]]:
+    """Read and strictly validate a data file, returning its policy events.
+
+    Thin wrapper over :func:`_load_data_file_complete` for callers that
+    only need the persisted scope-policy change history; every other
+    section is validated the same way but not returned.
+    """
+    _, _, _, _, _, policy_events = _load_data_file_complete(path)
+    return policy_events
+
+
 def ensure_data_file(
     path: str,
 ) -> tuple[
@@ -1880,13 +2012,14 @@ def ensure_data_file(
     dict[tuple[str, str], str],
     dict[str, list[dict[str, Any]]],
     dict[tuple[str, str], dict[str, Any]],
+    list[dict[str, Any]],
 ]:
     """Validate the data-file location and return its committed state.
 
     A missing target file is accepted (its parent directory must exist and
     be writable); an existing target must be a regular, parseable data
-    file. Returns ``(records, checkpoints, policies, transactions, acks)``.
-    Anything else raises PersistenceError.
+    file. Returns ``(records, checkpoints, policies, transactions, acks,
+    policy_events)``. Anything else raises PersistenceError.
     """
     parent = os.path.dirname(os.path.abspath(path))
     if not os.path.isdir(parent):
@@ -1901,7 +2034,7 @@ def ensure_data_file(
         if not stat.S_ISREG(mode):
             raise PersistenceError(f"data file path is not a regular file: {path!r}")
         return _load_data_file_complete(path)
-    return [], {}, {}, {}, {}
+    return [], {}, {}, {}, {}, []
 
 
 def _fsync_directory(directory: str) -> None:
@@ -2117,6 +2250,14 @@ class StateStore:
         # touches the accepted log, and it is committed atomically with the
         # checkpoint advance it caused.
         self._acks: dict[tuple[str, str], dict[str, Any]] = {}
+        # Scope-policy change history: one event per successful hot reload,
+        # in commit order. Each event is ``{"sequence", "digest",
+        # "tokens"}``: a 1-based continuous position, the SHA-256 of the
+        # reloaded policy file's raw UTF-8 bytes, and the new policy's entry
+        # count. Like the policy itself, the history rides in the data file
+        # but is otherwise unrelated to business state; a file written
+        # before this section existed recovers with an empty history.
+        self._policy_events: list[dict[str, Any]] = []
         self._data_file: str | None = None
         if data_file is not None:
             path = os.path.abspath(data_file)
@@ -2124,7 +2265,14 @@ class StateStore:
             # file is never touched by the probe and is opened only for
             # reading afterwards.
             preflight_data_file_directory(path)
-            records, checkpoints, policies, transactions, acks = ensure_data_file(path)
+            (
+                records,
+                checkpoints,
+                policies,
+                transactions,
+                acks,
+                policy_events,
+            ) = ensure_data_file(path)
             with self._lock:
                 for replica_id, operation in records:
                     self._commit_locked(replica_id, operation)
@@ -2132,6 +2280,7 @@ class StateStore:
                 self._policies = dict(policies)
                 self._transactions = dict(transactions)
                 self._acks = dict(acks)
+                self._policy_events = [dict(event) for event in policy_events]
                 self._data_file = path
                 if not records and not os.path.exists(path):
                     # The target is missing and the preflight proved the
@@ -2218,6 +2367,10 @@ class StateStore:
                 }
                 for (peer_id, ack_id), receipt in self._acks.items()
             ],
+            # Scope-policy change events ride along in the order their
+            # reloads committed, so every successful hot reload and its
+            # event become durable in one atomic commit together.
+            "policyEvents": [dict(event) for event in self._policy_events],
         }
         data = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
         directory = os.path.dirname(self._data_file)
@@ -4036,6 +4189,81 @@ class StateStore:
             "audit": audit,
         }
 
+    def record_policy_reload(self, digest: str, tokens: int) -> dict[str, Any]:
+        """Commit one successful scope-policy hot reload to the audit history.
+
+        Appends an event ``{"sequence", "digest", "tokens"}`` — the next
+        1-based position, the 64-character lowercase SHA-256 of the
+        reloaded policy file's raw UTF-8 bytes, and the new policy's entry
+        count — in the reload's commit order. With ``--data-file`` the
+        event is made durable by the same atomic commit protocol as
+        business state *before* it becomes visible: a durable failure
+        raises PersistenceError and leaves the in-memory history exactly
+        as it was, so a caller can answer HTTP 500 while both the old
+        policy and the old history stay in force. Returns the committed
+        event.
+        """
+        with self._lock:
+            event = {
+                "sequence": len(self._policy_events) + 1,
+                "digest": digest,
+                "tokens": tokens,
+            }
+            self._policy_events.append(event)
+            if self._data_file is not None:
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    self._policy_events.pop()
+                    raise
+            return dict(event)
+
+    def get_policy_events(
+        self, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of the scope-policy change history.
+
+        The stream is the history of successful hot reloads in their
+        commit order — one event per reload that atomically replaced the
+        live policy; failed reloads (409/503) and rejected requests never
+        enter it. ``after`` is the number of events already skipped (a
+        0-based resume cursor) and ``limit`` the page size. The page
+        slice, ``nextCursor``, ``hasMore``, the full-history digest, and
+        the count are all computed against the same snapshot under the
+        commit lock, so a concurrent reload is observed only as the whole
+        old or the whole new history. The query is strictly read-only.
+
+        Returns ``(200, report)`` with exactly six fields: ``events`` (the
+        page, each item carrying exactly ``sequence``, ``digest``, and
+        ``tokens``), ``nextCursor`` (the number of events skipped after
+        this page — feed it back as the next ``after``), ``hasMore``,
+        ``algorithm`` (``"sha256"``), ``digest`` (the SHA-256 of the
+        canonical compact JSON array produced by
+        :func:`_policy_events_digest_input` over the **whole** history, an
+        empty history hashing ``[]``), and ``eventsCount`` (the full
+        history length, not the page length). An ``after`` equal to the
+        event count is a valid empty tail. Raises ValueError when
+        ``after`` is past the event count of the snapshot. With
+        ``--data-file`` the history is rebuilt identically during
+        recovery (a file written before policy events existed recovers
+        with an empty set).
+        """
+        with self._lock:
+            total = len(self._policy_events)
+            if after > total:
+                raise ValueError("after is past the end of the policy event history")
+            digest_input = _policy_events_digest_input(self._policy_events)
+            page = [dict(event) for event in self._policy_events[after : after + limit]]
+        next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "events": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "eventsCount": total,
+        }
+
     def get_state_explanation(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Explain one key's current candidate state from a single snapshot.
 
@@ -4571,12 +4799,35 @@ class RequestHandler(BaseHTTPRequestHandler):
             # The health probe stays anonymous even when auth is enabled.
             self._json(HTTPStatus.OK, health_payload())
             return
+        segments = self._path_segments()
+        is_scope_policy_audit_get = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "scope-policy"
+            and segments[3] == "audit"
+        )
+        if is_scope_policy_audit_get:
+            # The change-audit entry is admin-gated, like the reload
+            # endpoint, and exists only in scope-policy mode. Authentication
+            # still runs before the mode gate, so a missing or bad
+            # credential is 401 in every mode, a valid token without the
+            # admin scope is 403 without a challenge, and single-token plus
+            # anonymous modes answer 404 exactly like an unpublished route.
+            # Path-shape mismatches never reach here, so they still fall
+            # through to the generic 404 below.
+            if not self._require_scope(SCOPE_ADMIN):
+                return
+            if getattr(self.server, "scope_policy", None) is None:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            self._handle_scope_policy_audit_get()
+            return
         # Every other route — known or unknown — authenticates and checks
         # the read scope before route matching, query parsing, or any state
         # access; the admin scope covers reads as well.
         if not self._require_scope(SCOPE_READ):
             return
-        segments = self._path_segments()
         if len(segments) == 2 and segments[0] == "v1" and segments[1] == "metrics":
             self._handle_metrics_get()
             return
@@ -5391,8 +5642,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             # missing manager a not-found rather than a server error.
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
+        # The recorder durably commits the change event before the manager
+        # swaps the live policy, so a durable failure aborts the whole
+        # reload: the old policy stays in force and the failed reload
+        # leaves no event behind.
+        recorder = self._store.record_policy_reload
         try:
-            digest, tokens = manager.reload()
+            digest, tokens = manager.reload(recorder)
         except ScopePolicyReloadError as exc:
             if exc.kind == "unavailable":
                 self._json(
@@ -5401,11 +5657,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.CONFLICT, {"error": "policy_conflict"})
             return
+        except PersistenceError:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            return
         # Field order is part of the contract: status, policyDigest, tokens.
         self._json_ordered(
             HTTPStatus.OK,
             {"status": "reloaded", "policyDigest": digest, "tokens": tokens},
         )
+
+    def _handle_scope_policy_audit_get(self) -> None:
+        # Authentication, the admin scope, and the scope-mode gate all ran
+        # in do_GET; route-shape mismatches — missing, extra, or a trailing
+        # slash — fall through to the generic 404 before this handler runs.
+        # The query accepts only the required after/limit pair.
+        params = parse_scope_policy_audit_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_policy_events(after, limit)
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        # The response keeps the payload's contracted field order: events,
+        # nextCursor, hasMore, algorithm, digest, eventsCount (and per event
+        # sequence, digest, tokens), terminated by one newline.
+        self._json_ordered_newline(status, payload)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()

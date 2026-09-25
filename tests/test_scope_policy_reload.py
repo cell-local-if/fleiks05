@@ -459,6 +459,51 @@ class ScopePolicyReloadHttpTests(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(payload, {"error": "invalid_request"})
 
+    def test_empty_content_length_is_400_for_any_credential_without_reading_body(self) -> None:
+        # An empty Content-Length declaration is a malformed length, exactly
+        # like a missing one: 400 invalid_request, ahead of authentication
+        # and the admin scope, and the declared body is never read (the
+        # response arrives even though the 64 declared bytes are never sent).
+        for value in ("", " ", "\t"):
+            for auth in (
+                None,
+                f"Bearer {ADMIN_TOKEN}",
+                f"Bearer {READ_TOKEN}",
+                "Bearer unknown",
+            ):
+                with self.subTest(value=repr(value), auth=auth):
+                    conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+                    conn.putrequest("POST", RELOAD_PATH)
+                    conn.putheader("Content-Length", value)
+                    if auth is not None:
+                        conn.putheader("Authorization", auth)
+                    conn.endheaders()  # declare an empty length, send no body
+                    response = conn.getresponse()
+                    payload = json.loads(response.read().decode("utf-8"))
+                    conn.close()
+                    self.assertEqual(response.status, 400)
+                    self.assertEqual(payload, {"error": "invalid_request"})
+        # The policy was never reloaded by any of those rejections.
+        self.assertEqual(set(self.server.scope_policy.snapshot()), set(INITIAL_POLICY))
+
+    def test_empty_content_length_beats_path_shape_query_and_body(self) -> None:
+        # Length validation runs before authentication but after the route
+        # shape is known; a correct path with an empty length and an invalid
+        # body is still the length 400, and no temp file is created.
+        listing_before = sorted(os.listdir(self.tmpdir))
+        status, payload, _ = self.raw_request(
+            "POST",
+            RELOAD_PATH + "?bogus=1",
+            [
+                ("Content-Length", ""),
+                ("Authorization", f"Bearer {ADMIN_TOKEN}"),
+            ],
+            b"not even json",
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        self.assertEqual(sorted(os.listdir(self.tmpdir)), listing_before)
+
     def test_over_limit_declaration_is_413_for_any_credential(self) -> None:
         for auth in (None, f"Bearer {ADMIN_TOKEN}", f"Bearer {READ_TOKEN}", "Bearer unknown"):
             with self.subTest(auth=auth):
