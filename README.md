@@ -22,7 +22,7 @@ Unknown routes return HTTP 404 with `{"error":"not_found"}`. Responses use UTF-8
 
 ### Request body limits
 
-All seven POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/sync/peers/{peerId}/checkpoint`, `POST /v1/transactions/apply`) share one body-size contract:
+All eight POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/sync/peers/{peerId}/checkpoint`, `POST /v1/sync/peers/{peerId}/acknowledge`, `POST /v1/transactions/apply`) share one body-size contract:
 
 - The request body is limited to **1,048,576 raw UTF-8 bytes** (1 MiB). A body whose declared length is exactly the limit is processed by the normal endpoint semantics.
 - `Content-Length` is required and validated before anything else. It must be a plain ASCII decimal integer: a missing header, an empty value, a sign, whitespace, a negative number, non-ASCII digits, or multiple headers declaring conflicting lengths all return HTTP 400 with `{"error":"invalid_request"}` — the request is never treated as having an empty body. (Multiple headers are accepted only when every occurrence declares the same length.)
@@ -56,7 +56,7 @@ The data file is a single UTF-8 JSON document, e.g.:
 {"checkpoints":{"peer-a":2},"operations":[{"replicaId":"r1","operation":{"clock":{"r1":1},"key":"color","operationId":"op-1","value":"blue"}}],"policies":[{"operationId":"fix-1","policy":"lowest_identity","replicaId":"r3"}],"version":1}
 ```
 
-The `checkpoints` section is optional and holds sender-side replication cursors (see below); a file written before checkpoints existed contains only `version` and `operations`, and recovers with no registered checkpoints. The `policies` section is likewise optional and holds the automatic-resolution policy bindings (see below): one `{"replicaId","operationId","policy"}` record per accepted automatic resolution, committed atomically with its operation. The `transactions` section is likewise optional and holds the atomic-transaction bindings (see below): one `{"transactionId","operations"}` record per accepted transaction, committed atomically with its operations. `version` stays `1`: the supplemented format is backward compatible, and an old file is upgraded on disk the first time a checkpoint (or any other new commit) is persisted.
+The `checkpoints` section is optional and holds sender-side replication cursors (see below); a file written before checkpoints existed contains only `version` and `operations`, and recovers with no registered checkpoints. The `policies` section is likewise optional and holds the automatic-resolution policy bindings (see below): one `{"replicaId","operationId","policy"}` record per accepted automatic resolution, committed atomically with its operation. The `transactions` section is likewise optional and holds the atomic-transaction bindings (see below): one `{"transactionId","operations"}` record per accepted transaction, committed atomically with its operations. The `acks` section is likewise optional and holds the consumption receipts (see below): one `{"peerId","ackId","cursor","operations"}` record per accepted acknowledgement, committed atomically with the checkpoint advance it caused. `version` stays `1`: the supplemented format is backward compatible, and an old file is upgraded on disk the first time a checkpoint (or any other new commit) is persisted.
 
 ### Optional bearer-token authentication
 
@@ -352,6 +352,29 @@ With `--data-file`, a new or advanced checkpoint is written to the data file in 
 - A peer that has never registered a checkpoint returns HTTP 404 with `{"error":"not_found"}`; the checkpoint GET on the same peer remains 404 in that case. On startup with `--data-file`, a recovered checkpoint cursor greater than the recovered log length is a corrupt file and makes the service refuse to start with exit code 2 before it begins listening.
 - A missing, empty (`/v1/sync/peers//operations`), or extra (`/v1/sync/peers/{peerId}/operations/extra`, a trailing slash, or a missing segment) path shape returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check.
 - Every number in the response is a JSON integer, and strings use the same escaping as the other endpoints. With `--data-file`, the checkpoints and log are rebuilt identically during recovery, so pickup results, cursor resume, and the error boundaries are identical before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
+
+#### Acknowledging consumed operations
+
+`POST /v1/sync/peers/{peerId}/acknowledge` creates a verifiable consumption receipt: the sending peer confirms, segment by segment, exactly which accepted records it consumed, and its checkpoint advances with the confirmation. The body is a JSON object with exactly three keys:
+
+```json
+{"ackId":"ack-1","cursor":2,"operations":[{"replicaId":"r1","operationId":"op-1"},{"replicaId":"r2","operationId":"op-2"}]}
+```
+
+- `{peerId}` must be a non-empty percent-decoded path segment, following the same path rules as the checkpoint and pickup routes; an empty segment (`/v1/sync/peers//acknowledge`) is a route-shape failure and returns HTTP 404 with `{"error":"not_found"}`.
+- `ackId` is a non-empty string naming the receipt. `cursor` is a non-boolean, non-negative integer. `operations` lists, in order, the identities the peer consumed: each entry is an object with exactly `replicaId` and `operationId`, both non-empty strings, and no identity may repeat. One request confirms at most 100 records.
+- Starting from the peer's registered checkpoint, `operations` must exactly cover the contiguous accepted records up to (but not including) `cursor`: `operations[i]` names the identity of the `checkpoint + i`-th accepted record, and the checkpoint plus the segment length equals `cursor`. An empty `operations` list confirms the empty segment at the current checkpoint.
+
+Malformed JSON, a non-object body, a missing or unknown key, a wrong-typed or empty identifier, a repeated identity, any query parameter, or a segment longer than 100 records all return HTTP 400 with `{"error":"invalid_request"}` and change nothing. A missing, empty, or extra path segment (for example `/v1/sync/peers/{peerId}/acknowledge/extra` or a trailing slash) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check. A peer that has never registered a checkpoint returns HTTP 404 with `{"error":"not_found"}`.
+
+- Success: HTTP 201 with exactly `{"status":"created","peerId","ackId","cursor"}` — a compact JSON object terminated by a single newline. The receipt, the checkpoint advance to `cursor`, and the `(peerId, ackId)` binding commit together.
+- The same peer replaying the same `ackId` with identical content returns HTTP 200 with `"status":"ok"` in the same response shape and appends nothing — the replay is answered from the committed binding, however the checkpoint has moved since. The same `(peerId, ackId)` with different content returns HTTP 409 with `{"error":"operation_conflict"}`; nothing changes.
+- A `cursor` below the peer's current checkpoint returns HTTP 409 with `{"error":"checkpoint_conflict"}`; nothing changes.
+- A segment that does not exactly match the accepted log — a wrong identity, a wrong record count, or a `cursor` past the log end — returns HTTP 409 with `{"error":"ack_conflict"}`; nothing changes.
+
+A receipt is not an operation. It changes neither the accepted-operation log nor sync export, the per-key audit, candidate state, or any of the six metrics counters; it is not exported by `GET /v1/sync/operations` and does not appear in audit streams. The checkpoint advance it carries is visible to the checkpoint GET, the pickup query, and the replication snapshot exactly like a checkpoint POST. Confirmation, checkpoint advancement, and binding are one commit under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so a concurrent reader always sees either the old or the new complete state, never half a receipt.
+
+With `--data-file`, the receipt and the advanced checkpoint are written to the data file in the same atomic commit protocol (`write temp file → fsync → rename → fsync directory`) before the HTTP 201; receipts live in the optional `acks` section, one `{"peerId","ackId","cursor","operations"}` record per accepted receipt. A durable failure returns HTTP 500 `{"error":"internal_error"}` and leaves memory, the checkpoint, the bindings, and the file exactly as they were — the request is safely retryable. A version:1 file written before receipts existed (without the `acks` section) recovers with no receipt bindings and otherwise unchanged semantics; after a restart the create `201`, replay `200`, and conflict `409` decisions are identical to a process that never restarted. The endpoint shares the common request contract: Content-Length is validated before authentication (400/413 first), an invalid or missing bearer token returns HTTP 401 `{"error":"unauthorized"}` without reading the body, and `/health` stays anonymous.
 
 ### Per-key operation audit
 

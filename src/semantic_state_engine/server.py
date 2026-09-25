@@ -740,6 +740,79 @@ def parse_checkpoint_payload(raw: bytes | str | dict[str, Any]) -> int:
     return cursor
 
 
+ACK_MAX_OPERATIONS = 100
+
+
+def _parse_ack_operations(raw: Any) -> list[dict[str, str]]:
+    """Validate the identity list of an acknowledge request.
+
+    ``operations`` records, in order, the identities the peer consumed: a
+    list of at most ``ACK_MAX_OPERATIONS`` entries, each an object with
+    exactly ``replicaId`` and ``operationId`` (both non-empty strings) and
+    no repeated identity. An empty list acknowledges the empty segment at
+    the peer's checkpoint. Raises ValueError on any violation.
+    """
+    if not isinstance(raw, list) or len(raw) > ACK_MAX_OPERATIONS:
+        raise ValueError("operations must be a list of at most 100 identities")
+    operations: list[dict[str, str]] = []
+    identities: set[tuple[str, str]] = set()
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {"replicaId", "operationId"}:
+            raise ValueError("each operation must have only replicaId and operationId")
+        replica_id = entry["replicaId"]
+        operation_id = entry["operationId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise ValueError("replicaId must be a non-empty string")
+        if not isinstance(operation_id, str) or operation_id == "":
+            raise ValueError("operationId must be a non-empty string")
+        identity = (replica_id, operation_id)
+        if identity in identities:
+            raise ValueError(f"duplicate identity {identity!r}")
+        identities.add(identity)
+        operations.append({"replicaId": replica_id, "operationId": operation_id})
+    return operations
+
+
+def parse_acknowledge_payload(raw: bytes | str | dict[str, Any]) -> tuple[str, int, list[dict[str, str]]]:
+    """Parse and validate a consumption-acknowledgement body.
+
+    The body must be a JSON object with exactly ``ackId`` (a non-empty
+    string), ``cursor`` (a non-boolean non-negative integer), and
+    ``operations`` (the ordered identities the peer consumed, see
+    :func:`_parse_ack_operations`). Returns the normalized
+    ``(ack_id, cursor, operations)`` triple. The segment check against the
+    peer's checkpoint and the accepted log is left to the store, because it
+    is only meaningful against a committed snapshot. Raises ValueError on
+    any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            payload: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or set(payload.keys()) != {
+        "ackId",
+        "cursor",
+        "operations",
+    }:
+        raise ValueError("body must be an object with only ackId, cursor, operations")
+    ack_id = payload["ackId"]
+    if not isinstance(ack_id, str) or ack_id == "":
+        raise ValueError("ackId must be a non-empty string")
+    cursor = payload["cursor"]
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+        raise ValueError("cursor must be a non-negative integer")
+    operations = _parse_ack_operations(payload["operations"])
+    return ack_id, cursor, operations
+
+
 def _escape_digest_string(value: str) -> str:
     """Escape a string for the canonical verification-digest input.
 
@@ -1152,6 +1225,80 @@ def _validate_stored_transactions(
     return transactions
 
 
+def _validate_stored_acks(
+    document: Any,
+    checkpoints: dict[str, int],
+    records: list[tuple[str, dict[str, Any]]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Validate the optional ``acks`` section of a data file.
+
+    Returns a clean ``{(peerId, ackId): {"cursor", "operations"}}``
+    mapping. The section is optional (a version:1 file written before
+    consumption receipts existed simply has none, and recovers with no
+    receipt bindings); when present it must be a list of
+    ``{"peerId", "ackId", "cursor", "operations"}`` records satisfying the
+    live acknowledge constraints, one per ``(peerId, ackId)`` pair. Because
+    a receipt is committed atomically with the checkpoint advance it
+    caused, every binding must name a registered peer whose checkpoint has
+    reached at least the binding's cursor, and the covered segment must
+    match the accepted log exactly — anything else is a corrupt file.
+    """
+    if "acks" not in document:
+        return {}
+    raw = document["acks"]
+    if not isinstance(raw, list):
+        raise PersistenceError("data file acks must be a list")
+    acks: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {
+            "peerId",
+            "ackId",
+            "cursor",
+            "operations",
+        }:
+            raise PersistenceError(
+                "each ack record must be an object with peerId, ackId, cursor, operations"
+            )
+        peer_id = entry["peerId"]
+        ack_id = entry["ackId"]
+        cursor = entry["cursor"]
+        if not isinstance(peer_id, str) or peer_id == "":
+            raise PersistenceError("ack peerId must be a non-empty string")
+        if not isinstance(ack_id, str) or ack_id == "":
+            raise PersistenceError("ackId must be a non-empty string")
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise PersistenceError("ack cursor must be a non-negative integer")
+        try:
+            operations = _parse_ack_operations(entry["operations"])
+        except ValueError as exc:
+            raise PersistenceError(
+                f"stored ack violates input constraints: {exc}"
+            ) from exc
+        key = (peer_id, ack_id)
+        if key in acks:
+            raise PersistenceError(f"duplicate ack binding {key!r} in data file")
+        registered = checkpoints.get(peer_id)
+        if registered is None or registered < cursor:
+            raise PersistenceError(
+                f"ack binding {key!r} names a peer whose checkpoint has not reached it"
+            )
+        start = cursor - len(operations)
+        if start < 0 or cursor > len(records):
+            raise PersistenceError(
+                f"ack binding {key!r} covers a segment outside the accepted log"
+            )
+        for (replica_id, operation), identity in zip(records[start:cursor], operations):
+            if (
+                replica_id != identity["replicaId"]
+                or operation["operationId"] != identity["operationId"]
+            ):
+                raise PersistenceError(
+                    f"ack binding {key!r} does not match the accepted log segment"
+                )
+        acks[key] = {"cursor": cursor, "operations": operations}
+    return acks
+
+
 def _load_data_file_complete(
     path: str,
 ) -> tuple[
@@ -1159,18 +1306,20 @@ def _load_data_file_complete(
     dict[str, int],
     dict[tuple[str, str], str],
     dict[str, list[dict[str, Any]]],
+    dict[tuple[str, str], dict[str, Any]],
 ]:
     """Read and strictly validate a data file, returning every section.
 
     Returns the accepted operations in their original commit order, the
     persisted ``{peerId: cursor}`` checkpoints, the persisted
     ``{(replicaId, operationId): policy}`` automatic-resolution policy
-    bindings, and the persisted ``{transactionId: entries}`` transaction
-    bindings (each empty for a version:1 file written before that section
+    bindings, the persisted ``{transactionId: entries}`` transaction
+    bindings, and the persisted ``{(peerId, ackId): receipt}`` consumption
+    receipts (each empty for a version:1 file written before that section
     existed). Raises PersistenceError when the file is missing-readable,
     not UTF-8 JSON, has an unexpected structure, or contains records,
-    checkpoints, policy bindings, or transaction bindings violating the
-    live constraints.
+    checkpoints, policy bindings, transaction bindings, or receipts
+    violating the live constraints.
     """
     try:
         with open(path, "rb") as handle:
@@ -1190,10 +1339,11 @@ def _load_data_file_complete(
         "checkpoints",
         "policies",
         "transactions",
+        "acks",
     } or "version" not in document or "operations" not in document:
         raise PersistenceError(
             "data file root must be an object with version and operations "
-            "and optionally checkpoints, policies, and transactions"
+            "and optionally checkpoints, policies, transactions, and acks"
         )
     version = document["version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != DATA_FORMAT_VERSION:
@@ -1214,7 +1364,8 @@ def _load_data_file_complete(
     checkpoints = _validate_stored_checkpoints(document, len(records))
     policies = _validate_stored_policies(document, identities)
     transactions = _validate_stored_transactions(document, identities)
-    return records, checkpoints, policies, transactions
+    acks = _validate_stored_acks(document, checkpoints, records)
+    return records, checkpoints, policies, transactions, acks
 
 
 def load_data_file_full(
@@ -1226,13 +1377,13 @@ def load_data_file_full(
     persisted ``{peerId: cursor}`` checkpoints, and the persisted
     ``{(replicaId, operationId): policy}`` automatic-resolution policy
     bindings (both empty for a version:1 file written before those sections
-    existed). Persisted transaction bindings are validated the same way but
-    not returned here. Raises PersistenceError when the file is
-    missing-readable, not UTF-8 JSON, has an unexpected structure, or
-    contains records, checkpoints, or policy bindings violating the live
-    constraints.
+    existed). Persisted transaction bindings and consumption receipts are
+    validated the same way but not returned here. Raises PersistenceError
+    when the file is missing-readable, not UTF-8 JSON, has an unexpected
+    structure, or contains records, checkpoints, or policy bindings
+    violating the live constraints.
     """
-    records, checkpoints, policies, _ = _load_data_file_complete(path)
+    records, checkpoints, policies, _, _ = _load_data_file_complete(path)
     return records, checkpoints, policies
 
 
@@ -1243,8 +1394,20 @@ def load_data_file_transactions(path: str) -> dict[str, list[dict[str, Any]]]:
     only need the persisted ``{transactionId: entries}`` bindings; every
     other section is validated the same way but not returned.
     """
-    _, _, _, transactions = _load_data_file_complete(path)
+    _, _, _, transactions, _ = _load_data_file_complete(path)
     return transactions
+
+
+def load_data_file_acks(path: str) -> dict[tuple[str, str], dict[str, Any]]:
+    """Read and strictly validate a data file, returning its receipts.
+
+    Thin wrapper over :func:`_load_data_file_complete` for callers that
+    only need the persisted ``{(peerId, ackId): receipt}`` consumption
+    receipts; every other section is validated the same way but not
+    returned.
+    """
+    _, _, _, _, acks = _load_data_file_complete(path)
+    return acks
 
 
 def load_data_file(path: str) -> list[tuple[str, dict[str, Any]]]:
@@ -1265,12 +1428,13 @@ def ensure_data_file(
     dict[str, int],
     dict[tuple[str, str], str],
     dict[str, list[dict[str, Any]]],
+    dict[tuple[str, str], dict[str, Any]],
 ]:
     """Validate the data-file location and return its committed state.
 
     A missing target file is accepted (its parent directory must exist and
     be writable); an existing target must be a regular, parseable data
-    file. Returns ``(records, checkpoints, policies, transactions)``.
+    file. Returns ``(records, checkpoints, policies, transactions, acks)``.
     Anything else raises PersistenceError.
     """
     parent = os.path.dirname(os.path.abspath(path))
@@ -1286,7 +1450,7 @@ def ensure_data_file(
         if not stat.S_ISREG(mode):
             raise PersistenceError(f"data file path is not a regular file: {path!r}")
         return _load_data_file_complete(path)
-    return [], {}, {}, {}
+    return [], {}, {}, {}, {}
 
 
 def _fsync_directory(directory: str) -> None:
@@ -1496,6 +1660,12 @@ class StateStore:
         # is local to this replica: it is persisted with its operations but
         # never exported by sync.
         self._transactions: dict[str, list[dict[str, Any]]] = {}
+        # Consumption receipts of accepted acknowledgements, keyed by
+        # ``(peerId, ackId)`` and holding the bound ``{"cursor",
+        # "operations"}`` content. A receipt is not an operation: it never
+        # touches the accepted log, and it is committed atomically with the
+        # checkpoint advance it caused.
+        self._acks: dict[tuple[str, str], dict[str, Any]] = {}
         self._data_file: str | None = None
         if data_file is not None:
             path = os.path.abspath(data_file)
@@ -1503,13 +1673,14 @@ class StateStore:
             # file is never touched by the probe and is opened only for
             # reading afterwards.
             preflight_data_file_directory(path)
-            records, checkpoints, policies, transactions = ensure_data_file(path)
+            records, checkpoints, policies, transactions, acks = ensure_data_file(path)
             with self._lock:
                 for replica_id, operation in records:
                     self._commit_locked(replica_id, operation)
                 self._checkpoints = dict(checkpoints)
                 self._policies = dict(policies)
                 self._transactions = dict(transactions)
+                self._acks = dict(acks)
                 self._data_file = path
                 if not records and not os.path.exists(path):
                     # The target is missing and the preflight proved the
@@ -1581,6 +1752,20 @@ class StateStore:
             "transactions": [
                 {"transactionId": transaction_id, "operations": entries}
                 for transaction_id, entries in self._transactions.items()
+            ],
+            # Consumption receipts ride along in commit order, so each
+            # binding is durable in the same atomic commit as the
+            # checkpoint advance it caused. A receipt is not an operation:
+            # it is never part of the accepted log or the exported sync
+            # records.
+            "acks": [
+                {
+                    "peerId": peer_id,
+                    "ackId": ack_id,
+                    "cursor": receipt["cursor"],
+                    "operations": receipt["operations"],
+                }
+                for (peer_id, ack_id), receipt in self._acks.items()
             ],
         }
         data = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -2522,6 +2707,90 @@ class StateStore:
             else:
                 self._checkpoints[peer_id] = cursor
             return HTTPStatus.OK, None
+
+    def acknowledge_operations(
+        self, peer_id: str, ack_id: str, cursor: int, operations: list[dict[str, str]]
+    ) -> tuple[HTTPStatus, str | None]:
+        """Commit a verifiable consumption receipt for ``peer_id``.
+
+        A receipt is not an operation: it never touches the accepted log,
+        the identity index, the candidate state, sync export, the per-key
+        audit, or the metrics counters. It shares their commit lock,
+        however, so validating the segment against the accepted log,
+        advancing the peer's checkpoint, and recording the
+        ``(peerId, ackId)`` binding are one indivisible commit: a
+        concurrent reader sees either the old or the new checkpoint and
+        binding, never a half state.
+
+        The receipt must exactly cover the contiguous accepted records from
+        the peer's registered checkpoint up to (but not including)
+        ``cursor``: ``operations[i]`` must name the identity of the
+        ``checkpoint + i``-th accepted record, and the checkpoint plus the
+        segment length must equal ``cursor``.
+
+        Returns ``(status, error)``: 201 with ``error=None`` when the
+        receipt is newly committed (the checkpoint advanced to ``cursor``),
+        or 200 with ``error=None`` when the same ``(peerId, ackId)`` is
+        replayed with identical content (answered from the committed
+        binding without re-checking the current state, and appending
+        nothing). 404 with ``"not_found"`` when the peer never registered a
+        checkpoint; 409 with ``"operation_conflict"`` when the
+        ``(peerId, ackId)`` binding exists with different content; 409 with
+        ``"checkpoint_conflict"`` when ``cursor`` is below the peer's
+        current checkpoint; 409 with ``"ack_conflict"`` when the segment
+        does not exactly match the accepted log. Raises PersistenceError
+        when the durable commit fails, in which case memory, the
+        checkpoint, the bindings, and the file are unchanged and the
+        request can be retried.
+        """
+        with self._lock:
+            current = self._checkpoints.get(peer_id)
+            if current is None:
+                return HTTPStatus.NOT_FOUND, "not_found"
+            binding = self._acks.get((peer_id, ack_id))
+            if binding is not None:
+                if binding["cursor"] == cursor and binding["operations"] == operations:
+                    # Identical replay: answer from the committed binding,
+                    # however the checkpoint has moved since.
+                    return HTTPStatus.OK, None
+                return HTTPStatus.CONFLICT, "operation_conflict"
+            if cursor < current:
+                return HTTPStatus.CONFLICT, "checkpoint_conflict"
+            # The covered segment is accepted[current:cursor]; it must
+            # exist in the log and match the acknowledged identities
+            # exactly, in order. The cursor must agree with the segment
+            # length, so a receipt can never advance the checkpoint past
+            # the accepted log.
+            if cursor - current != len(operations):
+                return HTTPStatus.CONFLICT, "ack_conflict"
+            segment = self._accepted[current:cursor]
+            if len(segment) != len(operations) or any(
+                replica_id != identity["replicaId"]
+                or operation["operationId"] != identity["operationId"]
+                for (replica_id, operation), identity in zip(segment, operations)
+            ):
+                return HTTPStatus.CONFLICT, "ack_conflict"
+            receipt = {
+                "cursor": cursor,
+                "operations": [dict(identity) for identity in operations],
+            }
+            if self._data_file is not None:
+                # Same commit discipline as checkpoints: stage the advanced
+                # cursor and the new binding, make the atomic rename the
+                # single commit point, and move the visible state only
+                # after it succeeds.
+                self._checkpoints[peer_id] = cursor
+                self._acks[(peer_id, ack_id)] = receipt
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    self._checkpoints[peer_id] = current
+                    del self._acks[(peer_id, ack_id)]
+                    raise
+            else:
+                self._checkpoints[peer_id] = cursor
+                self._acks[(peer_id, ack_id)] = receipt
+            return HTTPStatus.CREATED, None
 
     def get_operation(
         self, replica_id: str, operation_id: str
@@ -3560,6 +3829,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             return False, ""
         return True, unquote(parts[4])
 
+    def _acknowledge_route(self) -> tuple[bool, str]:
+        """Match ``/v1/sync/peers/{peerId}/acknowledge`` on the raw path.
+
+        Returns ``(matched, peer_id)``. As with :meth:`_checkpoint_route`,
+        the empty segment of ``/v1/sync/peers//acknowledge`` is preserved
+        so the shape still matches and yields an empty ``peer_id``; the
+        acknowledge contract treats an empty peer id exactly like a shape
+        failure (404), so the handler rejects it before any query check.
+        Any other segment count — missing segments, extra segments such as
+        ``.../acknowledge/extra``, or a trailing slash — falls through to
+        the generic 404.
+        """
+        parts = urlsplit(self.path).path.split("/")
+        if len(parts) != 6:
+            return False, ""
+        if parts[1:4] != ["v1", "sync", "peers"] or parts[5] != "acknowledge":
+            return False, ""
+        return True, unquote(parts[4])
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path == "/health":
             # The health probe stays anonymous even when auth is enabled.
@@ -3787,6 +4075,55 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(status, {"error": error})
             return
         self._json(status, {"peerId": peer_id, "cursor": cursor})
+
+    def _handle_acknowledge_post(self, peer_id: str) -> None:
+        # Route-shape matching ran first in do_POST (missing/extra segments
+        # and trailing slashes never reach here); an empty peer id is a
+        # shape failure and stays 404 even when the query is malformed.
+        if peer_id == "":
+            self._json_canonical_newline(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        # The route accepts no query parameters; any parameter — repeated,
+        # blank-named, or blank-valued — is an invalid request.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            ack_id, cursor, operations = parse_acknowledge_payload(raw)
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        try:
+            status, error = self._store.acknowledge_operations(
+                peer_id, ack_id, cursor, operations
+            )
+        except PersistenceError:
+            self._json_canonical_newline(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+            )
+            return
+        if status is HTTPStatus.NOT_FOUND:
+            self._json_canonical_newline(status, {"error": "not_found"})
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json_canonical_newline(status, {"error": error})
+            return
+        self._json_canonical_newline(
+            status,
+            {
+                "status": "created" if status is HTTPStatus.CREATED else "ok",
+                "peerId": peer_id,
+                "ackId": ack_id,
+                "cursor": cursor,
+            },
+        )
 
     def _handle_metrics_get(self) -> None:
         if not parse_metrics_query(urlsplit(self.path).query):
@@ -4235,6 +4572,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
+        matched_ack, acknowledge_peer = self._acknowledge_route()
         segments = self._path_segments()
         is_operation_post = (
             len(segments) == 4
@@ -4276,6 +4614,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
         if (
             matched
+            or matched_ack
             or is_operation_post
             or is_resolve_post
             or is_auto_resolve_post
@@ -4301,6 +4640,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if matched:
             self._handle_checkpoint_post(checkpoint_peer)
+            return
+        if matched_ack:
+            self._handle_acknowledge_post(acknowledge_peer)
             return
         if is_operation_post:
             replica_id = segments[2]
