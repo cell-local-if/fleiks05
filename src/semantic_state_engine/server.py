@@ -845,23 +845,25 @@ def _escape_digest_string(value: str) -> str:
     return '"' + "".join(escaped) + '"'
 
 
-def _canonical_json_bytes(value: Any) -> bytes:
-    """Serialize a response payload to canonical compact UTF-8 JSON.
+def _emit_compact_json(value: Any, *, sort_keys: bool) -> bytes:
+    """Serialize a payload to compact UTF-8 JSON with strict escaping.
 
-    Objects are emitted with their keys sorted lexicographically (Unicode
-    code point order), arrays in order, and no insignificant whitespace
+    Arrays are emitted in order and no insignificant whitespace appears
     anywhere. Strings escape only the quote, the backslash, and control
     characters (U+0000-U+001F, always as ``\\u00XX`` with lowercase hex) —
     every other code point is written literally. Integers are emitted as
     plain JSON integers (booleans as ``true``/``false``); no float,
     negative zero, or non-finite value can appear because the store only
-    ever holds validated integers.
+    ever holds validated integers. Object keys are sorted lexicographically
+    (Unicode code point order) when ``sort_keys`` is true, and kept in
+    their insertion order otherwise.
     """
 
     def emit(item: Any, parts: list[str]) -> None:
         if isinstance(item, dict):
             parts.append("{")
-            for index, name in enumerate(sorted(item)):
+            names = sorted(item) if sort_keys else list(item)
+            for index, name in enumerate(names):
                 if index:
                     parts.append(",")
                 parts.append(_escape_digest_string(name))
@@ -891,6 +893,27 @@ def _canonical_json_bytes(value: Any) -> bytes:
     parts: list[str] = []
     emit(value, parts)
     return "".join(parts).encode("utf-8")
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    """Serialize a response payload to canonical compact UTF-8 JSON.
+
+    Objects are emitted with their keys sorted lexicographically (Unicode
+    code point order); otherwise identical to :func:`_emit_compact_json`.
+    """
+    return _emit_compact_json(value, sort_keys=True)
+
+
+def _ordered_json_bytes(value: Any) -> bytes:
+    """Serialize a response payload to compact UTF-8 JSON in field order.
+
+    Same encoding rules as :func:`_canonical_json_bytes` — no insignificant
+    whitespace, strings escaping only the quote, the backslash, and control
+    characters, and every number a plain JSON integer — but object fields
+    keep their insertion order instead of being sorted, for endpoints whose
+    contract fixes the field order of the response.
+    """
+    return _emit_compact_json(value, sort_keys=False)
 
 
 def _verification_digest_input(candidates: dict[str, list[dict[str, Any]]]) -> bytes:
@@ -4219,7 +4242,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
             )
             return
-        self._json_canonical_newline(status, payload)
+        # The receipts contract fixes the response field order (receipts,
+        # nextCursor, hasMore, algorithm, digest, receiptsCount; peerId,
+        # ackId, cursor, operations per receipt; replicaId, operationId per
+        # identity), so the body is emitted in the payload's field order
+        # rather than sorted.
+        self._json_ordered_newline(status, payload)
 
     def _handle_checkpoint_post(self, peer_id: str) -> None:
         if peer_id == "":
@@ -4322,6 +4350,21 @@ class RequestHandler(BaseHTTPRequestHandler):
         the body and its declared length.
         """
         body = _canonical_json_bytes(payload) + b"\n"
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json_ordered_newline(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        """Respond with compact JSON in the payload's field order, newline-terminated.
+
+        The body is serialized by :func:`_ordered_json_bytes`: object fields
+        keep their insertion order (the endpoint's contracted field order),
+        with the same escaping, integer-only numbers, and single trailing
+        ``\\n`` as :meth:`_json_canonical_newline`.
+        """
+        body = _ordered_json_bytes(payload) + b"\n"
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

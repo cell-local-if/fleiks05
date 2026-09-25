@@ -454,17 +454,25 @@ class HttpPeerReceiptsTests(unittest.TestCase):
         self.assertEqual(
             raw,
             (
-                '{"algorithm":"sha256","digest":"%s","hasMore":false,'
-                '"nextCursor":1,"receipts":[{"ackId":"ack-1","cursor":1,'
-                '"operations":[{"operationId":"o1","replicaId":"r1"}],'
-                '"peerId":"peer-a"}],"receiptsCount":1}\n' % digest
+                '{"receipts":[{"peerId":"peer-a","ackId":"ack-1","cursor":1,'
+                '"operations":[{"replicaId":"r1","operationId":"o1"}]}],'
+                '"nextCursor":1,"hasMore":false,"algorithm":"sha256",'
+                '"digest":"%s","receiptsCount":1}\n' % digest
             ).encode("utf-8"),
         )
-        # Exactly the six contracted fields.
+        # Exactly the six contracted fields, in the contracted order.
         payload = json.loads(raw.decode("utf-8"))
         self.assertEqual(
-            set(payload),
-            {"receipts", "nextCursor", "hasMore", "algorithm", "digest", "receiptsCount"},
+            list(payload),
+            ["receipts", "nextCursor", "hasMore", "algorithm", "digest", "receiptsCount"],
+        )
+        self.assertEqual(
+            list(payload["receipts"][0]),
+            ["peerId", "ackId", "cursor", "operations"],
+        )
+        self.assertEqual(
+            list(payload["receipts"][0]["operations"][0]),
+            ["replicaId", "operationId"],
         )
 
     def test_empty_receipt_set(self) -> None:
