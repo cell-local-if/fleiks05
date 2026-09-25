@@ -768,6 +768,30 @@ def parse_checkpoint_payload(raw: bytes | str | dict[str, Any]) -> int:
 ACK_MAX_OPERATIONS = 100
 
 
+def parse_scope_policy_reload_payload(raw: bytes | str | dict[str, Any]) -> None:
+    """Validate the scope-policy reload body, which must be an empty object.
+
+    The reload never takes anything from the request — the same startup
+    file is always reread — so the only accepted body is exactly ``{}``:
+    valid UTF-8 JSON whose document is an object with no keys. Malformed
+    JSON, a non-object document, and any unknown field raise ValueError.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            payload: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or payload:
+        raise ValueError("body must be an empty object")
+
+
 def _parse_ack_operations(raw: Any) -> list[dict[str, str]]:
     """Validate the identity list of an acknowledge request.
 
@@ -1315,34 +1339,63 @@ class ScopePolicyError(Exception):
     """
 
 
-def load_scope_policy(path: str) -> dict[str, frozenset[str]]:
+class ScopePolicyUnavailable(ScopePolicyError):
+    """Raised when the scope policy file itself cannot provide content.
+
+    The target is missing, unreadable, not a regular file, or a read
+    faults. A hot reload maps this to HTTP 503 ``policy_unavailable``
+    without changing the live policy.
+    """
+
+
+class ScopePolicyConflict(ScopePolicyError):
+    """Raised when readable policy content fails the policy constraints.
+
+    The file is a readable regular file but its bytes are not a complete
+    valid UTF-8 JSON object satisfying the token and scope rules. A hot
+    reload maps this to HTTP 409 ``policy_conflict`` and leaves the old
+    permission mapping fully in force.
+    """
+
+
+def read_scope_policy_file(path: str) -> tuple[bytes, dict[str, frozenset[str]]]:
     """Read and strictly validate the token-to-scopes policy file.
 
-    The target must be a readable regular UTF-8 JSON file whose whole
-    content is one JSON object: every key is a non-empty ASCII printable
-    token (bytes 0x21-0x7E, no whitespace) and every value is a non-empty
-    array containing only the scopes ``"read"``, ``"write"``, and
-    ``"admin"`` without repetition. A missing, unreadable, or non-regular
-    target, malformed or incomplete JSON, a non-object document, a
-    duplicate token key, an illegal token, or an unknown/empty/duplicated
-    scope value raises ScopePolicyError; the error never echoes the file's
-    tokens or contents.
+    Shares the exact startup contract of :func:`load_scope_policy` but
+    returns the file's raw bytes alongside the validated mapping, and
+    classifies every failure:
+
+    - a missing, unreadable, or non-regular target, or a read fault,
+      raises :class:`ScopePolicyUnavailable`;
+    - readable content that is not complete valid UTF-8 JSON, is not an
+      object, repeats a token key, or carries an illegal token or an
+      unknown/empty/duplicated scope value raises
+      :class:`ScopePolicyConflict`.
+
+    Neither the configured tokens nor their scopes are ever included in
+    an error message.
     """
     try:
         mode = os.stat(path).st_mode
     except OSError as exc:
-        raise ScopePolicyError(f"cannot access scope policy file {path!r}: {exc}") from exc
+        raise ScopePolicyUnavailable(
+            f"cannot access scope policy file {path!r}: {exc}"
+        ) from exc
     if not stat.S_ISREG(mode):
-        raise ScopePolicyError(f"scope policy path is not a regular file: {path!r}")
+        raise ScopePolicyUnavailable(
+            f"scope policy path is not a regular file: {path!r}"
+        )
     try:
         with open(path, "rb") as handle:
             raw = handle.read()
     except OSError as exc:
-        raise ScopePolicyError(f"cannot read scope policy file {path!r}: {exc}") from exc
+        raise ScopePolicyUnavailable(
+            f"cannot read scope policy file {path!r}: {exc}"
+        ) from exc
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ScopePolicyError("scope policy file must be UTF-8 JSON") from exc
+        raise ScopePolicyConflict("scope policy file must be UTF-8 JSON") from exc
 
     def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
         document: dict[Any, Any] = {}
@@ -1355,30 +1408,46 @@ def load_scope_policy(path: str) -> dict[str, frozenset[str]]:
     try:
         document = json.loads(text, object_pairs_hook=reject_duplicate_keys)
     except json.JSONDecodeError as exc:
-        raise ScopePolicyError("scope policy file must be one complete, valid JSON document") from exc
+        raise ScopePolicyConflict(
+            "scope policy file must be one complete, valid JSON document"
+        ) from exc
     except ValueError as exc:
-        raise ScopePolicyError("scope policy must not repeat a token key") from exc
+        raise ScopePolicyConflict("scope policy must not repeat a token key") from exc
     if not isinstance(document, dict):
-        raise ScopePolicyError("scope policy must be a JSON object mapping tokens to scope arrays")
+        raise ScopePolicyConflict(
+            "scope policy must be a JSON object mapping tokens to scope arrays"
+        )
 
     policy: dict[str, frozenset[str]] = {}
     for token, scope_list in document.items():
         if not isinstance(token, str) or not token or any(
             ord(char) < 0x21 or ord(char) > 0x7E for char in token
         ):
-            raise ScopePolicyError(
+            raise ScopePolicyConflict(
                 "scope policy tokens must be non-empty ASCII printable strings without whitespace"
             )
         if not isinstance(scope_list, list) or not scope_list:
-            raise ScopePolicyError("each scope policy value must be a non-empty array")
+            raise ScopePolicyConflict("each scope policy value must be a non-empty array")
         scopes: set[str] = set()
         for scope in scope_list:
             if not isinstance(scope, str) or scope not in ALLOWED_SCOPES:
-                raise ScopePolicyError("each scope must be one of read, write, admin")
+                raise ScopePolicyConflict("each scope must be one of read, write, admin")
             if scope in scopes:
-                raise ScopePolicyError("scope arrays must not repeat a scope")
+                raise ScopePolicyConflict("scope arrays must not repeat a scope")
             scopes.add(scope)
         policy[token] = frozenset(scopes)
+    return raw, policy
+
+
+def load_scope_policy(path: str) -> dict[str, frozenset[str]]:
+    """Read and strictly validate the token-to-scopes policy file.
+
+    Thin startup wrapper over :func:`read_scope_policy_file` that discards
+    the raw bytes; both failure classifications remain
+    :class:`ScopePolicyError` subclasses, so a rejected file fails startup
+    exactly as before and never echoes the file's tokens or contents.
+    """
+    _, policy = read_scope_policy_file(path)
     return policy
 
 
@@ -4151,6 +4220,7 @@ class SemanticStateServer(ThreadingHTTPServer):
         store: StateStore | None = None,
         auth_token: str | None = None,
         auth_scopes: dict[str, frozenset[str]] | None = None,
+        scope_policy_file: str | None = None,
     ) -> None:
         # Build (and thus preflight/recover) the store before binding and
         # listening, so a rejected data file fails startup before any port is
@@ -4166,6 +4236,48 @@ class SemanticStateServer(ThreadingHTTPServer):
         # when authentication is disabled. Like the single token, the policy
         # is never written to the data file or any log.
         self.auth_scopes = auth_scopes
+        # The startup-configured scope policy file, or None unless the
+        # service is running in scope-policy mode. A reload always rereads
+        # this exact path; a request can never name another file. When set,
+        # auth_scopes is the validated policy loaded from it at startup.
+        self.scope_policy_file = (
+            os.path.abspath(scope_policy_file) if scope_policy_file is not None else None
+        )
+        # Serializes hot reloads as whole commits: the file is read,
+        # validated, and the policy reference replaced while holding this
+        # one lock, so concurrent reloads commit strictly one after
+        # another. Authentication never takes this lock — it only
+        # snapshots the policy reference — so in-flight requests keep
+        # deciding against the mapping they authenticated under while a
+        # reload swaps in the new mapping atomically.
+        self._scope_policy_lock = threading.Lock()
+
+    def reload_scope_policy(self) -> dict[str, Any]:
+        """Atomically reread and replace the live scope policy.
+
+        The same file given at startup is reread in full and validated
+        against the exact startup token and scope constraints; the file
+        is only read, never written, moved, or replaced, and no temporary
+        file is created. Concurrent reloads run as one complete commit
+        each under the reload lock, and the policy reference is replaced
+        in a single assignment, so every request observes either the old
+        or the new whole mapping — never a partial one.
+
+        Returns ``{"status": "reloaded", "policyDigest": digest,
+        "tokens": n}`` where the digest is the SHA-256 of the file's raw
+        UTF-8 bytes as 64 lowercase hexadecimal characters and ``n`` is
+        the number of token entries. Raises
+        :class:`ScopePolicyUnavailable` when the file itself cannot
+        provide content or :class:`ScopePolicyConflict` when readable
+        content fails validation; on either failure the live policy
+        stays exactly as it was.
+        """
+        assert self.scope_policy_file is not None
+        with self._scope_policy_lock:
+            raw, policy = read_scope_policy_file(self.scope_policy_file)
+            digest = hashlib.sha256(raw).hexdigest()
+            self.auth_scopes = policy
+        return {"status": "reloaded", "policyDigest": digest, "tokens": len(policy)}
 
 
 _FALLBACK_STORE = StateStore()
@@ -4250,6 +4362,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return True, frozenset(ALLOWED_SCOPES)
                 else:
                     assert policy is not None
+                    # Snapshot the whole mapping for this decision. A hot
+                    # reload replaces the server attribute atomically, so a
+                    # request that authenticated against the old policy keeps
+                    # executing with its old scopes even when a reload lands
+                    # mid-request; a later request simply reads the new
+                    # reference.
                     for configured_token, granted_scopes in policy.items():
                         if hmac.compare_digest(credential, configured_token.encode("ascii")):
                             return True, granted_scopes
@@ -5190,6 +5308,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_scope_policy_reload_post(self) -> None:
+        # Mode, body size, authentication, and the admin scope were all
+        # enforced in do_POST before reaching here; the path shape (missing
+        # or extra segments, trailing slash) matched exactly. Query
+        # validation comes next and wins over body validation: any query
+        # parameter is 400 on this route however the body is shaped.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            parse_scope_policy_reload_payload(raw)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            payload = self.server.reload_scope_policy()
+        except ScopePolicyUnavailable:
+            # The file itself cannot provide its content (missing,
+            # unreadable, not a regular file, or a read fault). The old
+            # policy is untouched and keeps serving every request.
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "policy_unavailable"})
+            return
+        except ScopePolicyConflict:
+            # The file is readable but its content is not a legal policy.
+            # The old permission mapping stays fully in force.
+            self._json(HTTPStatus.CONFLICT, {"error": "policy_conflict"})
+            return
+        self._json(HTTPStatus.OK, payload)
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
         matched_ack, acknowledge_peer = self._acknowledge_route()
@@ -5232,6 +5382,34 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "transactions"
             and segments[2] == "apply"
         )
+        is_scope_policy_reload_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "scope-policy"
+            and segments[3] == "reload"
+        )
+        if is_scope_policy_reload_post:
+            # The reload route exists only in scope-policy mode; in every
+            # other mode the path is just not published, so a correctly
+            # shaped request gets a flat 404 before any body or credential
+            # is inspected.
+            if getattr(self.server, "scope_policy_file", None) is None:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            # In scope mode the route keeps the shared POST body-size
+            # contract: a malformed Content-Length (400) or an over-limit
+            # declaration (413) is answered before authentication, and the
+            # admin-scope check then runs before the body is read, the
+            # query is inspected, or the policy file is touched. Routing
+            # shape (missing/extra segments, trailing slash) never reaches
+            # here; those paths fall through like every unknown POST.
+            if self._validate_declared_length() is None:
+                return
+            if not self._require_scope(SCOPE_ADMIN):
+                return
+            self._handle_scope_policy_reload_post()
+            return
         if (
             matched
             or matched_ack
@@ -5386,6 +5564,7 @@ def main(argv: list[str] | None = None) -> None:
         store=store,
         auth_token=auth_token,
         auth_scopes=auth_scopes,
+        scope_policy_file=args.scope_policy_file,
     )
     try:
         server.serve_forever()
