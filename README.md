@@ -22,7 +22,7 @@ Unknown routes return HTTP 404 with `{"error":"not_found"}`. Responses use UTF-8
 
 ### Request body limits
 
-All nine POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/resolve/auto/plan`, `POST /v1/sync/peers/{peerId}/checkpoint`, `POST /v1/sync/peers/{peerId}/acknowledge`, `POST /v1/transactions/apply`) share one body-size contract:
+All ten POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/resolve/auto/plan`, `POST /v1/states/{key}/causal-at`, `POST /v1/sync/peers/{peerId}/checkpoint`, `POST /v1/sync/peers/{peerId}/acknowledge`, `POST /v1/transactions/apply`) share one body-size contract:
 
 - The request body is limited to **1,048,576 raw UTF-8 bytes** (1 MiB). A body whose declared length is exactly the limit is processed by the normal endpoint semantics.
 - `Content-Length` is required and validated before anything else. It must be a plain ASCII decimal integer: a missing header, an empty value, a sign, whitespace, a negative number, non-ASCII digits, or multiple headers declaring conflicting lengths all return HTTP 400 with `{"error":"invalid_request"}` — the request is never treated as having an empty body. (Multiple headers are accepted only when every occurrence declares the same length.)
@@ -87,7 +87,7 @@ PYTHONPATH=src python3 -m semantic_state_engine.server --scope-policy-file ./var
 ```
 
 - Every key must be a non-empty ASCII printable token — bytes 0x21-0x7E, i.e. no whitespace, quotes, or non-ASCII characters — and no token key may repeat. Every value must be a **non-empty** array whose elements are chosen only from `"read"`, `"write"`, and `"admin"`, with no repetition.
-- Scopes authorize HTTP methods: `read` accesses every documented GET and the one read-only POST, the batch preview `POST /v1/resolve/auto/plan`; `write` submits the eight state-changing business POST endpoints; and `admin` covers both classes (it implies read and write) plus the scope-policy reload endpoint and the scope-policy change-audit and audit-verification endpoints. Apart from the read-only plan preview, the state-changing POST endpoints are not reachable with only `read` and the GET endpoints are not reachable with only `write`; neither `read` nor `write` alone reaches the admin-only reload and audit endpoints. `GET /health` stays anonymous in every mode.
+- Scopes authorize HTTP methods: `read` accesses every documented GET and the two read-only POSTs, the batch preview `POST /v1/resolve/auto/plan` and the causal slice `POST /v1/states/{key}/causal-at`; `write` submits the eight state-changing business POST endpoints; and `admin` covers both classes (it implies read and write) plus the scope-policy reload endpoint and the scope-policy change-audit and audit-verification endpoints. Apart from the read-only plan preview and causal slice, the state-changing POST endpoints are not reachable with only `read` and the GET endpoints are not reachable with only `write`; neither `read` nor `write` alone reaches the admin-only reload and audit endpoints. `GET /health` stays anonymous in every mode.
 - The policy file is read and validated **before the service begins listening**. A missing, unreadable, or non-regular target (for example a directory), a non-UTF-8 or incomplete/invalid JSON document, a non-object root, a duplicate token key, an illegal token, an unknown scope value, an empty value, or a duplicated scope all make startup fail with exit code 2, exactly like a rejected token or data file: no port is bound and neither tokens nor scopes are ever printed.
 
 #### Runtime policy reload: `POST /v1/admin/scope-policy/reload`
@@ -208,6 +208,35 @@ A key with no candidate at the requested position — one that never appeared, o
 Every number in the response is a JSON integer; no float, negative zero, or non-finite value can appear.
 
 The whole replay runs against one committed snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit and never observes half an import batch. The request is strictly read-only — it modifies neither memory nor the data file and creates no file. With `--data-file`, the accepted log is recovered identically during startup, so the same `cursor` yields the same report before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing or bad credential is HTTP 401, and in scope-policy mode a token without the `read` or `admin` scope is HTTP 403.
+
+### Reading state at a causal boundary
+
+`POST /v1/states/{key}/causal-at` returns a read-only report of one key's candidate state **as it was at a caller-named vector-clock boundary**, rather than at a global-log position. The body is a JSON object with exactly one key:
+
+```json
+{"clock":{"r1":2,"r2":1}}
+```
+
+The `clock` object's component names are replica ids and its values are non-boolean, non-negative JSON integers. The clock **may be empty** (`{}`): that is the causal origin, covering no accepted operation. A boundary *covers* an operation when every component of the operation's clock is less than or equal to the boundary's value for the same replica id; components missing from the boundary count as 0. The clock itself is therefore the minimal boundary at which that operation has happened, and a boundary missing one of the operation's components treats that component as 0 and does not yet cover it.
+
+The query replays from the empty state only the first-accepted records whose clocks are covered by the boundary, **in the shared global commit order** — the selection is causal, not a log prefix: an early committed record whose clock exceeds the boundary is skipped while a later committed record the boundary covers is still replayed. The replay covers exactly what the log holds — first-accepted ordinary writes, stale writes whose clock was already dominated, accepted conflict repairs, and sync-imported records — and nothing else: identical replays (`200`), conflicting or malformed requests (`409`/`400`), uncommitted requests, and records whose durable commit failed never enter the log. Candidate adds and deletes keep the existing vector-clock domination semantics (missing components count as 0), applied within the covered subset: a record dominated by another *covered* record adds no candidate, and a record that is stale in the current state can be a live candidate at an earlier boundary when its dominator is not covered.
+
+The body must be a complete JSON object carrying exactly `clock`. Malformed JSON, a non-object document, an unknown or duplicated field (a repeated `clock` or a repeated clock component), a structurally illegal clock (a non-object `clock`, an empty component name, a boolean, negative, string, or null tick), a float (including `1.0` and `-0.0`), or a non-finite token (`NaN`, `Infinity`, `-Infinity`) returns HTTP 400 with `{"error":"invalid_request"}`. The route accepts no query parameters — any parameter, including a repeated or blank name/value, is HTTP 400 `invalid_request`, and that check precedes the body check. A missing, empty, or extra path segment (for example `/v1/states//causal-at`, `/v1/states/{key}/causal-at/extra`, or a trailing slash), or any unknown route, returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter and body checks, and a `GET` on the path is also 404.
+
+A key with no candidate under the boundary — one that never appeared, or one whose records only appear at clocks past the boundary — returns HTTP 404 with `{"error":"not_found"}`, even when the same key has candidates at a later position. A successful HTTP 200 response is a compact UTF-8 JSON object with exactly four fields, terminated by a single newline:
+
+```json
+{"boundary":{"r1":2,"r2":1},"candidates":[{"clock":{"r1":1},"operationId":"op-1","replicaId":"r1","value":"blue"},{"clock":{"r2":1},"operationId":"op-2","replicaId":"r2","value":"red"}],"key":"color","status":"conflict"}
+```
+
+- `boundary`: the request clock, echoed back.
+- `key`: the requested key (the path segment is percent-decoded like every route).
+- `status`: `"resolved"` when every candidate covered by the boundary agrees on the value, `"conflict"` otherwise — the same classification as `GET /v1/states/{key}`.
+- `candidates`: always an array, even when resolved. Each entry carries exactly `value`, `clock`, `replicaId`, and `operationId`, sorted by `(replicaId, operationId)` ascending, so the first entry is the same value and clock the current-state query would choose for the same candidate set.
+
+Every number in the response is a JSON integer; no float, negative zero, or non-finite value can appear, and strings use the same compact escaping as the other endpoints.
+
+The whole replay runs against one committed snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit. The request is strictly read-only — it modifies neither memory nor the data file and creates no temporary file. With `--data-file`, the accepted log is recovered identically during startup, so the same boundary yields the same report before and after a restart. The endpoint shares the common request contract: `Content-Length` is validated before authentication (an illegal declaration is 400 and an over-limit declaration is 413, both without reading the body), a missing, duplicated, malformed, or mismatched bearer token is HTTP 401 `{"error":"unauthorized"}` with the `WWW-Authenticate: Bearer` challenge, and in scope-policy mode an authenticated token lacking the `read` or `admin` scope is HTTP 403 `{"error":"forbidden"}` with no challenge and without the body being read; `/health` stays anonymous.
 
 ### Explaining a key's candidate state
 
