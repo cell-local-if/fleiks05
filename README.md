@@ -22,7 +22,7 @@ Unknown routes return HTTP 404 with `{"error":"not_found"}`. Responses use UTF-8
 
 ### Request body limits
 
-All ten POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/resolve/auto/plan`, `POST /v1/sync/peers/{peerId}/checkpoint`, `POST /v1/sync/peers/{peerId}/acknowledge`, `POST /v1/transactions/apply`, and the read-only `POST /v1/states/{key}/causal-at`) share one body-size contract:
+All eleven POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/resolve/auto/plan`, `POST /v1/sync/peers/{peerId}/checkpoint`, `POST /v1/sync/peers/{peerId}/acknowledge`, `POST /v1/transactions/apply`, and the read-only `POST /v1/states/{key}/causal-at` and `POST /v1/replication/compare`) share one body-size contract:
 
 - The request body is limited to **1,048,576 raw UTF-8 bytes** (1 MiB). A body whose declared length is exactly the limit is processed by the normal endpoint semantics.
 - `Content-Length` is required and validated before anything else. It must be a plain ASCII decimal integer: a missing header, an empty value, a sign, whitespace, a negative number, non-ASCII digits, or multiple headers declaring conflicting lengths all return HTTP 400 with `{"error":"invalid_request"}` — the request is never treated as having an empty body. (Multiple headers are accepted only when every occurrence declares the same length.)
@@ -87,7 +87,7 @@ PYTHONPATH=src python3 -m semantic_state_engine.server --scope-policy-file ./var
 ```
 
 - Every key must be a non-empty ASCII printable token — bytes 0x21-0x7E, i.e. no whitespace, quotes, or non-ASCII characters — and no token key may repeat. Every value must be a **non-empty** array whose elements are chosen only from `"read"`, `"write"`, and `"admin"`, with no repetition.
-- Scopes authorize HTTP methods: `read` accesses every documented GET and the two read-only POSTs, the batch preview `POST /v1/resolve/auto/plan` and the causal-slice query `POST /v1/states/{key}/causal-at`; `write` submits the eight state-changing business POST endpoints; and `admin` covers both classes (it implies read and write) plus the scope-policy reload endpoint and the scope-policy change-audit and audit-verification endpoints. Apart from the read-only plan preview and causal-slice query, the state-changing POST endpoints are not reachable with only `read` and the GET endpoints are not reachable with only `write`; neither `read` nor `write` alone reaches the admin-only reload and audit endpoints. `GET /health` stays anonymous in every mode.
+- Scopes authorize HTTP methods: `read` accesses every documented GET and the three read-only POSTs, the batch preview `POST /v1/resolve/auto/plan`, the causal-slice query `POST /v1/states/{key}/causal-at`, and the cross-replica comparison `POST /v1/replication/compare`; `write` submits the eight state-changing business POST endpoints; and `admin` covers both classes (it implies read and write) plus the scope-policy reload endpoint and the scope-policy change-audit and audit-verification endpoints. Apart from the read-only plan preview, causal-slice query, and cross-replica comparison, the state-changing POST endpoints are not reachable with only `read` and the GET endpoints are not reachable with only `write`; neither `read` nor `write` alone reaches the admin-only reload and audit endpoints. `GET /health` stays anonymous in every mode.
 - The policy file is read and validated **before the service begins listening**. A missing, unreadable, or non-regular target (for example a directory), a non-UTF-8 or incomplete/invalid JSON document, a non-object root, a duplicate token key, an illegal token, an unknown scope value, an empty value, or a duplicated scope all make startup fail with exit code 2, exactly like a rejected token or data file: no port is bound and neither tokens nor scopes are ever printed.
 
 #### Runtime policy reload: `POST /v1/admin/scope-policy/reload`
@@ -830,6 +830,39 @@ The snapshot-digest input is a compact UTF-8 JSON array of exactly three element
 The candidate state, the log cursor, and the checkpoint mapping are read from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit: a read observes either the old or the new complete state, never half an import batch or a partially applied repair. The request is strictly read-only — it modifies neither memory nor the data file and creates no temporary file. With `--data-file`, the log and the checkpoints are rebuilt identically during recovery, so the same state yields the same verification result before and after a restart.
 
 The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}` without reading any state. A missing or extra path segment, an unknown route, or a trailing slash (for example `/v1/replication/snapshot/`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
+
+### Cross-replica candidate comparison
+
+`POST /v1/replication/compare` returns a read-only diff between the local current candidates and a remote replica's complete candidate snapshot, so a caller can locate exactly which candidate versions still need to converge. The request body is a JSON object with exactly two fields:
+
+```json
+{"replicaId":"replica-b","snapshot":{"color":[{"clock":{"r1":1},"operationId":"op-1","replicaId":"r1","value":"blue"}]}}
+```
+
+- `replicaId`: the remote replica's identifier, a non-empty string. It only names the comparison partner — the snapshot itself may hold candidates from any replica.
+- `snapshot`: the remote's complete candidate state, an object mapping each business key to a non-empty array of candidates. Each candidate must contain exactly `value`, `clock`, `replicaId`, and `operationId` and satisfy the live write constraints: the value and both identity components are non-empty strings, and the clock is a non-empty object whose component values are non-boolean, non-negative JSON integers (floats such as `1.0` and `-0.0` and non-finite values such as `NaN`/`Infinity`/`-Infinity` are rejected) and which contains the candidate's own replica id. An operation identity `(replicaId, operationId)` may appear at most once across the whole snapshot.
+
+Malformed JSON, a non-object body, a missing or unknown field, a duplicated field anywhere in the document, an empty key or candidate array, a duplicated candidate identity, or a structurally illegal candidate all return HTTP 400 with `{"error":"invalid_request"}` and change nothing. The route accepts no query parameters: any parameter returns HTTP 400 with `{"error":"invalid_request"}`, and that check precedes the body check. A missing or extra path segment or a trailing slash (for example `/v1/replication/compare/`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter and body checks.
+
+The remote snapshot is **only compared** — it is never imported into local state, and the request triggers no repair, transaction, sync, checkpoint, or persistence write. The local candidates are read from one committed snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so the response always describes a single commit even while commits are in flight: a read observes either the old or the new complete state, never half an import batch or a partially applied repair. A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly four fields:
+
+```json
+{"keys":[{"differences":[{"kind":"conflict","local":{"clock":{"r1":2},"operationId":"op-1","replicaId":"r1","value":"blue"},"remote":{"clock":{"r1":1},"operationId":"op-1","replicaId":"r1","value":"red"}}],"key":"color"}],"replicaId":"replica-b","status":"ok","summary":{"differences":1,"identical":false,"localCandidates":1,"localDigest":"<64 lowercase hex chars>","localKeys":1,"remoteCandidates":1,"remoteDigest":"<64 lowercase hex chars>","remoteKeys":1}}
+```
+
+- `status`: always `"ok"`.
+- `replicaId`: the requested remote replica id, echoed back.
+- `keys`: one entry per business key in the union of both sides, sorted lexicographically. Each entry's `differences` array covers every candidate identity either side holds for the key, sorted by `(replicaId, operationId)`, and each element keeps both sides' candidate — `local` and `remote`, each `{"value","clock","replicaId","operationId"}` or `null` on the side that lacks the identity — under one `kind` mark:
+  - `"shared"`: both sides hold the identity with the same value and the same clock — not a difference.
+  - `"missing_remote"`: only the local side holds the identity.
+  - `"missing_local"`: only the remote side holds the identity.
+  - `"conflict"`: both sides hold the identity but the values differ (a content conflict).
+  - `"clock"`: both sides hold the identity with the same value but different clocks (one side's clock covers the other's).
+- `summary`: the convergence totals — `localKeys`/`remoteKeys` and `localCandidates`/`remoteCandidates` count each side's keys and candidate versions; `localDigest` and `remoteDigest` are the 64-character lowercase hexadecimal SHA-256 of each side's canonical candidate snapshot, following exactly the verification-digest rules; `identical` reports whether the two digests are equal (true precisely when the candidate states are the same — in particular when both are empty, where both digests are the hash of `[]` and `keys` is empty); and `differences` counts the non-shared entries — the minimal candidate-level difference count a follow-up sync must reconcile. When one side is empty, only the other side's keys and candidates appear, each marked missing on the empty side.
+
+Every number in the response is a JSON integer; no float, negative zero, or non-finite value can appear. The compact encoding, escaping, and terminator are the same as `GET /v1/replication/snapshot`.
+
+The comparison is strictly read-only — it modifies neither memory nor the data file and creates no temporary file. With `--data-file`, the candidate state is rebuilt identically during recovery, so the same local state and the same remote snapshot yield the same report before and after a restart. The route shares the common request contract: an illegal `Content-Length` is HTTP 400 `{"error":"invalid_request"}` and a declared length over the body limit is HTTP 413 `{"error":"payload_too_large"}`, both answered **before** reading the body and before authentication; a missing, duplicated, or malformed `Authorization` header or a non-matching bearer token is HTTP 401 `{"error":"unauthorized"}` with the `WWW-Authenticate: Bearer` challenge; and in scope-policy mode an authenticated token lacking the `read` or `admin` scope is HTTP 403 `{"error":"forbidden"}` with no challenge. `/health` stays anonymous. A `GET` on the path is an unknown route and answers HTTP 404.
 
 ### Sender-side replication delivery status
 

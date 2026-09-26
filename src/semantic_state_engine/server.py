@@ -1009,6 +1009,108 @@ def parse_causal_at_payload(raw: bytes | str | dict[str, Any]) -> dict[str, int]
     return _validate_boundary_clock(payload.get("clock"))
 
 
+def parse_replication_compare_payload(
+    raw: bytes | str | dict[str, Any],
+) -> tuple[str, dict[str, list[dict[str, Any]]]]:
+    """Parse and validate a cross-replica candidate-comparison body.
+
+    The body must be a JSON object with exactly ``replicaId`` and
+    ``snapshot``: the remote replica's identifier (a non-empty string) and
+    its complete candidate snapshot — an object mapping each business key
+    to a non-empty array of candidates. Each candidate must contain
+    exactly ``value``, ``clock``, ``replicaId``, and ``operationId`` and
+    satisfy the live write constraints: the value and both identity
+    components are non-empty strings, and the clock follows
+    :func:`_validate_clock` (a non-empty object whose component values are
+    non-boolean, non-negative JSON integers — floats such as ``1.0`` and
+    ``-0.0`` and non-finite values are rejected — and which contains the
+    candidate's own replica id). A duplicated field anywhere in the
+    document, an unknown field, an empty key or candidate array, or an
+    operation identity ``(replicaId, operationId)`` appearing more than
+    once across the whole snapshot raises ValueError. Returns the remote
+    replica id and the normalized snapshot, ready for
+    :func:`_verification_digest_input`. The snapshot is only validated —
+    it is never imported into local state.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        # Already-decoded mappings come from store-level callers, which
+        # bypass JSON and therefore the duplicate-key hook.
+        text = None
+    if text is None:
+        payload = raw
+    else:
+        def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+            document: dict[Any, Any] = {}
+            for key, value in pairs:
+                if key in document:
+                    raise ValueError("duplicate field in body")
+                document[key] = value
+            return document
+
+        try:
+            payload = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload.keys()) != {"replicaId", "snapshot"}:
+        raise ValueError("body must be an object with only replicaId and snapshot")
+    replica_id = payload["replicaId"]
+    if not isinstance(replica_id, str) or replica_id == "":
+        raise ValueError("replicaId must be a non-empty string")
+    snapshot_raw = payload["snapshot"]
+    if not isinstance(snapshot_raw, dict):
+        raise ValueError("snapshot must be an object mapping keys to candidate arrays")
+
+    snapshot: dict[str, list[dict[str, Any]]] = {}
+    identities: set[tuple[str, str]] = set()
+    for key, candidates_raw in snapshot_raw.items():
+        if not isinstance(key, str) or key == "":
+            raise ValueError("snapshot keys must be non-empty strings")
+        if not isinstance(candidates_raw, list) or not candidates_raw:
+            raise ValueError("each snapshot entry must be a non-empty candidate array")
+        candidates: list[dict[str, Any]] = []
+        for entry in candidates_raw:
+            if not isinstance(entry, dict) or set(entry.keys()) != {
+                "value",
+                "clock",
+                "replicaId",
+                "operationId",
+            }:
+                raise ValueError(
+                    "each candidate must have only value, clock, replicaId, operationId"
+                )
+            value = entry["value"]
+            if not isinstance(value, str) or value == "":
+                raise ValueError("value must be a non-empty string")
+            candidate_replica = entry["replicaId"]
+            if not isinstance(candidate_replica, str) or candidate_replica == "":
+                raise ValueError("replicaId must be a non-empty string")
+            operation_id = entry["operationId"]
+            if not isinstance(operation_id, str) or operation_id == "":
+                raise ValueError("operationId must be a non-empty string")
+            clock = _validate_clock(entry["clock"], candidate_replica)
+            identity = (candidate_replica, operation_id)
+            if identity in identities:
+                raise ValueError("duplicate candidate identity in snapshot")
+            identities.add(identity)
+            candidates.append(
+                {
+                    "value": value,
+                    "clock": clock,
+                    "replicaId": candidate_replica,
+                    "operationId": operation_id,
+                }
+            )
+        snapshot[key] = candidates
+    return replica_id, snapshot
+
+
 ACK_MAX_OPERATIONS = 100
 
 
@@ -3692,6 +3794,111 @@ class StateStore:
             "checkpoints": checkpoints,
         }
 
+    def compare_replication_snapshot(
+        self, replica_id: str, snapshot: dict[str, list[dict[str, Any]]]
+    ) -> dict[str, Any]:
+        """Diff the current candidates against a remote replica's snapshot.
+
+        The local candidate state is copied under the same commit lock used
+        by local writes, sync imports, repairs, and checkpoint commits, so
+        the comparison always describes a single commit: it can never
+        observe half an import batch, a partially applied repair, or a
+        half-committed recovery — only the old or the new complete state.
+        The remote snapshot (already normalized by
+        :func:`parse_replication_compare_payload`) is only read: nothing is
+        imported, and no repair, transaction, sync, checkpoint, or
+        persistence runs. The read mutates neither memory nor the data
+        file and creates no temporary file, so with ``--data-file`` the
+        same local state and the same remote snapshot yield the same
+        report before and after a restart.
+
+        Both sides are digested with exactly the verification-digest rules
+        (:func:`_verification_digest_input`), so ``identical`` is true
+        precisely when the two candidate states are the same — in
+        particular when both are empty. The result groups the union of
+        business keys, each key's entries sorted by ``(replicaId,
+        operationId)`` and carrying both sides' candidate (``null`` on the
+        side that lacks the identity) under one ``kind`` mark:
+
+        - ``"shared"``: both sides hold the identity with the same value
+          and the same clock — not a difference.
+        - ``"missing_remote"``: only the local side holds the identity.
+        - ``"missing_local"``: only the remote side holds the identity.
+        - ``"conflict"``: both sides hold the identity but the values
+          differ (a content conflict).
+        - ``"clock"``: both sides hold the identity with the same value
+          but different clocks (one side's clock covers the other's).
+
+        The summary reports both sides' key counts and candidate counts,
+        both digests, whether they are identical, and ``differences`` —
+        the number of non-shared entries, the minimal candidate-level
+        difference count a follow-up sync must reconcile.
+        """
+        with self._lock:
+            local = {
+                key: [
+                    {
+                        "value": candidate["value"],
+                        "clock": dict(candidate["clock"]),
+                        "replicaId": candidate["replicaId"],
+                        "operationId": candidate["operationId"],
+                    }
+                    for candidate in candidates
+                ]
+                for key, candidates in self._candidates.items()
+            }
+        local_digest = hashlib.sha256(_verification_digest_input(local)).hexdigest()
+        remote_digest = hashlib.sha256(_verification_digest_input(snapshot)).hexdigest()
+
+        groups: list[dict[str, Any]] = []
+        differences = 0
+        for key in sorted(set(local) | set(snapshot)):
+            local_by_id = {
+                (c["replicaId"], c["operationId"]): c for c in local.get(key, [])
+            }
+            remote_by_id = {
+                (c["replicaId"], c["operationId"]): c for c in snapshot.get(key, [])
+            }
+            entries: list[dict[str, Any]] = []
+            for identity in sorted(set(local_by_id) | set(remote_by_id)):
+                local_candidate = local_by_id.get(identity)
+                remote_candidate = remote_by_id.get(identity)
+                if local_candidate is None:
+                    kind = "missing_local"
+                elif remote_candidate is None:
+                    kind = "missing_remote"
+                elif local_candidate["value"] != remote_candidate["value"]:
+                    kind = "conflict"
+                elif local_candidate["clock"] != remote_candidate["clock"]:
+                    kind = "clock"
+                else:
+                    kind = "shared"
+                if kind != "shared":
+                    differences += 1
+                entries.append(
+                    {
+                        "kind": kind,
+                        "local": local_candidate,
+                        "remote": remote_candidate,
+                    }
+                )
+            groups.append({"key": key, "differences": entries})
+        return {
+            "status": "ok",
+            "replicaId": replica_id,
+            "keys": groups,
+            "summary": {
+                "localKeys": len(local),
+                "remoteKeys": len(snapshot),
+                "localCandidates": sum(len(c) for c in local.values()),
+                "remoteCandidates": sum(len(c) for c in snapshot.values()),
+                "localDigest": local_digest,
+                "remoteDigest": remote_digest,
+                "identical": local_digest == remote_digest,
+                "differences": differences,
+            },
+        }
+
     def get_key_audit_digest(self, key: str) -> dict[str, Any]:
         """Return one key's audit-integrity digest from a single snapshot.
 
@@ -6310,6 +6517,38 @@ class RequestHandler(BaseHTTPRequestHandler):
         status, payload = self._store.get_replication_status(peer_id)
         self._json_ordered_newline(status, payload)
 
+    def _handle_replication_compare_post(self) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those. The route
+        # accepts no query parameters, and that check precedes the body
+        # check. The comparison is strictly read-only: the remote snapshot
+        # is validated and diffed against one committed local snapshot but
+        # never imported, and no repair, transaction, sync, or persistence
+        # runs. The report follows the compact-single-line contract:
+        # canonical UTF-8 JSON, one trailing newline, counts only as JSON
+        # integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            replica_id, snapshot = parse_replication_compare_payload(raw)
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(
+            HTTPStatus.OK,
+            self._store.compare_replication_snapshot(replica_id, snapshot),
+        )
+
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)
         if params is None:
@@ -6930,6 +7169,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "states"
             and segments[3] == "causal-at"
         )
+        is_replication_compare_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "compare"
+        )
         if (
             matched
             or matched_ack
@@ -6942,6 +7187,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_transaction_apply_post
             or is_scope_policy_reload_post
             or is_causal_at_post
+            or is_replication_compare_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -6971,6 +7217,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif is_causal_at_post:
                 # The causal slice is strictly read-only, so it is gated
                 # like every other read: a read or admin scope suffices.
+                if not self._require_scope(SCOPE_READ):
+                    return
+            elif is_replication_compare_post:
+                # The cross-replica comparison is strictly read-only — the
+                # remote snapshot is diffed, never imported — so it is
+                # gated like every other read: a read or admin scope
+                # suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
             elif not self._require_scope(SCOPE_WRITE):
@@ -7034,6 +7287,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_causal_at_post:
             self._handle_state_causal_at_post(segments[2])
+            return
+        if is_replication_compare_post:
+            self._handle_replication_compare_post()
             return
         self._handle_sync_post()
 
