@@ -3007,6 +3007,143 @@ class StateStore:
             self._candidates[key] = next_candidates
             return HTTPStatus.CREATED, operation, None
 
+    def _dry_run_auto_resolutions_locked(
+        self, requests: list[dict[str, Any]]
+    ) -> tuple[
+        list[dict[str, Any]] | None,
+        int,
+        int,
+        list[tuple[str, dict[str, Any]]],
+        dict[tuple[str, str], str],
+        str | None,
+    ]:
+        """Validate a batch of automatic resolutions against staged copies.
+
+        This is the shared, mutation-free core of :meth:`apply_auto_resolutions`
+        and :meth:`plan_auto_resolutions`: every entry is processed in request
+        order against staged copies of the identity index, the policy
+        bindings, and the candidate sets, so neither the visible state nor any
+        durable file is touched and a later entry sees earlier entries of the
+        same batch exactly the way a real commit would. Returns
+        ``(results, accepted, replayed, new_records, new_policies, error)``:
+        on success ``results`` holds one result per entry in request order
+        (each carrying ``key``, ``replicaId``, ``operationId``, the selected
+        ``value``, and ``policy``), ``accepted`` counts entries that a real
+        commit would newly append and ``replayed`` counts same-binding
+        identities answered from the committed operation; on failure
+        ``results`` is None and ``error`` is ``"operation_conflict"`` or
+        ``"resolution_conflict"``. The caller must hold :attr:`_lock`.
+        """
+        # Staged copies keep the whole dry run off the visible state:
+        # the batch is fixed in its entirety before the single commit.
+        staged_operations = dict(self._operations)
+        staged_policies = dict(self._policies)
+        staged_candidates = {
+            key: list(candidates) for key, candidates in self._candidates.items()
+        }
+        new_records: list[tuple[str, dict[str, Any]]] = []
+        new_policies: dict[tuple[str, str], str] = {}
+        results: list[dict[str, Any]] = []
+        accepted = 0
+        replayed = 0
+
+        for entry in requests:
+            replica_id = entry["replicaId"]
+            key = entry["key"]
+            identity = (replica_id, entry["operationId"])
+            operation = {
+                "operationId": entry["operationId"],
+                "key": key,
+                "value": "",
+                "clock": entry["clock"],
+            }
+            seen = staged_operations.get(identity)
+            if seen is not None:
+                # Same replay binding as the single-request path: key,
+                # clock, and policy must all match the committed
+                # operation (which must carry a policy binding).
+                if (
+                    seen["key"] == key
+                    and seen["clock"] == operation["clock"]
+                    and staged_policies.get(identity) == entry["policy"]
+                ):
+                    replayed += 1
+                    results.append(
+                        {
+                            "key": key,
+                            "replicaId": replica_id,
+                            "operationId": entry["operationId"],
+                            "value": seen["value"],
+                            "policy": entry["policy"],
+                        }
+                    )
+                    continue
+                return None, 0, 0, [], {}, "operation_conflict"
+
+            current = staged_candidates.get(key, [])
+            if not current or all(c["value"] == current[0]["value"] for c in current):
+                return None, 0, 0, [], {}, "resolution_conflict"
+
+            if entry["policy"] == "highest_identity":
+                chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
+            else:
+                chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+            operation["value"] = chosen["value"]
+
+            # A legal clock that nevertheless fails to dominate the live
+            # candidates is a failed resolution precondition (409), not
+            # a malformed request: structurally invalid clocks were
+            # rejected by the parser before the store was ever reached.
+            if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
+                return None, 0, 0, [], {}, "resolution_conflict"
+
+            staged_candidates[key] = self._next_candidates(
+                current, replica_id, operation
+            )
+            staged_operations[identity] = operation
+            staged_policies[identity] = entry["policy"]
+            new_records.append((replica_id, operation))
+            new_policies[identity] = entry["policy"]
+            accepted += 1
+            results.append(
+                {
+                    "key": key,
+                    "replicaId": replica_id,
+                    "operationId": entry["operationId"],
+                    "value": operation["value"],
+                    "policy": entry["policy"],
+                }
+            )
+        return results, accepted, replayed, new_records, new_policies, None
+
+    def plan_auto_resolutions(
+        self, requests: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], int, int, str | None]:
+        """Preview a batch of automatic resolutions without committing.
+
+        The read-only companion of :meth:`apply_auto_resolutions` for
+        ``POST /v1/resolve/auto/plan``. The whole batch is judged in request
+        order against one complete committed snapshot using exactly the
+        staged dry run a real batch commit performs, but nothing is appended,
+        written, bound, or otherwise changed: candidates, the identity
+        index, the policy bindings, checkpoints, audit streams, the data
+        file, and any temporary file are all untouched. A successful plan
+        therefore reports exactly what the equivalent batch commit would
+        choose at that instant — ``accepted`` counts entries that a commit
+        would newly create and ``replayed`` counts same-binding identities
+        answered from their committed operations (reporting the originally
+        chosen value) — while a failing batch reports the same
+        ``"operation_conflict"`` / ``"resolution_conflict"`` the commit would
+        return. Returns ``(results, accepted, replayed, error)``.
+        """
+        with self._lock:
+            results, accepted, replayed, _records, _policies, error = (
+                self._dry_run_auto_resolutions_locked(requests)
+            )
+            if error is not None:
+                return [], 0, 0, error
+            return results, accepted, replayed, None
+
     def apply_auto_resolutions(
         self, requests: list[dict[str, Any]]
     ) -> tuple[HTTPStatus, list[dict[str, Any]], int, int, str | None]:
@@ -3047,86 +3184,16 @@ class StateStore:
         unchanged.
         """
         with self._lock:
-            # Staged copies keep the whole dry run off the visible state:
-            # the batch is fixed in its entirety before the single commit.
-            staged_operations = dict(self._operations)
-            staged_policies = dict(self._policies)
-            staged_candidates = {
-                key: list(candidates) for key, candidates in self._candidates.items()
-            }
-            new_records: list[tuple[str, dict[str, Any]]] = []
-            new_policies: dict[tuple[str, str], str] = {}
-            results: list[dict[str, Any]] = []
-            accepted = 0
-            replayed = 0
-
-            for entry in requests:
-                replica_id = entry["replicaId"]
-                key = entry["key"]
-                identity = (replica_id, entry["operationId"])
-                operation = {
-                    "operationId": entry["operationId"],
-                    "key": key,
-                    "value": "",
-                    "clock": entry["clock"],
-                }
-                seen = staged_operations.get(identity)
-                if seen is not None:
-                    # Same replay binding as the single-request path: key,
-                    # clock, and policy must all match the committed
-                    # operation (which must carry a policy binding).
-                    if (
-                        seen["key"] == key
-                        and seen["clock"] == operation["clock"]
-                        and staged_policies.get(identity) == entry["policy"]
-                    ):
-                        replayed += 1
-                        results.append(
-                            {
-                                "key": key,
-                                "replicaId": replica_id,
-                                "operationId": entry["operationId"],
-                                "value": seen["value"],
-                                "policy": entry["policy"],
-                            }
-                        )
-                        continue
-                    return HTTPStatus.CONFLICT, [], 0, 0, "operation_conflict"
-
-                current = staged_candidates.get(key, [])
-                if not current or all(c["value"] == current[0]["value"] for c in current):
-                    return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
-
-                if entry["policy"] == "highest_identity":
-                    chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
-                else:
-                    chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
-                operation["value"] = chosen["value"]
-
-                # A legal clock that nevertheless fails to dominate the live
-                # candidates is a failed resolution precondition (409), not
-                # a malformed request: structurally invalid clocks were
-                # rejected by the parser before the store was ever reached.
-                if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
-                    return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
-
-                staged_candidates[key] = self._next_candidates(
-                    current, replica_id, operation
-                )
-                staged_operations[identity] = operation
-                staged_policies[identity] = entry["policy"]
-                new_records.append((replica_id, operation))
-                new_policies[identity] = entry["policy"]
-                accepted += 1
-                results.append(
-                    {
-                        "key": key,
-                        "replicaId": replica_id,
-                        "operationId": entry["operationId"],
-                        "value": operation["value"],
-                        "policy": entry["policy"],
-                    }
-                )
+            (
+                results,
+                accepted,
+                replayed,
+                new_records,
+                new_policies,
+                error,
+            ) = self._dry_run_auto_resolutions_locked(requests)
+            if error is not None:
+                return HTTPStatus.CONFLICT, [], 0, 0, error
 
             if not new_records:
                 return HTTPStatus.OK, results, accepted, replayed, None
@@ -6430,6 +6497,43 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_auto_resolve_plan_post(self) -> None:
+        # The declared-length check (400/413) and the write-scope gate ran in
+        # do_POST without reading the body; route-shape mismatches — missing,
+        # extra, or a trailing slash — fall through to the generic 404 before
+        # either. The plan accepts no query parameters, and that check
+        # precedes the body check even on a correct route.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        # The request body is the same shape as the committing batch, so its
+        # parse and 400 boundary are reused verbatim.
+        try:
+            entries = parse_auto_resolve_batch(raw)
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # Strictly read-only: the plan runs the same staged dry run a commit
+        # would, against one complete committed snapshot, but appends no
+        # record and writes no binding, candidate, checkpoint, audit entry,
+        # data file, or temporary file.
+        results, accepted, replayed, error = self._store.plan_auto_resolutions(entries)
+        if error is not None:
+            self._json_newline(HTTPStatus.CONFLICT, {"error": error})
+            return
+        self._json_newline(
+            HTTPStatus.OK,
+            {
+                "status": "planned",
+                "resolutions": results,
+                "accepted": accepted,
+                "replayed": replayed,
+            },
+        )
+
     def _handle_transaction_apply_post(self) -> None:
         # The route-shape check in do_POST already ran (missing or extra
         # segments — including a trailing slash — are 404 there), so a
@@ -6605,6 +6709,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "auto"
             and segments[3] == "batch"
         )
+        is_auto_resolve_plan_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "resolve"
+            and segments[2] == "auto"
+            and segments[3] == "plan"
+        )
         is_transaction_apply_post = (
             len(segments) == 3
             and segments[0] == "v1"
@@ -6626,6 +6737,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_auto_resolve_post
             or is_sync_post
             or is_auto_resolve_batch_post
+            or is_auto_resolve_plan_post
             or is_transaction_apply_post
             or is_scope_policy_reload_post
         ):
@@ -6648,6 +6760,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 if getattr(self.server, "scope_policy", None) is None:
                     self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+            elif is_auto_resolve_plan_post:
+                # The plan is strictly read-only — it previews a batch but
+                # commits nothing — so it takes the read scope (admin covers
+                # it too), exactly like the GET endpoints, rather than the
+                # write scope every committing POST requires.
+                if not self._require_scope(SCOPE_READ):
                     return
             elif not self._require_scope(SCOPE_WRITE):
                 return
@@ -6698,6 +6817,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_auto_resolve_batch_post:
             self._handle_auto_resolve_batch_post()
+            return
+        if is_auto_resolve_plan_post:
+            self._handle_auto_resolve_plan_post()
             return
         if is_transaction_apply_post:
             self._handle_transaction_apply_post()
