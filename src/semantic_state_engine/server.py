@@ -1128,6 +1128,179 @@ def parse_replication_compare_payload(
     return replica_id, snapshot
 
 
+REPLICATION_APPLY_ACTIONS = ("send_local", "fetch_remote", "semantic_resolution")
+REPLICATION_APPLY_MIN = 1
+REPLICATION_APPLY_MAX = 100
+
+
+def _parse_replication_apply_actions(
+    actions_raw: Any,
+) -> list[dict[str, Any]]:
+    """Validate the ordered action list of a replication-apply body.
+
+    Between :data:`REPLICATION_APPLY_MIN` and :data:`REPLICATION_APPLY_MAX`
+    entries, kept in request order. Every entry carries ``action`` plus the
+    candidate identity, value, and clock it acts on: ``key``, ``replicaId``,
+    ``operationId``, ``value`` (non-empty strings) and ``clock`` (following
+    :func:`_validate_clock`, so it must contain the entry's own replica id).
+    ``action`` must be one of :data:`REPLICATION_APPLY_ACTIONS` — the two
+    plan directions ``send_local``/``fetch_remote`` or a
+    ``semantic_resolution``; anything else is an unknown direction. A
+    ``semantic_resolution`` entry additionally carries ``candidates``, the
+    expected conflicting candidate set: a non-empty list of distinct
+    ``{"replicaId", "operationId"}`` identities, exactly as in a manual
+    resolution. No two entries may carry the same ``(replicaId,
+    operationId)`` identity. Raises ValueError on any violation.
+    """
+    if not isinstance(actions_raw, list) or not (
+        REPLICATION_APPLY_MIN <= len(actions_raw) <= REPLICATION_APPLY_MAX
+    ):
+        raise ValueError("actions must be a list of 1-100 entries")
+
+    actions: list[dict[str, Any]] = []
+    identities: set[tuple[str, str]] = set()
+    for entry in actions_raw:
+        if not isinstance(entry, dict):
+            raise ValueError("each action must be an object")
+        action = entry.get("action")
+        if action not in REPLICATION_APPLY_ACTIONS:
+            raise ValueError(
+                "action must be send_local, fetch_remote, or semantic_resolution"
+            )
+        expected_fields = {"action", "key", "replicaId", "operationId", "value", "clock"}
+        if action == "semantic_resolution":
+            expected_fields = expected_fields | {"candidates"}
+        if set(entry.keys()) != expected_fields:
+            raise ValueError(
+                "each action must have only action, key, replicaId, operationId, "
+                "value, clock" + (", candidates" if action == "semantic_resolution" else "")
+            )
+        key = entry["key"]
+        if not isinstance(key, str) or key == "":
+            raise ValueError("key must be a non-empty string")
+        replica_id = entry["replicaId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise ValueError("replicaId must be a non-empty string")
+        operation_id = entry["operationId"]
+        if not isinstance(operation_id, str) or operation_id == "":
+            raise ValueError("operationId must be a non-empty string")
+        value = entry["value"]
+        if not isinstance(value, str) or value == "":
+            raise ValueError("value must be a non-empty string")
+        clock = _validate_clock(entry["clock"], replica_id)
+
+        normalized: dict[str, Any] = {
+            "action": action,
+            "key": key,
+            "replicaId": replica_id,
+            "operationId": operation_id,
+            "value": value,
+            "clock": clock,
+        }
+        if action == "semantic_resolution":
+            candidates_raw = entry["candidates"]
+            if not isinstance(candidates_raw, list) or not candidates_raw:
+                raise ValueError("candidates must be a non-empty list")
+            candidates: list[dict[str, str]] = []
+            candidate_identities: set[tuple[str, str]] = set()
+            for candidate in candidates_raw:
+                if not isinstance(candidate, dict) or set(candidate.keys()) != {
+                    "replicaId",
+                    "operationId",
+                }:
+                    raise ValueError(
+                        "each candidate must have only replicaId and operationId"
+                    )
+                candidate_replica = candidate["replicaId"]
+                candidate_operation = candidate["operationId"]
+                if not isinstance(candidate_replica, str) or candidate_replica == "":
+                    raise ValueError("candidate replicaId must be a non-empty string")
+                if not isinstance(candidate_operation, str) or candidate_operation == "":
+                    raise ValueError("candidate operationId must be a non-empty string")
+                candidate_identity = (candidate_replica, candidate_operation)
+                if candidate_identity in candidate_identities:
+                    raise ValueError(f"duplicate candidate {candidate_identity!r}")
+                candidate_identities.add(candidate_identity)
+                candidates.append(
+                    {"replicaId": candidate_replica, "operationId": candidate_operation}
+                )
+            normalized["candidates"] = candidates
+
+        identity = (replica_id, operation_id)
+        if identity in identities:
+            raise ValueError(f"duplicate identity {identity!r} in actions")
+        identities.add(identity)
+        actions.append(normalized)
+    return actions
+
+
+def parse_replication_apply_payload(
+    raw: bytes | str | dict[str, Any],
+) -> tuple[str, dict[str, list[dict[str, Any]]], str, list[dict[str, Any]]]:
+    """Parse and validate an executable replica-repair batch body.
+
+    The body must be a JSON object with exactly ``replicaId``, ``snapshot``,
+    ``expectedDigest``, and ``actions``: the remote replica's identifier and
+    its complete candidate snapshot under exactly the comparison's
+    constraints (:func:`parse_replication_compare_payload`), the local
+    candidate digest the plan was computed against (64 lowercase hexadecimal
+    characters, as reported by ``GET /v1/replication/snapshot`` and the
+    comparison's ``localDigest`` summary field), and the ordered action list
+    (:func:`_parse_replication_apply_actions`). A duplicated field anywhere
+    in the document, an unknown or missing field, a malformed digest, an
+    illegal action or clock, or a duplicated action identity raises
+    ValueError. Returns the remote replica id, the normalized snapshot, the
+    expected digest, and the normalized actions in request order. The
+    snapshot is only validated — it is never imported on its own.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        # Already-decoded mappings come from store-level callers, which
+        # bypass JSON and therefore the duplicate-key hook.
+        text = None
+    if text is None:
+        payload = raw
+    else:
+        def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+            document: dict[Any, Any] = {}
+            for key, value in pairs:
+                if key in document:
+                    raise ValueError("duplicate field in body")
+                document[key] = value
+            return document
+
+        try:
+            payload = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload.keys()) != {
+        "replicaId",
+        "snapshot",
+        "expectedDigest",
+        "actions",
+    }:
+        raise ValueError(
+            "body must be an object with only replicaId, snapshot, "
+            "expectedDigest, actions"
+        )
+    expected_digest = payload["expectedDigest"]
+    if not _is_sha256_hex64(expected_digest):
+        raise ValueError("expectedDigest must be 64 lowercase hex characters")
+    # The remote identifier and the complete candidate snapshot follow
+    # exactly the comparison's constraints.
+    replica_id, snapshot = parse_replication_compare_payload(
+        {"replicaId": payload["replicaId"], "snapshot": payload["snapshot"]}
+    )
+    actions = _parse_replication_apply_actions(payload["actions"])
+    return replica_id, snapshot, expected_digest, actions
+
+
 ACK_MAX_OPERATIONS = 100
 
 
@@ -4055,6 +4228,261 @@ class StateStore:
             },
         }
 
+    def apply_replication_plan(
+        self,
+        replica_id: str,
+        snapshot: dict[str, list[dict[str, Any]]],
+        expected_digest: str,
+        actions: list[dict[str, Any]],
+    ) -> tuple[HTTPStatus, list[dict[str, Any]], int, int, str | None]:
+        """Execute a validated replica-repair batch as one atomic commit.
+
+        The parser already guarantees 1-100 actions with distinct
+        identities, structurally valid clocks, and a well-formed expected
+        digest. The actions are processed in request order against a staged
+        view of the store, so the whole batch is fixed before anything is
+        persisted or made visible, and any failure rejects the batch
+        unchanged:
+
+        - a known ``(replicaId, operationId)`` with different content than
+          the entry claims is an operation conflict, whatever the action;
+        - ``send_local`` only confirms the local side of the plan: the
+          identity must be a current local candidate with the entry's value
+          and clock, and the remote snapshot must either lack the identity
+          or hold it with the same value under a clock the local clock
+          dominates — otherwise the plan direction no longer holds. It
+          commits nothing, so it always counts as replayed;
+        - ``fetch_remote`` imports the remote candidate as one operation
+          with the ordinary write semantics. The remote snapshot must hold
+          the identity with exactly the entry's value and clock; a known
+          identity with identical content is a replay answered from the
+          committed record;
+        - ``semantic_resolution`` commits a manual resolution for the key:
+          the key must currently be in conflict, the entry's ``candidates``
+          must name exactly the key's current candidate identities, and the
+          entry clock must dominate every one of those candidates. A known
+          identity with identical content is a replay.
+
+        When at least one action newly commits, the expected digest is
+        checked against the current committed candidate snapshot
+        (:func:`_verification_digest_input`): a mismatch means the plan was
+        computed against a different local state and the whole batch is
+        rejected with ``apply_conflict``. A batch in which every action is
+        a replay commits nothing and needs no digest check, so an identical
+        retry of an already-applied batch stays a ``200`` even though the
+        first apply moved the digest. All new operations are then committed
+        together in one atomic commit, exactly like a sync-import batch.
+
+        Returns ``(status, results, accepted, replayed, error)``: 201 when
+        at least one action was newly committed or 200 when every action
+        was a replay, with ``results`` in request order (each carrying
+        ``action``, ``key``, ``replicaId``, ``operationId``, and the
+        committed ``value``); or 409 with ``"operation_conflict"`` /
+        ``"apply_conflict"`` / ``"resolution_conflict"`` and an unchanged
+        store. Raises ValueError when a resolution clock does not dominate
+        its expected candidates (a malformed request, not a state
+        conflict); raises PersistenceError when the durable commit fails,
+        in which case memory, the identity index, and the file are
+        unchanged and the request can be retried.
+        """
+        with self._lock:
+            # Staged copies keep the whole dry run off the visible state:
+            # the batch is fixed in its entirety before the single commit.
+            staged_operations = dict(self._operations)
+            staged_candidates = {
+                key: list(candidates) for key, candidates in self._candidates.items()
+            }
+            new_records: list[tuple[str, dict[str, Any]]] = []
+            results: list[dict[str, Any]] = []
+            accepted = 0
+            replayed = 0
+
+            for entry in actions:
+                action = entry["action"]
+                key = entry["key"]
+                entry_replica = entry["replicaId"]
+                identity = (entry_replica, entry["operationId"])
+                operation = {
+                    "operationId": entry["operationId"],
+                    "key": key,
+                    "value": entry["value"],
+                    "clock": entry["clock"],
+                }
+                seen = staged_operations.get(identity)
+                if seen is not None and seen != operation:
+                    return HTTPStatus.CONFLICT, [], 0, 0, "operation_conflict"
+
+                if action == "send_local":
+                    # The local side must still hold the candidate the plan
+                    # wants to propagate: an unknown identity, an
+                    # overwritten candidate, or a remote side that no
+                    # longer needs the send all mean the plan's direction
+                    # no longer holds.
+                    if seen is None:
+                        return HTTPStatus.CONFLICT, [], 0, 0, "apply_conflict"
+                    current = staged_candidates.get(key, [])
+                    if not any(
+                        (c["replicaId"], c["operationId"]) == identity for c in current
+                    ):
+                        return HTTPStatus.CONFLICT, [], 0, 0, "apply_conflict"
+                    remote_candidate = next(
+                        (
+                            c
+                            for c in snapshot.get(key, [])
+                            if (c["replicaId"], c["operationId"]) == identity
+                        ),
+                        None,
+                    )
+                    if remote_candidate is not None and (
+                        remote_candidate["value"] != entry["value"]
+                        or not clock_dominates(entry["clock"], remote_candidate["clock"])
+                    ):
+                        return HTTPStatus.CONFLICT, [], 0, 0, "apply_conflict"
+                    replayed += 1
+                    results.append(
+                        {
+                            "action": action,
+                            "key": key,
+                            "replicaId": entry_replica,
+                            "operationId": entry["operationId"],
+                            "value": seen["value"],
+                        }
+                    )
+                    continue
+
+                if action == "fetch_remote":
+                    if seen is None:
+                        # The remote snapshot must still hold exactly the
+                        # candidate the plan told us to pull.
+                        remote_candidate = next(
+                            (
+                                c
+                                for c in snapshot.get(key, [])
+                                if (c["replicaId"], c["operationId"]) == identity
+                            ),
+                            None,
+                        )
+                        if (
+                            remote_candidate is None
+                            or remote_candidate["value"] != entry["value"]
+                            or remote_candidate["clock"] != entry["clock"]
+                        ):
+                            return HTTPStatus.CONFLICT, [], 0, 0, "apply_conflict"
+                        staged_operations[identity] = operation
+                        staged_candidates[key] = self._next_candidates(
+                            staged_candidates.get(key, []), entry_replica, operation
+                        )
+                        new_records.append((entry_replica, operation))
+                        accepted += 1
+                        results.append(
+                            {
+                                "action": action,
+                                "key": key,
+                                "replicaId": entry_replica,
+                                "operationId": entry["operationId"],
+                                "value": operation["value"],
+                            }
+                        )
+                        continue
+                    # Identical content already committed: an idempotent
+                    # replay answered from the committed record.
+                    replayed += 1
+                    results.append(
+                        {
+                            "action": action,
+                            "key": key,
+                            "replicaId": entry_replica,
+                            "operationId": entry["operationId"],
+                            "value": seen["value"],
+                        }
+                    )
+                    continue
+
+                # semantic_resolution: a manual resolution embedded in the
+                # batch, with the entry's merged value and expected
+                # candidate set.
+                if seen is not None:
+                    replayed += 1
+                    results.append(
+                        {
+                            "action": action,
+                            "key": key,
+                            "replicaId": entry_replica,
+                            "operationId": entry["operationId"],
+                            "value": seen["value"],
+                        }
+                    )
+                    continue
+                current = staged_candidates.get(key, [])
+                if not current or all(c["value"] == current[0]["value"] for c in current):
+                    return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
+                current_identities = {
+                    (c["replicaId"], c["operationId"]) for c in current
+                }
+                expected_identities = {
+                    (c["replicaId"], c["operationId"]) for c in entry["candidates"]
+                }
+                if current_identities != expected_identities:
+                    return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
+                # A legal clock that fails to dominate the expected
+                # candidates is a malformed request (400), not a state
+                # conflict; the dry run has touched nothing.
+                if not all(
+                    clock_dominates(operation["clock"], c["clock"]) for c in current
+                ):
+                    raise ValueError("clock does not dominate every expected candidate")
+                staged_operations[identity] = operation
+                staged_candidates[key] = self._next_candidates(
+                    current, entry_replica, operation
+                )
+                new_records.append((entry_replica, operation))
+                accepted += 1
+                results.append(
+                    {
+                        "action": action,
+                        "key": key,
+                        "replicaId": entry_replica,
+                        "operationId": entry["operationId"],
+                        "value": operation["value"],
+                    }
+                )
+
+            if not new_records:
+                return HTTPStatus.OK, results, accepted, replayed, None
+
+            # The batch would commit: the plan must still match the
+            # committed candidate snapshot it was computed against. A pure
+            # replay never reaches here, so an identical retry of an
+            # already-applied batch is not rejected for the digest the
+            # first apply itself moved.
+            local_digest = hashlib.sha256(
+                _verification_digest_input(self._candidates)
+            ).hexdigest()
+            if local_digest != expected_digest:
+                return HTTPStatus.CONFLICT, [], 0, 0, "apply_conflict"
+
+            # Commit every new operation together. The atomic rename is the
+            # single durable commit point; memory and the identity index
+            # move only after it succeeds, so a failed durable commit
+            # leaves everything exactly as before.
+            if self._data_file is not None:
+                previous_length = len(self._accepted)
+                self._accepted.extend(new_records)
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    del self._accepted[previous_length:]
+                    raise
+            else:
+                self._accepted.extend(new_records)
+            for record_replica, operation in new_records:
+                self._operations[(record_replica, operation["operationId"])] = operation
+                op_key = operation["key"]
+                self._candidates[op_key] = self._next_candidates(
+                    self._candidates.get(op_key, []), record_replica, operation
+                )
+            return HTTPStatus.CREATED, results, accepted, replayed, None
+
     def get_key_audit_digest(self, key: str) -> dict[str, Any]:
         """Return one key's audit-integrity digest from a single snapshot.
 
@@ -6737,6 +7165,56 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._store.plan_replication_sync(replica_id, snapshot),
         )
 
+    def _handle_replication_apply_post(self) -> None:
+        # The declared-length check (400/413) and the write-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those. The route
+        # accepts no query parameters, and that check precedes the body
+        # check. The batch commits under the same commit lock as every
+        # other write: the response follows the batch contract — compact
+        # JSON, one trailing newline, counts only as JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            replica_id, snapshot, expected_digest, actions = (
+                parse_replication_apply_payload(raw)
+            )
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status, results, accepted, replayed, error = (
+                self._store.apply_replication_plan(
+                    replica_id, snapshot, expected_digest, actions
+                )
+            )
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        except PersistenceError:
+            self._json_newline(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+            )
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json_newline(status, {"error": error})
+            return
+        self._json_newline(
+            status,
+            {
+                "status": "created" if status is HTTPStatus.CREATED else "ok",
+                "replicaId": replica_id,
+                "actions": results,
+                "accepted": accepted,
+                "replayed": replayed,
+            },
+        )
+
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)
         if params is None:
@@ -7369,6 +7847,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "replication"
             and segments[2] == "plan"
         )
+        is_replication_apply_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "apply"
+        )
         if (
             matched
             or matched_ack
@@ -7383,6 +7867,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_causal_at_post
             or is_replication_compare_post
             or is_replication_plan_post
+            or is_replication_apply_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -7495,6 +7980,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_replication_plan_post:
             self._handle_replication_plan_post()
+            return
+        if is_replication_apply_post:
+            self._handle_replication_apply_post()
             return
         self._handle_sync_post()
 
