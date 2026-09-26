@@ -991,6 +991,32 @@ Every number in the response is a JSON integer. The checkpoint cursor, the uncon
 
 A peer that has never registered a checkpoint returns HTTP 404 with `{"error":"not_found"}`. A missing or extra path segment (for example `/v1/replication`, `/v1/replication/status/extra`, or a trailing slash) likewise returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 with a `Bearer` challenge, in scope-policy mode an authenticated token lacking the read scope is HTTP 403 without a challenge, and `/health` stays anonymous. With `--data-file`, the log, the checkpoints, and the receipts are rebuilt identically during recovery, so the same state yields the same status before and after a restart.
 
+### Sender-side replication delivery overview
+
+`GET /v1/replication/status/all?after=N&limit=N` returns a strictly read-only delivery overview over **every** registered sender-side replication peer in one report. It is the all-peers companion to the single-peer `GET /v1/replication/status?peerId=P` above: the detail page, the resume cursor, the complete peer count, the aggregate totals, and the chain-anomaly aggregate are all read together from one committed snapshot. The endpoint never advances or writes a checkpoint, creates no receipt, and changes neither the accepted log, candidates, audit streams, metrics counters, summaries, nor the data file; it creates no temporary file.
+
+Both paging parameters are required and must each appear exactly once as ASCII decimal integers: `after` is the number of registered peers to skip (a 0-based resume cursor over the overview's peer-id order) and `limit` must be between 1 and 100. A missing, repeated, blank, signed, or non-ASCII-digit `after`/`limit`, any unknown parameter, and a `limit` outside `1-100` return HTTP 400 with `{"error":"invalid_request"}`. An `after` equal to the registered-peer count is a valid empty tail page; an `after` past the count is HTTP 400 with `{"error":"invalid_request"}`, the bound being checked against the committed snapshot. A missing or extra path segment (for example `/v1/replication/status`, `/v1/replication/status/all/extra`, or a trailing slash) or an unknown route returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly six fields in this order:
+
+```json
+{"peers":[{"peer":"peer-a","pos":2,"left":1,"acks":1,"chainStatus":"ok"}],"nextCursor":1,"hasMore":false,"peerCount":1,"totals":{"pos":2,"left":1,"acks":1},"anomalies":{"gaps":[],"overlaps":[],"identityMismatches":[],"cursorRegressions":[]}}
+```
+
+- `peers`: the requested detail page. Peers are ordered by peer id in ascending lexicographic (dictionary) order, and the page covers `limit` peers beginning after the `after` skipped. Each item has exactly five fields in this order:
+  - `peer`: the registered peer id.
+  - `pos`: the peer's registered checkpoint cursor — the number of accepted records the peer has consumed.
+  - `left`: the number of accepted records past the checkpoint the peer has not yet consumed.
+  - `acks`: the number of the peer's committed receipts.
+  - `chainStatus`: the peer's receipt chain conclusion — `"ok"` or `"broken"`, exactly the `chain.status` the single-peer status reports.
+- `nextCursor`: the number of peers skipped after this page — feed it back as the next `after`.
+- `hasMore`: whether further peers remain past the page.
+- `peerCount`: the number of peers in the **complete** registered set, not just the current page.
+- `totals`: `pos`, `left`, and `acks` summed over the complete registered set, never just the current page.
+- `anomalies`: the receipt-audit anomaly aggregate over the complete registered set, with the four list names reused from the receipt chain audit — `gaps`, `overlaps`, `identityMismatches`, and `cursorRegressions`. Each entry is the corresponding receipt-audit marker (same fields as the single-peer chain audit) with an additional leading `peer` field naming the peer whose receipt chain produced it; lists stay grouped by anomaly kind and, within each list, follow ascending peer-id order.
+
+Every number in the response is a JSON integer; no float, negative zero, or non-finite value can appear. An empty registered set returns an empty `peers` page, `nextCursor` 0, `hasMore` false, `peerCount` 0, all-zero totals, and four empty anomaly lists. The page, the cursor, the totals, and the anomalies are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, checkpoint commits, and acknowledgement commits, so a concurrent commit is observed only as a complete old or new overview, never a mix. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 with a `Bearer` challenge, in scope-policy mode an authenticated token lacking the `read` (or `admin`) scope is HTTP 403 with `{"error":"forbidden"}` and no challenge, and `/health` stays anonymous. With `--data-file`, the log, the checkpoints, and the receipts are rebuilt identically during recovery, so the same state yields the same overview, page order, totals, and anomalies before and after a restart.
+
 ## Tests
 
 ```bash
