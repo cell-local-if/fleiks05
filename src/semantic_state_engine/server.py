@@ -869,6 +869,22 @@ def parse_causal_descendants_query(query: str) -> tuple[str, str, int, int] | No
     return replica_id, operation_id, after, limit
 
 
+def parse_causal_frontier_query(query: str) -> tuple[int, int] | None:
+    """Validate the causal-frontier query string.
+
+    Both ``after`` and ``limit`` are **required** (there are no defaults,
+    unlike the single-operation causal chains): each must appear exactly
+    once as a non-negative ASCII decimal integer, with ``limit`` between
+    1 and 100. A missing or repeated name, an unknown parameter, a blank,
+    signed, whitespace-bearing, decimal-point, or non-ASCII-decimal
+    value, and an out-of-range ``limit`` return None. The bound on
+    ``after`` against the frontier size is checked by the store against
+    the committed snapshot (``after`` equal to the frontier size is a
+    valid stable empty page).
+    """
+    return parse_peer_pickup_query(query)
+
+
 def parse_metrics_query(query: str) -> bool:
     """Validate the metrics query string, which accepts no parameters.
 
@@ -4428,6 +4444,80 @@ class StateStore:
             "more": cursor < total,
         }
 
+    def get_causal_frontier(
+        self, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of the causal frontier from a single snapshot.
+
+        The frontier is the maximal set of first-accepted operations: the
+        accepted records whose clock no **other** accepted record's clock
+        strictly dominates (missing components count as 0, and domination
+        already requires the clocks to differ). Two records whose clocks
+        are equal, or that dominate each other in neither direction, both
+        stay on the frontier; the operation's source kind is irrelevant —
+        ordinary writes, stale writes that added no candidate, sync
+        imports, and accepted manual or automatic repairs all participate
+        as ordinary committed records, while identical replays, rejected
+        (400/409) requests, uncommitted requests, and requests whose
+        durable commit failed never enter the log and so never appear.
+
+        The frontier, the page slice, the resume cursor, the remaining
+        flag, the complete count, and the digest are all computed under
+        the same commit lock used by local writes, sync imports, repairs,
+        and checkpoint commits, so the response always describes a single
+        commit: a read can never observe half an import batch or a
+        partially applied repair. The snapshot mutates neither memory,
+        the data file, candidates, metrics, audits, checkpoints, nor
+        logs.
+
+        Returns ``(200, report)`` with exactly six fields: ``operations``
+        (one page of frontier records in the shared log's global commit
+        order, each in the per-operation archive shape
+        ``{"replicaId", "operation"}``), ``nextCursor`` (the number of
+        frontier records skipped after this page — feed it back as the
+        next ``after``), ``hasMore`` (whether further frontier records
+        remain), ``algorithm`` (``"sha256"``), ``digest`` (the
+        64-character lowercase hexadecimal SHA-256 of the complete
+        frontier serialized by :func:`_key_audit_digest_input` — the
+        audit chain's canonical record bytes, one compact array element
+        per frontier record in frontier order, an empty frontier hashing
+        ``[]``), and ``frontierCount`` (the complete frontier size, never
+        the page length). An ``after`` equal to the frontier size is a
+        valid stable empty page. Raises ValueError when ``after`` is past
+        the frontier size of the snapshot. With ``--data-file`` the log
+        is rebuilt identically during recovery, so the same state yields
+        the same frontier, the same digest, and the same pages before and
+        after a restart.
+        """
+        with self._lock:
+            accepted = self._accepted
+            frontier: list[tuple[str, dict[str, Any]]] = []
+            for index, (replica_id, operation) in enumerate(accepted):
+                dominated = any(
+                    other_index != index
+                    and clock_dominates(other_operation["clock"], operation["clock"])
+                    for other_index, (_, other_operation) in enumerate(accepted)
+                )
+                if not dominated:
+                    frontier.append((replica_id, operation))
+            total = len(frontier)
+            if after > total:
+                raise ValueError("after is past the end of the causal frontier")
+            digest_input = _key_audit_digest_input(frontier)
+            page = [
+                self._source_record_locked(replica_id, operation)
+                for replica_id, operation in frontier[after : after + limit]
+            ]
+        next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "operations": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "frontierCount": total,
+        }
+
     def get_checkpoint(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Return the registered checkpoint, or 404 when ``peer_id`` is unknown.
 
@@ -5602,10 +5692,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_causal_descendants_get()
             return
         if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "causal"
+            and segments[2] == "frontier"
+        ):
+            self._handle_causal_frontier_get()
+            return
+        if (
             len(segments) == 4
             and segments[0] == "v1"
             and segments[1] == "causal"
-            and segments[2] not in ("compare", "diff", "descendants")
+            and segments[2] not in ("compare", "diff", "descendants", "frontier")
         ):
             self._handle_causal_get(segments[2], segments[3])
             return
@@ -6184,6 +6282,30 @@ class RequestHandler(BaseHTTPRequestHandler):
             status, payload = self._store.get_causal_descendants(
                 replica_id, operation_id, after, limit
             )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(status, payload)
+
+    def _handle_causal_frontier_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before any
+        # query check), so a malformed query is rejected here without any
+        # state being read or changed. The frontier route carries only the
+        # required after/limit paging pair, and its response follows the
+        # same compact-single-line contract as the other causal queries:
+        # canonical JSON, one trailing newline, numbers only as integers.
+        params = parse_causal_frontier_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_causal_frontier(after, limit)
         except ValueError:
             self._json_canonical_newline(
                 HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
