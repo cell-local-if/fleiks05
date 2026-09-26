@@ -1147,6 +1147,88 @@ def parse_replication_compare_payload(
     return replica_id, snapshot
 
 
+REPLICATION_CONSENSUS_MIN_SOURCES = 2
+REPLICATION_CONSENSUS_MAX_SOURCES = 100
+
+# Source id under which the local committed candidate state participates
+# in a consensus decision, alongside the request's remote replica ids.
+LOCAL_CONSENSUS_SOURCE = "local"
+
+
+def parse_replication_consensus_payload(
+    raw: bytes | str | list[Any],
+) -> list[tuple[str, dict[str, list[dict[str, Any]]]]]:
+    """Parse and validate a multi-replica convergence-consensus body.
+
+    The body must be a JSON array of between two and one hundred entries,
+    each an object with exactly ``replicaId`` and ``snapshot``: a remote
+    replica's identifier (a non-empty string, unique within the array)
+    and its complete candidate snapshot under exactly the comparison's
+    constraints (:func:`_parse_remote_snapshot`). The empty array, an
+    oversized array, a non-array document, an empty or duplicated replica
+    id, an unknown or missing field, a duplicated field anywhere in the
+    document, a malformed snapshot, or any structurally illegal candidate
+    — including floats such as ``1.0`` and ``-0.0`` and non-finite values
+    such as ``NaN``/``Infinity``/``-Infinity`` — raise ValueError.
+    Returns the entries in request order as ``(replicaId, snapshot)``
+    pairs. The snapshots are only validated — never imported into local
+    state.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        # Already-decoded sequences come from store-level callers, which
+        # bypass JSON and therefore the duplicate-key hook.
+        text = None
+    if text is None:
+        payload = raw
+    else:
+        def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+            document: dict[Any, Any] = {}
+            for key, value in pairs:
+                if key in document:
+                    raise ValueError("duplicate field in body")
+                document[key] = value
+            return document
+
+        try:
+            payload = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    if not isinstance(payload, list) or not (
+        REPLICATION_CONSENSUS_MIN_SOURCES
+        <= len(payload)
+        <= REPLICATION_CONSENSUS_MAX_SOURCES
+    ):
+        raise ValueError("body must be an array of 2-100 replica snapshots")
+    sources: list[tuple[str, dict[str, list[dict[str, Any]]]]] = []
+    replica_ids: set[str] = set()
+    for entry in payload:
+        if not isinstance(entry, dict) or set(entry.keys()) != {"replicaId", "snapshot"}:
+            raise ValueError(
+                "each entry must be an object with only replicaId and snapshot"
+            )
+        replica_id = entry["replicaId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise ValueError("replicaId must be a non-empty string")
+        if replica_id == LOCAL_CONSENSUS_SOURCE:
+            # The local committed state participates under this reserved
+            # source id; a remote claiming it would make the evidence
+            # attribution ambiguous.
+            raise ValueError("replicaId must not collide with the local source id")
+        if replica_id in replica_ids:
+            raise ValueError("duplicate replicaId in consensus sources")
+        replica_ids.add(replica_id)
+        snapshot = _parse_remote_snapshot(entry["snapshot"])
+        sources.append((replica_id, snapshot))
+    return sources
+
+
 REPLICATION_APPLY_MIN_ACTIONS = 1
 REPLICATION_APPLY_MAX_ACTIONS = 100
 
@@ -4234,6 +4316,172 @@ class StateStore:
             },
         }
 
+    def replication_consensus_summary(
+        self,
+        sources: list[tuple[str, dict[str, list[dict[str, Any]]]]],
+    ) -> dict[str, Any]:
+        """Aggregate one convergence decision over several remote replicas.
+
+        The local committed candidate state participates as the first
+        source (``"local"``), followed by the already-validated remote
+        ``(replicaId, snapshot)`` entries in request order. Observations
+        are aggregated by business key and then by operation identity
+        ``(replicaId, operationId)``. Each identity observed by at least
+        one source is classified under one status:
+
+        - ``"converged"``: every observation holds exactly the same value
+          and exactly the same clock.
+        - ``"propagable"``: every observation holds the same value but the
+          clocks differ, and exactly one observation's clock dominates all
+          the others (missing components count as 0). The decision names
+          the winning version's source (``"local"`` or a remote id) and
+          retains every eliminated clock as evidence.
+        - ``"conflict"``: anything else — equal values with no single
+          dominant clock (concurrent or equal clocks), or different values
+          across sources. All observations and the identity are retained;
+          no value is chosen and no clock is merged.
+
+        Keys are sorted lexicographically and identities by
+        ``(replicaId, operationId)``, so the whole report is stable for the
+        same local snapshot and request. The local candidates are copied
+        under the same commit lock used by local writes, sync imports,
+        repairs, and checkpoint commits, so every decision describes one
+        complete committed snapshot. The query is strictly read-only: it
+        mutates neither memory nor the data file and creates no temporary
+        file.
+        """
+        with self._lock:
+            local = {
+                key: [
+                    {
+                        "value": candidate["value"],
+                        "clock": dict(candidate["clock"]),
+                        "replicaId": candidate["replicaId"],
+                        "operationId": candidate["operationId"],
+                    }
+                    for candidate in candidates
+                ]
+                for key, candidates in self._candidates.items()
+            }
+
+        named_sources: list[tuple[str, dict[str, list[dict[str, Any]]]]] = [
+            (LOCAL_CONSENSUS_SOURCE, local),
+            *sources,
+        ]
+        source_ids = [source_id for source_id, _ in named_sources]
+
+        # key -> identity -> list of (source_id, candidate) in source order
+        observations: dict[
+            str, dict[tuple[str, str], list[tuple[str, dict[str, Any]]]]
+        ] = {}
+        for source_id, snapshot in named_sources:
+            for key, candidates in snapshot.items():
+                key_groups = observations.setdefault(key, {})
+                for candidate in candidates:
+                    identity = (candidate["replicaId"], candidate["operationId"])
+                    key_groups.setdefault(identity, []).append((source_id, candidate))
+
+        groups: list[dict[str, Any]] = []
+        converged_count = 0
+        propagable_count = 0
+        conflict_count = 0
+        for key in sorted(observations):
+            identities_report: list[dict[str, Any]] = []
+            for identity in sorted(observations[key]):
+                observed = observations[key][identity]
+                values = {candidate["value"] for _, candidate in observed}
+                clocks = [
+                    (source_id, dict(candidate["clock"]))
+                    for source_id, candidate in observed
+                ]
+                same_clock = all(
+                    clock == clocks[0][1] for _, clock in clocks[1:]
+                )
+                if same_clock and len(values) == 1:
+                    # Every observation is byte-for-byte the same version.
+                    winner = observed[0][1]
+                    identities_report.append(
+                        {
+                            "replicaId": identity[0],
+                            "operationId": identity[1],
+                            "status": "converged",
+                            "value": winner["value"],
+                            "clock": winner["clock"],
+                            "sources": [source_id for source_id, _ in observed],
+                        }
+                    )
+                    converged_count += 1
+                    continue
+                if len(values) == 1:
+                    # Same value everywhere: only one clock may be auto
+                    # propagated, and only when it dominates every other
+                    # observed clock. Equal clocks never dominate, so a tie
+                    # falls through to semantic repair.
+                    dominant = [
+                        index
+                        for index, (_, clock) in enumerate(clocks)
+                        if all(
+                            index == other_index
+                            or clock_dominates(clock, clocks[other_index][1])
+                            for other_index in range(len(clocks))
+                        )
+                    ]
+                    if len(dominant) == 1:
+                        winner_index = dominant[0]
+                        winner_source, winner_clock = clocks[winner_index]
+                        winner_value = observed[winner_index][1]["value"]
+                        superseded = [
+                            {"source": source_id, "clock": clock}
+                            for index, (source_id, clock) in enumerate(clocks)
+                            if index != winner_index
+                        ]
+                        identities_report.append(
+                            {
+                                "replicaId": identity[0],
+                                "operationId": identity[1],
+                                "status": "propagable",
+                                "decision": {
+                                    "source": winner_source,
+                                    "value": winner_value,
+                                    "clock": winner_clock,
+                                },
+                                "supersededClocks": superseded,
+                            }
+                        )
+                        propagable_count += 1
+                        continue
+                # Either the values diverge or no single clock dominates:
+                # the identity needs semantic repair. Every observation is
+                # retained as evidence; no value is chosen and no clock is
+                # merged.
+                identities_report.append(
+                    {
+                        "replicaId": identity[0],
+                        "operationId": identity[1],
+                        "status": "conflict",
+                        "observations": [
+                            {
+                                "source": source_id,
+                                "value": candidate["value"],
+                                "clock": dict(candidate["clock"]),
+                            }
+                            for source_id, candidate in observed
+                        ],
+                    }
+                )
+                conflict_count += 1
+            groups.append({"key": key, "identities": identities_report})
+        return {
+            "status": "ok",
+            "sources": source_ids,
+            "keys": groups,
+            "summary": {
+                "converged": converged_count,
+                "propagable": propagable_count,
+                "conflicts": conflict_count,
+            },
+        }
+
     def apply_replication_plan(
         self,
         replica_id: str,
@@ -7121,6 +7369,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._store.plan_replication_sync(replica_id, snapshot),
         )
 
+    def _handle_replication_consensus_post(self) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those. The route
+        # accepts no query parameters, and that check precedes the body
+        # check. The summary is strictly read-only: the remote snapshots
+        # are validated and aggregated with one committed local snapshot
+        # but never imported, and no repair, transaction, sync, checkpoint,
+        # or persistence runs. The report follows the compact-single-line
+        # contract: canonical UTF-8 JSON, one trailing newline, counts and
+        # vector-clock ticks only as JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            sources = parse_replication_consensus_payload(raw)
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(
+            HTTPStatus.OK,
+            self._store.replication_consensus_summary(sources),
+        )
+
     def _handle_replication_apply_post(self) -> None:
         # The declared-length check (400/413) and the write-scope check ran
         # in do_POST before this handler, neither reading the body;
@@ -7818,6 +8098,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "replication"
             and segments[2] == "apply"
         )
+        is_replication_consensus_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "consensus"
+        )
         if (
             matched
             or matched_ack
@@ -7833,6 +8119,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_replication_compare_post
             or is_replication_plan_post
             or is_replication_apply_post
+            or is_replication_consensus_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -7876,6 +8163,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # snapshot and never imports the remote candidates, so it
                 # is gated like the comparison: a read or admin scope
                 # suffices.
+                if not self._require_scope(SCOPE_READ):
+                    return
+            elif is_replication_consensus_post:
+                # The multi-replica convergence summary is strictly
+                # read-only — the remote snapshots are aggregated but
+                # never imported — so it is gated like the comparison and
+                # the plan: a read or admin scope suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
             elif not self._require_scope(SCOPE_WRITE):
@@ -7948,6 +8242,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_replication_apply_post:
             self._handle_replication_apply_post()
+            return
+        if is_replication_consensus_post:
+            self._handle_replication_consensus_post()
             return
         self._handle_sync_post()
 
