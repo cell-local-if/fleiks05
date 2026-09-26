@@ -1026,6 +1026,69 @@ def parse_causal_at_payload(raw: bytes | str | dict[str, Any]) -> dict[str, int]
     return _validate_boundary_clock(payload.get("clock"))
 
 
+def _parse_remote_snapshot(snapshot_raw: Any) -> dict[str, list[dict[str, Any]]]:
+    """Validate a remote replica's complete candidate snapshot.
+
+    The snapshot maps each business key to a non-empty array of
+    candidates. Each candidate must contain exactly ``value``, ``clock``,
+    ``replicaId``, and ``operationId`` and satisfy the live write
+    constraints: the value and both identity components are non-empty
+    strings, and the clock follows :func:`_validate_clock` (a non-empty
+    object whose component values are non-boolean, non-negative JSON
+    integers — floats such as ``1.0`` and ``-0.0`` and non-finite values
+    are rejected — and which contains the candidate's own replica id). An
+    empty key or candidate array, or an operation identity
+    ``(replicaId, operationId)`` appearing more than once across the
+    whole snapshot raises ValueError. Returns the normalized snapshot;
+    it is only validated — never imported into local state.
+    """
+    if not isinstance(snapshot_raw, dict):
+        raise ValueError("snapshot must be an object mapping keys to candidate arrays")
+
+    snapshot: dict[str, list[dict[str, Any]]] = {}
+    identities: set[tuple[str, str]] = set()
+    for key, candidates_raw in snapshot_raw.items():
+        if not isinstance(key, str) or key == "":
+            raise ValueError("snapshot keys must be non-empty strings")
+        if not isinstance(candidates_raw, list) or not candidates_raw:
+            raise ValueError("each snapshot entry must be a non-empty candidate array")
+        candidates: list[dict[str, Any]] = []
+        for entry in candidates_raw:
+            if not isinstance(entry, dict) or set(entry.keys()) != {
+                "value",
+                "clock",
+                "replicaId",
+                "operationId",
+            }:
+                raise ValueError(
+                    "each candidate must have only value, clock, replicaId, operationId"
+                )
+            value = entry["value"]
+            if not isinstance(value, str) or value == "":
+                raise ValueError("value must be a non-empty string")
+            candidate_replica = entry["replicaId"]
+            if not isinstance(candidate_replica, str) or candidate_replica == "":
+                raise ValueError("replicaId must be a non-empty string")
+            operation_id = entry["operationId"]
+            if not isinstance(operation_id, str) or operation_id == "":
+                raise ValueError("operationId must be a non-empty string")
+            clock = _validate_clock(entry["clock"], candidate_replica)
+            identity = (candidate_replica, operation_id)
+            if identity in identities:
+                raise ValueError("duplicate candidate identity in snapshot")
+            identities.add(identity)
+            candidates.append(
+                {
+                    "value": value,
+                    "clock": clock,
+                    "replicaId": candidate_replica,
+                    "operationId": operation_id,
+                }
+            )
+        snapshot[key] = candidates
+    return snapshot
+
+
 def parse_replication_compare_payload(
     raw: bytes | str | dict[str, Any],
 ) -> tuple[str, dict[str, list[dict[str, Any]]]]:
@@ -1080,52 +1143,168 @@ def parse_replication_compare_payload(
     replica_id = payload["replicaId"]
     if not isinstance(replica_id, str) or replica_id == "":
         raise ValueError("replicaId must be a non-empty string")
-    snapshot_raw = payload["snapshot"]
-    if not isinstance(snapshot_raw, dict):
-        raise ValueError("snapshot must be an object mapping keys to candidate arrays")
-
-    snapshot: dict[str, list[dict[str, Any]]] = {}
-    identities: set[tuple[str, str]] = set()
-    for key, candidates_raw in snapshot_raw.items():
-        if not isinstance(key, str) or key == "":
-            raise ValueError("snapshot keys must be non-empty strings")
-        if not isinstance(candidates_raw, list) or not candidates_raw:
-            raise ValueError("each snapshot entry must be a non-empty candidate array")
-        candidates: list[dict[str, Any]] = []
-        for entry in candidates_raw:
-            if not isinstance(entry, dict) or set(entry.keys()) != {
-                "value",
-                "clock",
-                "replicaId",
-                "operationId",
-            }:
-                raise ValueError(
-                    "each candidate must have only value, clock, replicaId, operationId"
-                )
-            value = entry["value"]
-            if not isinstance(value, str) or value == "":
-                raise ValueError("value must be a non-empty string")
-            candidate_replica = entry["replicaId"]
-            if not isinstance(candidate_replica, str) or candidate_replica == "":
-                raise ValueError("replicaId must be a non-empty string")
-            operation_id = entry["operationId"]
-            if not isinstance(operation_id, str) or operation_id == "":
-                raise ValueError("operationId must be a non-empty string")
-            clock = _validate_clock(entry["clock"], candidate_replica)
-            identity = (candidate_replica, operation_id)
-            if identity in identities:
-                raise ValueError("duplicate candidate identity in snapshot")
-            identities.add(identity)
-            candidates.append(
-                {
-                    "value": value,
-                    "clock": clock,
-                    "replicaId": candidate_replica,
-                    "operationId": operation_id,
-                }
-            )
-        snapshot[key] = candidates
+    snapshot = _parse_remote_snapshot(payload["snapshot"])
     return replica_id, snapshot
+
+
+REPLICATION_APPLY_MIN_ACTIONS = 1
+REPLICATION_APPLY_MAX_ACTIONS = 100
+
+REPLICATION_APPLY_ACTIONS = ("send_local", "fetch_remote", "semantic_resolution")
+
+
+def _parse_expected_candidate_identities(raw: Any) -> list[dict[str, str]]:
+    """Validate the expected candidate identity set of a semantic repair.
+
+    The set is a non-empty list of distinct ``{"replicaId", "operationId"}``
+    identities — the candidate identities the repair expects its target key
+    to currently hold. Raises ValueError on any violation.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("candidates must be a non-empty list")
+    candidates: list[dict[str, str]] = []
+    identities: set[tuple[str, str]] = set()
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {"replicaId", "operationId"}:
+            raise ValueError("each candidate must have only replicaId and operationId")
+        candidate_replica = entry["replicaId"]
+        candidate_operation = entry["operationId"]
+        if not isinstance(candidate_replica, str) or candidate_replica == "":
+            raise ValueError("candidate replicaId must be a non-empty string")
+        if not isinstance(candidate_operation, str) or candidate_operation == "":
+            raise ValueError("candidate operationId must be a non-empty string")
+        identity = (candidate_replica, candidate_operation)
+        if identity in identities:
+            raise ValueError(f"duplicate candidate {identity!r}")
+        identities.add(identity)
+        candidates.append({"replicaId": candidate_replica, "operationId": candidate_operation})
+    return candidates
+
+
+def parse_replication_apply_payload(
+    raw: bytes | str | dict[str, Any],
+) -> tuple[str, str, dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Parse and validate an executable replica-repair batch body.
+
+    The body must be a JSON object with exactly ``replicaId``,
+    ``expectedLocalDigest``, ``snapshot``, and ``actions``: the remote
+    replica's identifier (a non-empty string), the 64-character lowercase
+    hexadecimal digest the caller expects the current committed local
+    candidate snapshot to have, the remote's complete candidate snapshot
+    (exactly the comparison's constraints, see
+    :func:`_parse_remote_snapshot`), and the ordered list of 1-100 repair
+    actions. Each action names its direction in ``action`` —
+    ``"send_local"``, ``"fetch_remote"``, or ``"semantic_resolution"`` —
+    and carries the candidate identity (``replicaId``, ``operationId``),
+    ``key``, ``value``, and ``clock`` it acts on; a semantic repair
+    additionally carries ``candidates``, the expected current candidate
+    identity set of its target key (its ``value`` is the merged value).
+    A duplicated field anywhere in the document, an unknown or missing
+    field, an unknown direction, a structurally illegal entry, or an
+    operation identity ``(replicaId, operationId)`` appearing in more
+    than one action raises ValueError. Returns the remote replica id,
+    the expected digest, the normalized snapshot, and the normalized
+    actions in request order. Nothing is validated against local state
+    here — the snapshot is only parsed, never imported.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        # Already-decoded mappings come from store-level callers, which
+        # bypass JSON and therefore the duplicate-key hook.
+        text = None
+    if text is None:
+        payload = raw
+    else:
+        def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+            document: dict[Any, Any] = {}
+            for key, value in pairs:
+                if key in document:
+                    raise ValueError("duplicate field in body")
+                document[key] = value
+            return document
+
+        try:
+            payload = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload.keys()) != {
+        "replicaId",
+        "expectedLocalDigest",
+        "snapshot",
+        "actions",
+    }:
+        raise ValueError(
+            "body must be an object with only replicaId, expectedLocalDigest, "
+            "snapshot, actions"
+        )
+    replica_id = payload["replicaId"]
+    if not isinstance(replica_id, str) or replica_id == "":
+        raise ValueError("replicaId must be a non-empty string")
+    expected_digest = payload["expectedLocalDigest"]
+    if not _is_sha256_hex64(expected_digest):
+        raise ValueError("expectedLocalDigest must be 64 lowercase hexadecimal characters")
+    snapshot = _parse_remote_snapshot(payload["snapshot"])
+    actions_raw = payload["actions"]
+    if not isinstance(actions_raw, list) or not (
+        REPLICATION_APPLY_MIN_ACTIONS <= len(actions_raw) <= REPLICATION_APPLY_MAX_ACTIONS
+    ):
+        raise ValueError("actions must be a list of 1-100 entries")
+
+    actions: list[dict[str, Any]] = []
+    identities: set[tuple[str, str]] = set()
+    for entry in actions_raw:
+        if not isinstance(entry, dict):
+            raise ValueError("each action must be an object")
+        action = entry.get("action")
+        if action not in REPLICATION_APPLY_ACTIONS:
+            raise ValueError(
+                "action must be send_local, fetch_remote, or semantic_resolution"
+            )
+        expected_fields = {"action", "key", "replicaId", "operationId", "value", "clock"}
+        if action == "semantic_resolution":
+            expected_fields.add("candidates")
+        if set(entry.keys()) != expected_fields:
+            raise ValueError(
+                "each action must have only "
+                + ", ".join(sorted(expected_fields))
+            )
+        key = entry["key"]
+        if not isinstance(key, str) or key == "":
+            raise ValueError("key must be a non-empty string")
+        entry_replica = entry["replicaId"]
+        if not isinstance(entry_replica, str) or entry_replica == "":
+            raise ValueError("replicaId must be a non-empty string")
+        operation_id = entry["operationId"]
+        if not isinstance(operation_id, str) or operation_id == "":
+            raise ValueError("operationId must be a non-empty string")
+        value = entry["value"]
+        if not isinstance(value, str) or value == "":
+            raise ValueError("value must be a non-empty string")
+        clock = _validate_clock(entry["clock"], entry_replica)
+        identity = (entry_replica, operation_id)
+        if identity in identities:
+            raise ValueError(f"duplicate identity {identity!r} in batch")
+        identities.add(identity)
+        normalized: dict[str, Any] = {
+            "action": action,
+            "key": key,
+            "replicaId": entry_replica,
+            "operationId": operation_id,
+            "value": value,
+            "clock": clock,
+        }
+        if action == "semantic_resolution":
+            normalized["candidates"] = _parse_expected_candidate_identities(
+                entry["candidates"]
+            )
+        actions.append(normalized)
+    return replica_id, expected_digest, snapshot, actions
 
 
 ACK_MAX_OPERATIONS = 100
@@ -4055,6 +4234,211 @@ class StateStore:
             },
         }
 
+    def apply_replication_plan(
+        self,
+        replica_id: str,
+        expected_digest: str,
+        snapshot: dict[str, list[dict[str, Any]]],
+        actions: list[dict[str, Any]],
+    ) -> tuple[HTTPStatus, list[dict[str, Any]], int, int, str | None]:
+        """Execute a validated replica-repair batch as one atomic commit.
+
+        The parser already guarantees 1-100 actions with distinct
+        identities, a structurally legal expected digest, and a validated
+        remote snapshot. The whole batch runs under the commit lock, so a
+        concurrent commit is observed only as a complete old or new
+        snapshot, never a mix. First the expected local digest is compared
+        with the digest of the current committed candidate state: a
+        mismatch rejects the whole batch unchanged with
+        ``"apply_conflict"``. The actions are then processed in request
+        order against a staged view of the store:
+
+        - a known ``(replicaId, operationId)`` whose committed operation
+          carries the same key, value, and clock is a replay and is
+          answered from the committed operation without any state check;
+        - a known identity with different content is an operation
+          conflict;
+        - ``send_local``/``fetch_remote`` follow the sync plan's
+          directions: an unseen identity makes a send impossible (the
+          local side does not hold the candidate) and a fetch requires
+          the remote snapshot to still hold the candidate exactly as the
+          action claims — a direction that no longer holds or a candidate
+          that changed is an ``"apply_conflict"``;
+        - ``semantic_resolution`` follows the manual repair semantics: a
+          missing target key, a key no longer in value conflict, or an
+          expected candidate set that does not match the key's current
+          identities is a ``"resolution_conflict"``; a clock that does
+          not dominate every expected candidate is a malformed request
+          (ValueError), exactly as in :meth:`apply_resolution`.
+
+        A ``send_local`` action changes no local state — the candidate is
+        already committed locally — so it is idempotent by construction
+        and always counts as replayed. A ``fetch_remote`` action imports
+        the remote candidate as one ordinary operation, and a
+        ``semantic_resolution`` commits its merged value as one ordinary
+        operation, exactly like a sync-import record or a manual repair:
+        both flow through the shared accepted log, sync export, the audit
+        streams, the metrics, and the data file identically.
+
+        Any failure rejects the whole batch unchanged, however far
+        validation got. All new operations are then committed together in
+        one atomic commit: the atomic rename is the single durable commit
+        point, and memory moves only after it succeeds, so a failed
+        durable commit leaves memory, the identity index, and the file
+        exactly as before and creates no temporary file.
+
+        Returns ``(status, results, accepted, replayed, error)``: 201
+        when at least one action was newly committed or 200 when every
+        action was a replay, with ``results`` in request order (each
+        carrying ``action``, ``key``, ``replicaId``, ``operationId``, and
+        the committed ``value``); or 409 with ``"apply_conflict"`` /
+        ``"operation_conflict"`` / ``"resolution_conflict"`` and an
+        unchanged store. Raises ValueError when a semantic-repair clock
+        does not dominate its expected candidates; raises
+        PersistenceError when the durable commit fails.
+        """
+        with self._lock:
+            local_digest = hashlib.sha256(
+                _verification_digest_input(self._candidates)
+            ).hexdigest()
+            if local_digest != expected_digest:
+                return HTTPStatus.CONFLICT, [], 0, 0, "apply_conflict"
+
+            # Staged copies keep the whole dry run off the visible state:
+            # the batch is fixed in its entirety before the single commit.
+            staged_operations = dict(self._operations)
+            staged_candidates = {
+                key: list(candidates) for key, candidates in self._candidates.items()
+            }
+            new_records: list[tuple[str, dict[str, Any]]] = []
+            results: list[dict[str, Any]] = []
+            accepted = 0
+            replayed = 0
+
+            for entry in actions:
+                action = entry["action"]
+                key = entry["key"]
+                entry_replica = entry["replicaId"]
+                identity = (entry_replica, entry["operationId"])
+                operation = {
+                    "operationId": entry["operationId"],
+                    "key": key,
+                    "value": entry["value"],
+                    "clock": entry["clock"],
+                }
+                seen = staged_operations.get(identity)
+                if seen is not None:
+                    # Same replay rule as the write and batch paths: the
+                    # identity binding is the committed operation's key,
+                    # value, and clock; an identical replay is answered
+                    # without any state check, any difference is an
+                    # operation conflict.
+                    if seen == operation:
+                        replayed += 1
+                        results.append(
+                            {
+                                "action": action,
+                                "key": key,
+                                "replicaId": entry_replica,
+                                "operationId": entry["operationId"],
+                                "value": seen["value"],
+                            }
+                        )
+                        continue
+                    return HTTPStatus.CONFLICT, [], 0, 0, "operation_conflict"
+
+                if action == "semantic_resolution":
+                    current = staged_candidates.get(key, [])
+                    if not current:
+                        return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
+                    if all(c["value"] == current[0]["value"] for c in current):
+                        return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
+                    current_identities = {
+                        (c["replicaId"], c["operationId"]) for c in current
+                    }
+                    expected_identities = {
+                        (c["replicaId"], c["operationId"])
+                        for c in entry["candidates"]
+                    }
+                    if current_identities != expected_identities:
+                        return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
+                    # A legal clock that fails to dominate the expected
+                    # candidates is a malformed request (400), exactly as
+                    # in the manual repair flow, not a state conflict.
+                    if not all(
+                        clock_dominates(operation["clock"], c["clock"])
+                        for c in current
+                    ):
+                        raise ValueError(
+                            "clock does not dominate every expected candidate"
+                        )
+                elif action == "send_local":
+                    # An unseen identity is never a current local
+                    # candidate, so the planned send direction no longer
+                    # holds (the candidate moved or never existed).
+                    return HTTPStatus.CONFLICT, [], 0, 0, "apply_conflict"
+                else:
+                    # fetch_remote: the remote snapshot must still hold
+                    # the candidate exactly as the action claims. The
+                    # local side cannot hold the identity (it is unseen),
+                    # so a match makes the plan's fetch direction hold.
+                    remote_candidate = next(
+                        (
+                            candidate
+                            for candidate in snapshot.get(key, [])
+                            if (candidate["replicaId"], candidate["operationId"])
+                            == identity
+                        ),
+                        None,
+                    )
+                    if (
+                        remote_candidate is None
+                        or remote_candidate["value"] != entry["value"]
+                        or remote_candidate["clock"] != entry["clock"]
+                    ):
+                        return HTTPStatus.CONFLICT, [], 0, 0, "apply_conflict"
+
+                staged_candidates[key] = self._next_candidates(
+                    staged_candidates.get(key, []), entry_replica, operation
+                )
+                staged_operations[identity] = operation
+                new_records.append((entry_replica, operation))
+                accepted += 1
+                results.append(
+                    {
+                        "action": action,
+                        "key": key,
+                        "replicaId": entry_replica,
+                        "operationId": entry["operationId"],
+                        "value": operation["value"],
+                    }
+                )
+
+            if not new_records:
+                return HTTPStatus.OK, results, accepted, replayed, None
+
+            # Commit every new operation together. The atomic rename is
+            # the single durable commit point; memory and the identity
+            # index move only after it succeeds, so a failed durable
+            # commit leaves everything exactly as before.
+            if self._data_file is not None:
+                previous_length = len(self._accepted)
+                self._accepted.extend(new_records)
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    del self._accepted[previous_length:]
+                    raise
+            else:
+                self._accepted.extend(new_records)
+            for record_replica, record in new_records:
+                self._operations[(record_replica, record["operationId"])] = record
+                op_key = record["key"]
+                self._candidates[op_key] = self._next_candidates(
+                    self._candidates.get(op_key, []), record_replica, record
+                )
+            return HTTPStatus.CREATED, results, accepted, replayed, None
+
     def get_key_audit_digest(self, key: str) -> dict[str, Any]:
         """Return one key's audit-integrity digest from a single snapshot.
 
@@ -6737,6 +7121,65 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._store.plan_replication_sync(replica_id, snapshot),
         )
 
+    def _handle_replication_apply_post(self) -> None:
+        # The declared-length check (400/413) and the write-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those. The route
+        # accepts no query parameters, and that check precedes the body
+        # check. The batch executes against one committed snapshot: the
+        # expected local digest is verified first, then every action is
+        # validated in request order against a staged view, and all new
+        # operations commit together atomically. The response follows the
+        # compact-single-line contract: canonical UTF-8 JSON, one trailing
+        # newline, counts only as JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            replica_id, expected_digest, snapshot, actions = (
+                parse_replication_apply_payload(raw)
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        try:
+            status, results, accepted, replayed, error = (
+                self._store.apply_replication_plan(
+                    replica_id, expected_digest, snapshot, actions
+                )
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        except PersistenceError:
+            self._json_canonical_newline(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+            )
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json_canonical_newline(status, {"error": error})
+            return
+        self._json_canonical_newline(
+            status,
+            {
+                "status": "created" if status is HTTPStatus.CREATED else "ok",
+                "replicaId": replica_id,
+                "actions": results,
+                "accepted": accepted,
+                "replayed": replayed,
+            },
+        )
+
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)
         if params is None:
@@ -7369,6 +7812,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "replication"
             and segments[2] == "plan"
         )
+        is_replication_apply_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "apply"
+        )
         if (
             matched
             or matched_ack
@@ -7383,6 +7832,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_causal_at_post
             or is_replication_compare_post
             or is_replication_plan_post
+            or is_replication_apply_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -7495,6 +7945,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_replication_plan_post:
             self._handle_replication_plan_post()
+            return
+        if is_replication_apply_post:
+            self._handle_replication_apply_post()
             return
         self._handle_sync_post()
 

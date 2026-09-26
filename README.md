@@ -22,7 +22,7 @@ Unknown routes return HTTP 404 with `{"error":"not_found"}`. Responses use UTF-8
 
 ### Request body limits
 
-All twelve POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/resolve/auto/plan`, `POST /v1/sync/peers/{peerId}/checkpoint`, `POST /v1/sync/peers/{peerId}/acknowledge`, `POST /v1/transactions/apply`, and the read-only `POST /v1/states/{key}/causal-at`, `POST /v1/replication/compare`, and `POST /v1/replication/plan`) share one body-size contract:
+All thirteen POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/resolve/auto/plan`, `POST /v1/sync/peers/{peerId}/checkpoint`, `POST /v1/sync/peers/{peerId}/acknowledge`, `POST /v1/transactions/apply`, `POST /v1/replication/apply`, and the read-only `POST /v1/states/{key}/causal-at`, `POST /v1/replication/compare`, and `POST /v1/replication/plan`) share one body-size contract:
 
 - The request body is limited to **1,048,576 raw UTF-8 bytes** (1 MiB). A body whose declared length is exactly the limit is processed by the normal endpoint semantics.
 - `Content-Length` is required and validated before anything else. It must be a plain ASCII decimal integer: a missing header, an empty value, a sign, whitespace, a negative number, non-ASCII digits, or multiple headers declaring conflicting lengths all return HTTP 400 with `{"error":"invalid_request"}` — the request is never treated as having an empty body. (Multiple headers are accepted only when every occurrence declares the same length.)
@@ -900,6 +900,40 @@ Per identity, the action is decided as follows:
 Every number in the response is a JSON integer (the only numbers are key/candidate/action counts and vector-clock ticks); no float, negative zero, or non-finite value can appear. The compact encoding, escaping, and terminator are the same as `GET /v1/replication/snapshot`, and every count is written as a JSON integer.
 
 The plan is strictly read-only — it modifies neither memory nor the data file and creates no temporary file. With `--data-file`, the candidate state is rebuilt identically during recovery, so the same local state and the same remote snapshot yield the same plan before and after a restart. The route shares the common request contract: an illegal `Content-Length` is HTTP 400 `{"error":"invalid_request"}` and a declared length over the body limit is HTTP 413 `{"error":"payload_too_large"}`, both answered **before** reading the body and before authentication; a missing, duplicated, or malformed `Authorization` header or a non-matching bearer token is HTTP 401 `{"error":"unauthorized"}` with the `WWW-Authenticate: Bearer` challenge; and in scope-policy mode an authenticated token lacking the `read` or `admin` scope is HTTP 403 `{"error":"forbidden"}` with no challenge (a `read`-only token is sufficient). `/health` stays anonymous.
+
+### Executable replica repair batch
+
+`POST /v1/replication/apply` executes a planned repair batch against the local replica: it is the committing counterpart of the read-only comparison and plan. The request body is a JSON object with exactly four fields:
+
+```json
+{"replicaId":"replica-b","expectedLocalDigest":"<64 lowercase hex chars>","snapshot":{"color":[{"clock":{"r1":1},"operationId":"op-1","replicaId":"r1","value":"blue"}]},"actions":[{"action":"fetch_remote","key":"color","replicaId":"r2","operationId":"op-9","value":"red","clock":{"r2":1}}]}
+```
+
+- `replicaId`: the remote replica's identifier, a non-empty string. As in the comparison, it only names the repair partner — the snapshot may hold candidates from any replica.
+- `expectedLocalDigest`: the 64-character lowercase hexadecimal SHA-256 the caller expects the **current committed local candidate snapshot** to have — exactly the `localDigest` the comparison reports (the verification-digest rules over the current candidate sets). If it does not match the committed state, the whole batch is rejected unchanged with HTTP 409 `{"error":"apply_conflict"}`.
+- `snapshot`: the remote's complete candidate state under **exactly the comparison's constraints** — an object mapping each business key to a non-empty candidate array, each candidate carrying exactly `value`, `clock`, `replicaId`, and `operationId` with non-empty strings and a non-empty clock of non-boolean, non-negative JSON integers that contains the candidate's own replica id.
+- `actions`: the ordered repair batch, 1 to 100 entries, validated and executed **in request order against a staged view** of the store (an earlier action's effect is visible to a later one). Each entry carries `action` — `"send_local"`, `"fetch_remote"`, or `"semantic_resolution"` — plus the candidate identity (`replicaId`, `operationId`), `key`, `value`, and `clock` it acts on; a `"semantic_resolution"` entry additionally carries `candidates`, the non-empty list of distinct `{"replicaId","operationId"}` identities it expects its target key to currently hold, and its `value` is the merged value. No two actions may name the same `(replicaId, operationId)` identity.
+
+Malformed JSON, a non-object body, a missing or unknown field, a duplicated field anywhere in the document, an unknown direction, a structurally illegal entry (including an illegal clock or an illegal expected-candidate set), a duplicated action identity, or an illegal snapshot all return HTTP 400 with `{"error":"invalid_request"}` and change nothing. A semantic-repair clock that is structurally legal but does **not dominate** every expected candidate is likewise HTTP 400 `{"error":"invalid_request"}` — the same malformed-request rule the manual repair flow applies. The route accepts no query parameters: any parameter returns HTTP 400 with `{"error":"invalid_request"}`, and that check precedes the body check. A missing or extra path segment or a trailing slash (for example `/v1/replication/apply/`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter and body checks. A `GET` on the path is an unknown route and answers HTTP 404.
+
+Per action, against the staged view:
+
+- A known `(replicaId, operationId)` whose committed operation carries the same key, value, and clock is a **replay**: it is answered from the committed operation without any state check and counts as replayed. A known identity with different content is HTTP 409 `{"error":"operation_conflict"}`.
+- `"send_local"` and `"fetch_remote"` follow the synchronization plan's directions. A send whose identity is not a current local candidate (the direction no longer holds or the candidate moved) and a fetch whose remote snapshot no longer holds the candidate exactly as claimed are HTTP 409 `{"error":"apply_conflict"}`. A send changes no local state — the candidate is already committed locally — so it is idempotent by construction; a fetch imports the remote candidate as one ordinary operation.
+- `"semantic_resolution"` follows the manual repair semantics: a missing target key, a key no longer in value conflict, or an expected candidate set that does not match the key's current identities is HTTP 409 `{"error":"resolution_conflict"}`. Otherwise the merged value commits as one ordinary operation whose clock dominates every expected candidate.
+
+Any failure rejects the **whole batch unchanged**, however far validation got. When at least one action is newly accepted, every new operation is committed together in one atomic commit — persisted before the caller observes success, exactly like a sync-import batch — and the response is HTTP 201; when every action is a replay, nothing is written and the response is HTTP 200. Both are compact UTF-8 JSON objects terminated by a single newline:
+
+```json
+{"accepted":1,"actions":[{"action":"fetch_remote","key":"color","operationId":"op-9","replicaId":"r2","value":"red"}],"replicaId":"replica-b","replayed":0,"status":"created"}
+```
+
+- `status`: `"created"` when at least one action was newly committed, `"ok"` when every action was a replay.
+- `replicaId`: the requested remote replica id, echoed back.
+- `actions`: one result per requested action, in request order, each carrying exactly `action`, `key`, `replicaId`, `operationId`, and the committed `value`.
+- `accepted` and `replayed`: how many actions were newly committed and how many were replays.
+
+Every number in the response is a JSON integer; no float, negative zero, or non-finite value can appear. The compact encoding, escaping, and terminator are the same as `GET /v1/replication/snapshot`. The whole batch runs under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so a concurrent commit is observed only as a complete old or new snapshot, never a mix; a rejected batch creates no temporary file, and a failed durable commit returns HTTP 500 `{"error":"internal_error"}` with memory, the identity index, and the data file exactly as before. The route shares the common request contract (length checks before authentication, 401 with a `Bearer` challenge, 403 without one); because the batch commits operations, it requires the `write` or `admin` scope in scope-policy mode. With `--data-file`, the committed operations are rebuilt identically during recovery, so replay and conflict decisions are the same before and after a restart.
 
 ### Sender-side replication delivery status
 
