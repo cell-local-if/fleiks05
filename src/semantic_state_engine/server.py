@@ -42,6 +42,23 @@ def clock_dominates(clock_a: dict[str, int], clock_b: dict[str, int]) -> bool:
     return strictly_greater
 
 
+def clock_direction(clock_a: dict[str, int], clock_b: dict[str, int]) -> str:
+    """Classify two already-known-different clocks relative to each other.
+
+    Returns ``"L"`` when ``clock_a`` dominates ``clock_b``, ``"R"`` when
+    ``clock_b`` dominates ``clock_a``, and ``"C"`` when the clocks are
+    concurrent — neither dominates the other. Equal clocks are never
+    compared: the callers only ask for a direction when the clocks
+    differ. Missing components count as 0, exactly as in
+    :func:`clock_dominates`.
+    """
+    if clock_dominates(clock_a, clock_b):
+        return "L"
+    if clock_dominates(clock_b, clock_a):
+        return "R"
+    return "C"
+
+
 def _validate_clock(clock: Any, replica_id: str) -> dict[str, int]:
     """Validate a vector clock for ``replica_id`` and return a clean copy."""
     if not isinstance(clock, dict) or not clock:
@@ -3828,6 +3845,10 @@ class StateStore:
           differ (a content conflict).
         - ``"clock"``: both sides hold the identity with the same value
           but different clocks (one side's clock covers the other's).
+          Such an entry additionally carries ``clockDirection`` —
+          ``"L"`` when the local clock dominates the remote clock,
+          ``"R"`` when the remote dominates, and ``"C"`` when the two
+          clocks are concurrent (missing components count as 0).
 
         The summary reports both sides' key counts and candidate counts,
         both digests, whether they are identical, and ``differences`` —
@@ -3875,13 +3896,16 @@ class StateStore:
                     kind = "shared"
                 if kind != "shared":
                     differences += 1
-                entries.append(
-                    {
-                        "kind": kind,
-                        "local": local_candidate,
-                        "remote": remote_candidate,
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "kind": kind,
+                    "local": local_candidate,
+                    "remote": remote_candidate,
+                }
+                if kind == "clock":
+                    entry["clockDirection"] = clock_direction(
+                        local_candidate["clock"], remote_candidate["clock"]
+                    )
+                entries.append(entry)
             groups.append({"key": key, "differences": entries})
         return {
             "status": "ok",
@@ -3896,6 +3920,138 @@ class StateStore:
                 "remoteDigest": remote_digest,
                 "identical": local_digest == remote_digest,
                 "differences": differences,
+            },
+        }
+
+    def plan_replication_sync(
+        self, replica_id: str, snapshot: dict[str, list[dict[str, Any]]]
+    ) -> dict[str, Any]:
+        """Build a read-only follow-up sync plan against a remote snapshot.
+
+        The local candidate state is copied under the same commit lock
+        used by local writes, sync imports, repairs, and checkpoint
+        commits, so the plan always describes a single commit: it can
+        never observe half an import batch or a partially applied
+        repair — only the old or the new complete state. The remote
+        snapshot (already normalized by
+        :func:`parse_replication_compare_payload`) is only read: nothing
+        is imported, and no repair, transaction, sync, checkpoint, or
+        persistence runs. The plan mutates neither memory nor the data
+        file and creates no temporary file, so with ``--data-file`` the
+        same local state and the same remote snapshot yield the same
+        plan before and after a restart.
+
+        The union of business keys is walked in lexicographic order and,
+        within each key, the identity union ``(replicaId, operationId)``
+        in ascending order. Each identity that cannot already be
+        considered converged produces one action:
+
+        - ``"send_local"``: the local side alone holds the identity, or
+          the local clock dominates the remote clock.
+        - ``"fetch_remote"``: the remote side alone holds the identity,
+          or the remote clock dominates the local clock.
+        - ``"semantic_resolution"``: both sides hold the identity but
+          neither version may be auto-overwritten — either the clocks
+          are concurrent (regardless of value) or the values differ; the
+          conflicting ``local`` and ``remote`` candidates are both kept
+          for the existing semantic-repair flow.
+
+        An identity the two sides hold with the same value and the same
+        clock produces no action: when the two candidate states are
+        identical the action list is empty and every summary pair is
+        equal.
+        """
+        with self._lock:
+            local = {
+                key: [
+                    {
+                        "value": candidate["value"],
+                        "clock": dict(candidate["clock"]),
+                        "replicaId": candidate["replicaId"],
+                        "operationId": candidate["operationId"],
+                    }
+                    for candidate in candidates
+                ]
+                for key, candidates in self._candidates.items()
+            }
+
+        groups: list[dict[str, Any]] = []
+        actions = 0
+        for key in sorted(set(local) | set(snapshot)):
+            local_by_id = {
+                (c["replicaId"], c["operationId"]): c for c in local.get(key, [])
+            }
+            remote_by_id = {
+                (c["replicaId"], c["operationId"]): c for c in snapshot.get(key, [])
+            }
+            entries: list[dict[str, Any]] = []
+            for identity in sorted(set(local_by_id) | set(remote_by_id)):
+                local_candidate = local_by_id.get(identity)
+                remote_candidate = remote_by_id.get(identity)
+                action: str | None = None
+                kind: str
+                if local_candidate is not None and remote_candidate is None:
+                    kind = "missing_remote"
+                    action = "send_local"
+                elif local_candidate is None and remote_candidate is not None:
+                    kind = "missing_local"
+                    action = "fetch_remote"
+                elif local_candidate["value"] == remote_candidate["value"] and (
+                    local_candidate["clock"] == remote_candidate["clock"]
+                ):
+                    # Same value and same clock: already converged, no
+                    # action for this identity.
+                    continue
+                elif local_candidate["value"] != remote_candidate["value"]:
+                    # A content conflict is never auto-overwritten, even
+                    # when one clock dominates the other; both versions
+                    # are retained for semantic resolution.
+                    kind = "conflict"
+                    action = "semantic_resolution"
+                else:
+                    # Same value, different clocks: only the causal
+                    # relationship decides.
+                    kind = "clock"
+                    direction = clock_direction(
+                        local_candidate["clock"], remote_candidate["clock"]
+                    )
+                    if direction == "L":
+                        action = "send_local"
+                    elif direction == "R":
+                        action = "fetch_remote"
+                    else:
+                        action = "semantic_resolution"
+                actions += 1
+                entries.append(
+                    {
+                        "action": action,
+                        "kind": kind,
+                        "local": local_candidate,
+                        "remote": remote_candidate,
+                    }
+                )
+            if entries:
+                groups.append({"key": key, "actions": entries})
+        local_key_count = len(local)
+        remote_key_count = len(snapshot)
+        local_candidate_count = sum(len(c) for c in local.values())
+        remote_candidate_count = sum(len(c) for c in snapshot.values())
+        # identical follows exactly the verification-digest rule the
+        # comparison uses: true precisely when the two candidate states
+        # are the same (in particular when both are empty).
+        local_digest = hashlib.sha256(_verification_digest_input(local)).hexdigest()
+        remote_digest = hashlib.sha256(_verification_digest_input(snapshot)).hexdigest()
+        return {
+            "status": "ok",
+            "replicaId": replica_id,
+            "keys": groups,
+            "summary": {
+                "localKeys": local_key_count,
+                "remoteKeys": remote_key_count,
+                "localCandidates": local_candidate_count,
+                "remoteCandidates": remote_candidate_count,
+                "actions": actions,
+                "identical": local_digest == remote_digest,
             },
         }
 
@@ -6549,6 +6705,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._store.compare_replication_snapshot(replica_id, snapshot),
         )
 
+    def _handle_replication_plan_post(self) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those. The route
+        # accepts no query parameters, and that check precedes the body
+        # check. The plan is strictly read-only: the remote snapshot is
+        # validated and diffed against one committed local snapshot but
+        # never imported, and no repair, transaction, sync, checkpoint, or
+        # persistence runs. The report follows the compact-single-line
+        # contract: canonical UTF-8 JSON, one trailing newline, counts
+        # only as JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            replica_id, snapshot = parse_replication_compare_payload(raw)
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_canonical_newline(
+            HTTPStatus.OK,
+            self._store.plan_replication_sync(replica_id, snapshot),
+        )
+
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)
         if params is None:
@@ -7175,6 +7363,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "replication"
             and segments[2] == "compare"
         )
+        is_replication_plan_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "plan"
+        )
         if (
             matched
             or matched_ack
@@ -7188,6 +7382,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_scope_policy_reload_post
             or is_causal_at_post
             or is_replication_compare_post
+            or is_replication_plan_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -7223,6 +7418,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # The cross-replica comparison is strictly read-only — the
                 # remote snapshot is diffed, never imported — so it is
                 # gated like every other read: a read or admin scope
+                # suffices.
+                if not self._require_scope(SCOPE_READ):
+                    return
+            elif is_replication_plan_post:
+                # The follow-up sync plan only observes one complete
+                # snapshot and never imports the remote candidates, so it
+                # is gated like the comparison: a read or admin scope
                 # suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
@@ -7290,6 +7492,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_replication_compare_post:
             self._handle_replication_compare_post()
+            return
+        if is_replication_plan_post:
+            self._handle_replication_plan_post()
             return
         self._handle_sync_post()
 
