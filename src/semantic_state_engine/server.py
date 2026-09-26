@@ -1009,6 +1009,139 @@ def parse_causal_at_payload(raw: bytes | str | dict[str, Any]) -> dict[str, int]
     return _validate_boundary_clock(payload.get("clock"))
 
 
+def _reject_json_float(_value: str) -> Any:
+    """``parse_float`` hook: every JSON float is an illegal compare input."""
+    raise ValueError("numbers must be JSON integers")
+
+
+def _reject_json_constant(_value: str) -> Any:
+    """``parse_constant`` hook: reject ``NaN``/``Infinity``/``-Infinity``."""
+    raise ValueError("numbers must be finite JSON integers")
+
+
+def _validate_compare_candidate(raw: Any) -> dict[str, Any]:
+    """Validate one candidate of a remote compare snapshot.
+
+    A candidate keeps the live candidate shape — exactly ``value``,
+    ``clock``, ``replicaId``, and ``operationId`` — and obeys the existing
+    write constraints: non-empty strings and a non-empty clock of
+    non-boolean, non-negative JSON integer components that contains the
+    candidate's own ``replicaId``. Returns a normalized copy with the
+    clock's component order fixed lexicographically. Raises ValueError on
+    any violation.
+    """
+    if not isinstance(raw, dict) or set(raw.keys()) != {
+        "value",
+        "clock",
+        "replicaId",
+        "operationId",
+    }:
+        raise ValueError(
+            "each candidate must have only value, clock, replicaId, operationId"
+        )
+    value = raw["value"]
+    replica_id = raw["replicaId"]
+    operation_id = raw["operationId"]
+    if not isinstance(value, str) or value == "":
+        raise ValueError("candidate value must be a non-empty string")
+    if not isinstance(replica_id, str) or replica_id == "":
+        raise ValueError("candidate replicaId must be a non-empty string")
+    if not isinstance(operation_id, str) or operation_id == "":
+        raise ValueError("candidate operationId must be a non-empty string")
+    clock = _validate_clock(raw.get("clock"), replica_id)
+    return {
+        "value": value,
+        "clock": {name: clock[name] for name in sorted(clock)},
+        "replicaId": replica_id,
+        "operationId": operation_id,
+    }
+
+
+def parse_replication_compare_payload(
+    raw: bytes | str | dict[str, Any],
+) -> tuple[str, dict[str, list[dict[str, Any]]]]:
+    """Parse and validate a cross-replica candidate-compare request body.
+
+    The body must be a complete JSON object with exactly two keys:
+    ``replicaId`` (a non-empty string identifying the remote replica the
+    snapshot came from) and ``snapshot`` (an object mapping non-empty
+    business keys to non-empty candidate arrays). Each candidate follows
+    the live write constraints — see
+    :func:`_validate_compare_candidate` — and no operation identity
+    ``(replicaId, operationId)`` may repeat anywhere in the snapshot.
+    Unknown fields, a duplicated JSON field anywhere, a structurally
+    illegal clock, and any non-integer number (JSON floats including
+    ``1.0`` and ``-0.0`` plus the non-finite ``NaN``/``Infinity``/
+    ``-Infinity`` tokens) raise ValueError. Returns the normalized
+    ``(replica_id, snapshot)`` pair; the remote content is never imported
+    into the local store.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        # Already-decoded mappings come from store-level callers, which
+        # bypass JSON and therefore the duplicate-key and strict-number
+        # hooks.
+        if not isinstance(raw, dict) or set(raw.keys()) != {"replicaId", "snapshot"}:
+            raise ValueError("body must be an object with only replicaId, snapshot")
+        replica_id = raw["replicaId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise ValueError("replicaId must be a non-empty string")
+        return replica_id, _validate_compare_snapshot(raw.get("snapshot"))
+
+    def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+        document: dict[Any, Any] = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError("duplicate field in body")
+            document[key] = value
+        return document
+
+    try:
+        payload: Any = json.loads(
+            text,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_float=_reject_json_float,
+            parse_constant=_reject_json_constant,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError("body must be valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload.keys()) != {"replicaId", "snapshot"}:
+        raise ValueError("body must be an object with only replicaId, snapshot")
+    replica_id = payload["replicaId"]
+    if not isinstance(replica_id, str) or replica_id == "":
+        raise ValueError("replicaId must be a non-empty string")
+    return replica_id, _validate_compare_snapshot(payload.get("snapshot"))
+
+
+def _validate_compare_snapshot(raw: Any) -> dict[str, list[dict[str, Any]]]:
+    """Validate the ``snapshot`` mapping of a compare request body."""
+    if not isinstance(raw, dict):
+        raise ValueError("snapshot must be a JSON object")
+    snapshot: dict[str, list[dict[str, Any]]] = {}
+    identities: set[tuple[str, str]] = set()
+    for key, candidates_raw in raw.items():
+        if not isinstance(key, str) or key == "":
+            raise ValueError("snapshot keys must be non-empty strings")
+        if not isinstance(candidates_raw, list) or not candidates_raw:
+            raise ValueError("each snapshot key must map to a non-empty candidate array")
+        candidates: list[dict[str, Any]] = []
+        for candidate_raw in candidates_raw:
+            candidate = _validate_compare_candidate(candidate_raw)
+            identity = (candidate["replicaId"], candidate["operationId"])
+            if identity in identities:
+                raise ValueError(f"duplicate candidate identity {identity!r}")
+            identities.add(identity)
+            candidates.append(candidate)
+        snapshot[key] = candidates
+    return snapshot
+
+
 ACK_MAX_OPERATIONS = 100
 
 
@@ -1482,6 +1615,200 @@ def _replication_snapshot_input(
         parts.append(str(checkpoints[peer_id]))
     parts.append("}]")
     return "".join(parts).encode("utf-8")
+
+
+# Per-entry relation labels for the cross-replica candidate comparison.
+COMPARE_IDENTICAL = "identical"
+COMPARE_MISSING_REMOTE = "missing_remote"
+COMPARE_MISSING_LOCAL = "missing_local"
+COMPARE_CONTENT_CONFLICT = "content_conflict"
+COMPARE_LOCAL_CLOCK_COVERS = "local_clock_covers"
+COMPARE_REMOTE_CLOCK_COVERS = "remote_clock_covers"
+COMPARE_CLOCK_DIVERGENT = "clock_divergent"
+
+
+def _compare_side_candidate(candidate: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Project one side's candidate into the compare response shape.
+
+    The missing side of a one-sided difference is ``None``; otherwise the
+    candidate keeps exactly ``value``, ``clock``, ``replicaId``, and
+    ``operationId`` in that fixed field order, with the clock's component
+    names sorted lexicographically so the report is deterministic.
+    """
+    if candidate is None:
+        return None
+    return {
+        "value": candidate["value"],
+        "clock": {name: candidate["clock"][name] for name in sorted(candidate["clock"])},
+        "replicaId": candidate["replicaId"],
+        "operationId": candidate["operationId"],
+    }
+
+
+def _compare_entry(
+    key: str,
+    candidate: dict[str, Any],
+    relation: str,
+    *,
+    local: dict[str, Any] | None,
+    remote: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build one per-candidate difference entry in its fixed field order."""
+    return {
+        "key": key,
+        "identity": {
+            "replicaId": candidate["replicaId"],
+            "operationId": candidate["operationId"],
+        },
+        "relation": relation,
+        "local": _compare_side_candidate(local),
+        "remote": _compare_side_candidate(remote),
+    }
+
+
+def _compare_clock_relation(
+    local: dict[str, Any], remote: dict[str, Any]
+) -> str:
+    """Classify same-value, different-clock candidates by clock coverage."""
+    if clock_dominates(local["clock"], remote["clock"]):
+        return COMPARE_LOCAL_CLOCK_COVERS
+    if clock_dominates(remote["clock"], local["clock"]):
+        return COMPARE_REMOTE_CLOCK_COVERS
+    return COMPARE_CLOCK_DIVERGENT
+
+
+def replication_compare_report(
+    remote_replica_id: str,
+    local: dict[str, list[dict[str, Any]]],
+    remote: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Compute the read-only cross-replica candidate difference report.
+
+    ``local`` is one committed snapshot of the current local candidate
+    sets (a copy taken under the commit lock by the caller) and ``remote``
+    is the caller-supplied, already-validated remote snapshot; neither is
+    mutated and the remote content is never treated as local state. The
+    result groups candidates by business key:
+
+    - ``shared``: identities present under the same key on both sides with
+      the same value and clock;
+    - ``localOnly``/``remoteOnly``: candidates one side holds and the
+      other does not;
+    - ``contentConflict``: identities present on both sides under the same
+      key whose value differs (``content_conflict``) or whose value agrees
+      while the clock differs — marked ``local_clock_covers``,
+      ``remote_clock_covers``, or ``clock_divergent`` when neither clock
+      dominates.
+
+    Every group is sorted stably by business key and then operation
+    identity, so repeating the same two snapshots always yields the same
+    report. The summary reports both sides' key and candidate counts,
+    whether the canonical candidate digests match, and the total number of
+    difference entries — shared candidates excluded — the minimal count a
+    continuation of synchronization still has to address.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {
+        "shared": [],
+        "localOnly": [],
+        "remoteOnly": [],
+        "contentConflict": [],
+    }
+    for key in sorted(set(local) | set(remote)):
+        local_candidates = {
+            (candidate["replicaId"], candidate["operationId"]): candidate
+            for candidate in local.get(key, [])
+        }
+        remote_candidates = {
+            (candidate["replicaId"], candidate["operationId"]): candidate
+            for candidate in remote.get(key, [])
+        }
+        # Identities match only within the same business key: an identity
+        # one side holds under another key is missing on this key and is
+        # reported on that key's walk, so every per-key difference stays
+        # visible.
+        for identity in sorted(local_candidates):
+            local_candidate = local_candidates[identity]
+            remote_candidate = remote_candidates.get(identity)
+            if remote_candidate is None:
+                groups["localOnly"].append(
+                    _compare_entry(
+                        key,
+                        local_candidate,
+                        COMPARE_MISSING_REMOTE,
+                        local=local_candidate,
+                        remote=None,
+                    )
+                )
+                continue
+            if (
+                local_candidate["value"] == remote_candidate["value"]
+                and local_candidate["clock"] == remote_candidate["clock"]
+            ):
+                groups["shared"].append(
+                    _compare_entry(
+                        key,
+                        local_candidate,
+                        COMPARE_IDENTICAL,
+                        local=local_candidate,
+                        remote=remote_candidate,
+                    )
+                )
+            elif local_candidate["value"] != remote_candidate["value"]:
+                groups["contentConflict"].append(
+                    _compare_entry(
+                        key,
+                        local_candidate,
+                        COMPARE_CONTENT_CONFLICT,
+                        local=local_candidate,
+                        remote=remote_candidate,
+                    )
+                )
+            else:
+                groups["contentConflict"].append(
+                    _compare_entry(
+                        key,
+                        local_candidate,
+                        _compare_clock_relation(local_candidate, remote_candidate),
+                        local=local_candidate,
+                        remote=remote_candidate,
+                    )
+                )
+        for identity in sorted(remote_candidates):
+            if identity in local_candidates:
+                continue
+            remote_candidate = remote_candidates[identity]
+            groups["remoteOnly"].append(
+                _compare_entry(
+                    key,
+                    remote_candidate,
+                    COMPARE_MISSING_LOCAL,
+                    local=None,
+                    remote=remote_candidate,
+                )
+            )
+
+    local_candidate_count = sum(len(candidates) for candidates in local.values())
+    remote_candidate_count = sum(len(candidates) for candidates in remote.values())
+    same_digest = hashlib.sha256(
+        _verification_digest_input(local)
+    ).hexdigest() == hashlib.sha256(_verification_digest_input(remote)).hexdigest()
+    difference_count = (
+        len(groups["localOnly"])
+        + len(groups["remoteOnly"])
+        + len(groups["contentConflict"])
+    )
+    return {
+        "remoteReplicaId": remote_replica_id,
+        "differences": groups,
+        "summary": {
+            "localKeys": len(local),
+            "remoteKeys": len(remote),
+            "localCandidates": local_candidate_count,
+            "remoteCandidates": remote_candidate_count,
+            "sameDigest": same_digest,
+            "differences": difference_count,
+        },
+    }
 
 
 def _receipts_digest_input(
@@ -3691,6 +4018,45 @@ class StateStore:
             "candidateVersions": candidate_versions,
             "checkpoints": checkpoints,
         }
+
+    def compare_replication(
+        self,
+        remote_replica_id: str,
+        remote_snapshot: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Compare a caller-supplied remote snapshot with the local snapshot.
+
+        The read is strictly read-only: the remote content is never
+        imported, no repair, transaction, sync, or checkpoint path runs,
+        and neither memory nor the data file changes; no temporary file is
+        created. The local current candidate sets are copied once under
+        the same commit lock used by local writes, sync imports, repairs,
+        and checkpoint commits, so the comparison observes only a complete
+        old or new snapshot — never half an import batch, a half-applied
+        repair, or a partially recovered state. The difference report
+        itself is then assembled by
+        :func:`replication_compare_report` outside the lock.
+
+        With ``--data-file`` the candidate state is rebuilt identically
+        during recovery, so the same local state and the same remote
+        snapshot produce the same report before and after a restart.
+        """
+        with self._lock:
+            local_snapshot = {
+                key: [
+                    {
+                        "value": candidate["value"],
+                        "clock": dict(candidate["clock"]),
+                        "replicaId": candidate["replicaId"],
+                        "operationId": candidate["operationId"],
+                    }
+                    for candidate in candidates
+                ]
+                for key, candidates in self._candidates.items()
+            }
+        return replication_compare_report(
+            remote_replica_id, local_snapshot, remote_snapshot
+        )
 
     def get_key_audit_digest(self, key: str) -> dict[str, Any]:
         """Return one key's audit-integrity digest from a single snapshot.
@@ -6209,6 +6575,36 @@ class RequestHandler(BaseHTTPRequestHandler):
         status, payload = self._store.get_state_causal_at(key, boundary)
         self._json_newline(status, payload)
 
+    def _handle_replication_compare_post(self) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fell through to the generic 404 before any of those, so the
+        # shape decision always precedes the body. The route accepts no
+        # query parameters, and that check precedes the body check. The
+        # comparison never imports the remote content and triggers no
+        # repair, transaction, or sync: it reads one committed local
+        # snapshot, so the success body follows the compact-single-line
+        # contract (compact UTF-8 JSON, one trailing newline, counts only
+        # as JSON integers) and is strictly read-only.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            remote_replica_id, remote_snapshot = parse_replication_compare_payload(raw)
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        report = self._store.compare_replication(remote_replica_id, remote_snapshot)
+        self._json_ordered_newline(HTTPStatus.OK, report)
+
     def _handle_state_why_get(self, key: str) -> None:
         # The route-shape check in do_GET already ran, so a query parameter
         # is rejected here without any state being read or changed. The
@@ -6930,6 +7326,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "states"
             and segments[3] == "causal-at"
         )
+        is_replication_compare_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "compare"
+        )
         if (
             matched
             or matched_ack
@@ -6942,6 +7344,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_transaction_apply_post
             or is_scope_policy_reload_post
             or is_causal_at_post
+            or is_replication_compare_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -6971,6 +7374,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif is_causal_at_post:
                 # The causal slice is strictly read-only, so it is gated
                 # like every other read: a read or admin scope suffices.
+                if not self._require_scope(SCOPE_READ):
+                    return
+            elif is_replication_compare_post:
+                # The cross-replica comparison imports nothing and changes
+                # nothing, so it shares the read-only gate: a read or admin
+                # scope suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
             elif not self._require_scope(SCOPE_WRITE):
@@ -7034,6 +7443,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_causal_at_post:
             self._handle_state_causal_at_post(segments[2])
+            return
+        if is_replication_compare_post:
+            self._handle_replication_compare_post()
             return
         self._handle_sync_post()
 
