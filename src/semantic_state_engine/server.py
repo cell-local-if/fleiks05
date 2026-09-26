@@ -949,6 +949,66 @@ def parse_empty_object_payload(raw: bytes | str | dict[str, Any]) -> None:
         raise ValueError("body must be an empty JSON object")
 
 
+def _validate_boundary_clock(clock: Any) -> dict[str, int]:
+    """Validate a causal-at boundary clock and return a clean copy.
+
+    Unlike an operation clock, a boundary clock may be empty (the causal
+    origin). When non-empty, every component name must be a non-empty
+    string and every value a non-boolean, non-negative JSON integer;
+    booleans, floats (including ``1.0`` and ``-0.0``), and non-finite
+    values are rejected. Raises ValueError on any violation.
+    """
+    if not isinstance(clock, dict):
+        raise ValueError("clock must be a JSON object")
+    for component, tick in clock.items():
+        if not isinstance(component, str) or component == "":
+            raise ValueError("clock components must be non-empty strings")
+        if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
+            raise ValueError("clock values must be non-negative integers")
+    return dict(clock)
+
+
+def parse_causal_at_payload(raw: bytes | str | dict[str, Any]) -> dict[str, int]:
+    """Parse and validate a causal-slice boundary body.
+
+    The body must be a complete JSON object whose only key is ``clock``;
+    unknown fields, a non-object document, or a duplicated key anywhere
+    in the document raise ValueError. ``clock`` is a boundary vector
+    clock (see :func:`_validate_boundary_clock`): it may be empty (the
+    causal origin), and otherwise maps replica ids to non-boolean
+    non-negative integers. Returns the normalized clock.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        # Already-decoded mappings come from store-level callers, which
+        # bypass JSON and therefore the duplicate-key hook.
+        if not isinstance(raw, dict) or set(raw.keys()) != {"clock"}:
+            raise ValueError("body must be an object with only clock")
+        return _validate_boundary_clock(raw.get("clock"))
+
+    def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+        document: dict[Any, Any] = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError("duplicate field in body")
+            document[key] = value
+        return document
+
+    try:
+        payload: Any = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError("body must be valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload.keys()) != {"clock"}:
+        raise ValueError("body must be an object with only clock")
+    return _validate_boundary_clock(payload.get("clock"))
+
+
 ACK_MAX_OPERATIONS = 100
 
 
@@ -5341,6 +5401,69 @@ class StateStore:
             "candidates": present,
         }
 
+    def get_state_causal_at(
+        self, key: str, boundary: dict[str, int]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Replay the accepted log up to a vector-clock boundary.
+
+        Unlike :meth:`get_state_at`, the slice is selected causally rather
+        than by a global log position: starting from the empty state, only
+        first-accepted records whose clock is componentwise no greater
+        than ``boundary`` (missing components count as 0) are replayed in
+        global commit order. The empty clock is the causal origin: only
+        operations already covered by it can apply. Every first-accepted
+        record participates in exactly the same way as a position replay
+        — ordinary writes, stale writes whose clock was already dominated
+        (they still add no candidate), sync-imported records, and accepted
+        repairs — because identical replays, conflicting or malformed
+        requests, uncommitted requests, and failed durable commits never
+        enter the log. Candidate add/delete keeps the existing
+        vector-clock domination semantics via
+        :meth:`_next_candidates`.
+
+        The whole replay runs against one committed snapshot under the
+        commit lock, and the read mutates neither memory, the data file,
+        logs, nor checkpoints and creates no files.
+
+        Returns ``(404, {"error": "not_found"})`` when the key holds no
+        candidate within the boundary — even when the key appears only
+        past it. Otherwise returns ``(200, report)`` with exactly four
+        fields: ``clock`` (the requested boundary, echoed back), ``key``,
+        ``status`` (``"resolved"`` when every replayed candidate agrees
+        on the value, ``"conflict"`` otherwise), and ``candidates``
+        (always an array, sorted by ``(replicaId, operationId)``
+        ascending, each carrying exactly ``value``, ``clock``,
+        ``replicaId``, and ``operationId``).
+        """
+        with self._lock:
+            candidates: list[dict[str, Any]] = []
+            for replica_id, operation in self._accepted:
+                if operation["key"] != key:
+                    continue
+                clock = operation["clock"]
+                if any(tick > boundary.get(component, 0) for component, tick in clock.items()):
+                    continue
+                candidates = self._next_candidates(candidates, replica_id, operation)
+            ordered = sorted(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
+            present = [
+                {
+                    "value": c["value"],
+                    "clock": dict(c["clock"]),
+                    "replicaId": c["replicaId"],
+                    "operationId": c["operationId"],
+                }
+                for c in ordered
+            ]
+        if not present:
+            return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+        status = "resolved" if all(c["value"] == present[0]["value"] for c in present) else "conflict"
+        return HTTPStatus.OK, {
+            "clock": dict(boundary),
+            "key": key,
+            "status": status,
+            "candidates": present,
+        }
+
 
 class SemanticStateServer(ThreadingHTTPServer):
     """Threading HTTP server carrying its own StateStore."""
@@ -6063,6 +6186,29 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json_newline(status, payload)
 
+    def _handle_state_causal_at_post(self, key: str) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those. The route
+        # accepts no query parameters, and that check precedes the body
+        # check. The report follows the compact-single-line contract:
+        # compact UTF-8 JSON, one trailing newline, numbers only as JSON
+        # integers, and the query is strictly read-only.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            boundary = parse_causal_at_payload(raw)
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._store.get_state_causal_at(key, boundary)
+        self._json_newline(status, payload)
+
     def _handle_state_why_get(self, key: str) -> None:
         # The route-shape check in do_GET already ran, so a query parameter
         # is rejected here without any state being read or changed. The
@@ -6778,6 +6924,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "scope-policy"
             and segments[3] == "reload"
         )
+        is_causal_at_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "states"
+            and segments[3] == "causal-at"
+        )
         if (
             matched
             or matched_ack
@@ -6789,6 +6941,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_auto_resolve_plan_post
             or is_transaction_apply_post
             or is_scope_policy_reload_post
+            or is_causal_at_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -6813,6 +6966,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif is_auto_resolve_plan_post:
                 # The preview changes no state, so it is gated like the read
                 # endpoints: a read or admin scope suffices.
+                if not self._require_scope(SCOPE_READ):
+                    return
+            elif is_causal_at_post:
+                # The causal slice is strictly read-only, so it is gated
+                # like every other read: a read or admin scope suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
             elif not self._require_scope(SCOPE_WRITE):
@@ -6873,6 +7031,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_scope_policy_reload_post:
             self._handle_scope_policy_reload_post()
+            return
+        if is_causal_at_post:
+            self._handle_state_causal_at_post(segments[2])
             return
         self._handle_sync_post()
 
