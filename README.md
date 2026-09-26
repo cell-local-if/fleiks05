@@ -991,6 +991,28 @@ Every number in the response is a JSON integer. The checkpoint cursor, the uncon
 
 A peer that has never registered a checkpoint returns HTTP 404 with `{"error":"not_found"}`. A missing or extra path segment (for example `/v1/replication`, `/v1/replication/status/extra`, or a trailing slash) likewise returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 with a `Bearer` challenge, in scope-policy mode an authenticated token lacking the read scope is HTTP 403 without a challenge, and `/health` stays anonymous. With `--data-file`, the log, the checkpoints, and the receipts are rebuilt identically during recovery, so the same state yields the same status before and after a restart.
 
+### All-peers replication delivery overview
+
+`GET /v1/replication/status/all?after=N&limit=N` returns a strictly read-only delivery-status overview across **every registered** sender-side replication peer: one page of per-peer details together with the paging cursor, the complete registered count, the progress totals, and the receipt-anomaly counts are all read from one committed snapshot. The endpoint creates no receipt, never advances or writes a checkpoint, and changes neither the accepted log, candidates, audit streams, metrics counters, summaries, nor the data file; it creates no temporary file.
+
+The query string carries exactly two parameters, both **required** and each appearing exactly once: `after` is the number of registered peers already skipped (a 0-based resume cursor that starts at `0`) and `limit` is the page size. Both accept only ASCII decimal digits — a missing or repeated parameter, an unknown parameter, an empty value, a sign, a decimal point, whitespace, or non-ASCII numerals returns HTTP 400 with `{"error":"invalid_request"}`, as does a `limit` outside `1-100`. An `after` equal to the registered peer count is a valid stable empty page; an `after` past it is HTTP 400 with `{"error":"invalid_request"}`. No rejected query reads or changes any state.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly six fields in this order:
+
+```json
+{"peers":[{"peer":"peer-a","pos":2,"left":1,"acks":1,"chainStatus":"ok"}],"nextCursor":1,"hasMore":false,"peerCount":1,"totals":{"pos":2,"left":1,"acks":1},"anomalies":{"gaps":0,"overlaps":0,"identityMismatches":0,"cursorRegressions":0}}
+```
+
+- `peers`: one page of the registered peers in ascending `peerId` (Unicode code point) order. Each item carries exactly five fields in this order: `peer` (the peer id), `pos` (its registered checkpoint cursor — the number of accepted records it has consumed), `left` (the number of accepted records past the checkpoint it has not yet consumed), `acks` (its committed receipt count), and `chainStatus` (the `status` of the receipt chain-audit conclusion over the peer's **whole** committed receipt set, exactly as `GET /v1/replication/status` reports it — `"ok"` or `"broken"`).
+- `nextCursor`: the number of peers skipped after this page — feed it back as the next `after`; `hasMore` reports whether further peers remain.
+- `peerCount`: the complete registered peer count, never just the page size.
+- `totals`: `pos`, `left`, and `acks` summed over the **complete** registered set, not just the current page.
+- `anomalies`: for each of the receipt chain-audit's four anomaly classes — `gaps`, `overlaps`, `identityMismatches`, and `cursorRegressions` — the number of registered peers whose whole-chain audit reports a non-empty list for that class, again over the complete registered set.
+
+Every number in the response is a JSON integer. An empty registered set reports an empty page with an all-zero summary. The page, the cursor, the count, the totals, and the anomaly counts are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, checkpoint commits, and acknowledgement commits, so the overview always describes a single commit even while commits are in flight.
+
+A missing or extra path segment (for example `/v1/replication`, `/v1/replication/status/all/extra`, or a trailing slash) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 with a `Bearer` challenge, in scope-policy mode an authenticated token lacking the read scope is HTTP 403 without a challenge, and `/health` stays anonymous. With `--data-file`, the log, the checkpoints, and the receipts are rebuilt identically during recovery, so the same state yields the same overview before and after a restart.
+
 ## Tests
 
 ```bash

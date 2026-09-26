@@ -762,6 +762,21 @@ def parse_replication_status_query(query: str) -> str | None:
     return peer_id
 
 
+def parse_replication_status_all_query(query: str) -> tuple[int, int] | None:
+    """Validate the all-peers replication-status query string.
+
+    Delegates to :func:`parse_peer_pickup_query` — both ``after`` and
+    ``limit`` are required non-repeated ASCII decimal integers, ``after``
+    non-negative (the number of registered peers already skipped) and
+    ``limit`` between 1 and 100, and any unknown parameter is rejected.
+    Kept as a named entry point for the status-all route. The bound on
+    ``after`` against the registered peer count is checked by the store
+    against the committed snapshot (``after`` equal to the count is a
+    valid empty page).
+    """
+    return parse_peer_pickup_query(query)
+
+
 def parse_scope_policy_audit_query(query: str) -> tuple[int, int] | None:
     """Validate the scope-policy change-audit query string.
 
@@ -5966,6 +5981,104 @@ class StateStore:
             "chain": chain,
         }
 
+    def get_replication_status_all(
+        self, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of the all-peers sender-side delivery overview.
+
+        Every registered peer's checkpoint cursor, unconsumed record
+        count, committed receipt count, and receipt chain-audit
+        conclusion are read together under the same commit lock used by
+        local writes, sync imports, repairs, checkpoint commits, and
+        acknowledgement commits, so the page, the totals, and the
+        anomaly counts always describe a single commit even while
+        commits are in flight. The query is strictly read-only: it never
+        advances or writes a checkpoint, records no receipt, and mutates
+        neither memory nor the data file.
+
+        ``after`` is the number of registered peers already skipped (a
+        0-based resume cursor) and ``limit`` the page size. Raises
+        ``ValueError`` when ``after`` is past the registered peer count
+        (``after`` equal to the count is a valid empty page). Otherwise
+        returns ``(200, overview)`` with exactly six fields, in this
+        order:
+
+        - ``peers``: the page, one item per registered peer in
+          ascending ``peerId`` (Unicode code point) order, each carrying
+          exactly ``peer``, ``pos``, ``left``, ``acks``, and
+          ``chainStatus`` — the same per-peer progress, counts, and
+          ``"ok"``/``"broken"`` chain conclusion the single-peer status
+          query reports.
+        - ``nextCursor``: the number of peers skipped after this page —
+          feed it back as the next ``after``.
+        - ``hasMore``: whether further peers remain.
+        - ``peerCount``: the complete registered peer count, never just
+          the page size.
+        - ``totals``: ``pos``, ``left``, and ``acks`` summed over the
+          **complete** registered set, not just the page.
+        - ``anomalies``: for each of the receipt chain-audit's anomaly
+          classes (``gaps``, ``overlaps``, ``identityMismatches``,
+          ``cursorRegressions``), the number of registered peers whose
+          whole-chain audit reports a non-empty list for that class —
+          again over the complete registered set.
+
+        An empty registered set reports an empty page with an all-zero
+        summary. With ``--data-file`` the log, the checkpoints, and the
+        receipts are rebuilt identically during recovery, so the same
+        state yields the same overview before and after a restart.
+        """
+        with self._lock:
+            peer_ids = sorted(self._checkpoints)
+            peer_count = len(peer_ids)
+            if after > peer_count:
+                raise ValueError("after is past the end of the registered peers")
+            log_length = len(self._accepted)
+            receipts_by_peer: dict[str, list[tuple[str, dict[str, Any]]]] = {
+                peer_id: [] for peer_id in peer_ids
+            }
+            for (receipt_peer, ack_id), receipt in self._acks.items():
+                committed = receipts_by_peer.get(receipt_peer)
+                if committed is not None:
+                    committed.append((ack_id, receipt))
+            totals = {"pos": 0, "left": 0, "acks": 0}
+            anomalies = {
+                "gaps": 0,
+                "overlaps": 0,
+                "identityMismatches": 0,
+                "cursorRegressions": 0,
+            }
+            entries: list[dict[str, Any]] = []
+            for peer_id in peer_ids:
+                cursor = self._checkpoints[peer_id]
+                committed = receipts_by_peer[peer_id]
+                chain = _receipt_chain_audit_locked(committed, self._accepted)
+                left = log_length - cursor
+                totals["pos"] += cursor
+                totals["left"] += left
+                totals["acks"] += len(committed)
+                for name in anomalies:
+                    if chain[name]:
+                        anomalies[name] += 1
+                entries.append(
+                    {
+                        "peer": peer_id,
+                        "pos": cursor,
+                        "left": left,
+                        "acks": len(committed),
+                        "chainStatus": chain["status"],
+                    }
+                )
+            page = entries[after : after + limit]
+            next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "peers": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < peer_count,
+            "peerCount": peer_count,
+            "totals": totals,
+            "anomalies": anomalies,
+        }
+
     def record_policy_reload(self, digest: str, tokens: int) -> dict[str, Any]:
         """Commit one successful scope-policy hot reload to the audit history.
 
@@ -6821,6 +6934,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_replication_status_get()
             return
+        if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "status"
+            and segments[3] == "all"
+        ):
+            self._handle_replication_status_all_get()
+            return
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
@@ -7303,6 +7425,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             return
         status, payload = self._store.get_replication_status(peer_id)
+        self._json_ordered_newline(status, payload)
+
+    def _handle_replication_status_all_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before
+        # any query check), so a malformed query is rejected here without
+        # any state being read or changed. The success body fixes the
+        # field order (peers, nextCursor, hasMore, peerCount, totals,
+        # anomalies; peer, pos, left, acks, chainStatus per page item)
+        # and follows the compact-single-line contract: one trailing
+        # newline, numbers only as JSON integers.
+        params = parse_replication_status_all_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_replication_status_all(after, limit)
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
         self._json_ordered_newline(status, payload)
 
     def _handle_replication_compare_post(self) -> None:
