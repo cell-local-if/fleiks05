@@ -1492,6 +1492,226 @@ def parse_acknowledge_payload(raw: bytes | str | dict[str, Any]) -> tuple[str, i
     return ack_id, cursor, operations
 
 
+REPAIR_BATCH_MIN = 1
+REPAIR_BATCH_MAX = 100
+
+# The four executable repair actions, in the fixed order a batch is
+# validated and committed in: resend (补发), deduplicate (去重),
+# correct an identity (纠正身份), and correct a cursor (纠正游标).
+REPAIR_ACTIONS = ("resend", "deduplicate", "correct_identity", "correct_cursor")
+# Interval-shaped actions name an affected half-open log interval; the
+# identity correction names one position and the identity it should
+# hold; the cursor correction only names a cursor boundary.
+REPAIR_INTERVAL_ACTIONS = ("resend", "deduplicate")
+
+
+def _load_json_object_no_duplicate_keys(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
+    """Decode a body into a JSON object, rejecting duplicate field names.
+
+    Accepts raw bytes or text (decoded strictly as UTF-8 JSON) or an
+    already-decoded mapping (used by store-level callers, which bypass
+    JSON and therefore the duplicate-key hook). Raises ValueError when
+    the body is not valid UTF-8 JSON, is not an object, or repeats any
+    field name.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        if not isinstance(raw, dict):
+            raise ValueError("body must be a JSON object")
+        return raw
+
+    def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+        document: dict[Any, Any] = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError("duplicate field in body")
+            document[key] = value
+        return document
+
+    try:
+        payload = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError("body must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("body must be a JSON object")
+    return payload
+
+
+def _repair_boundary(raw: Any) -> dict[str, int]:
+    """Validate a repair interval boundary ``{"start", "end"}``.
+
+    Both fields are required and hold non-boolean, non-negative JSON
+    integers with ``start <= end``. Raises ValueError on any violation.
+    """
+    if not isinstance(raw, dict) or set(raw.keys()) != {"start", "end"}:
+        raise ValueError("a repair boundary must have only start and end")
+    start = raw["start"]
+    end = raw["end"]
+    if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+        raise ValueError("boundary start must be a non-negative integer")
+    if isinstance(end, bool) or not isinstance(end, int) or end < 0:
+        raise ValueError("boundary end must be a non-negative integer")
+    if start > end:
+        raise ValueError("boundary start must not exceed end")
+    return {"start": start, "end": end}
+
+
+def _repair_identity(raw: Any) -> dict[str, str]:
+    """Validate a repair identity ``{"replicaId", "operationId"}``."""
+    if not isinstance(raw, dict) or set(raw.keys()) != {"replicaId", "operationId"}:
+        raise ValueError("an identity must have only replicaId and operationId")
+    replica_id = raw["replicaId"]
+    operation_id = raw["operationId"]
+    if not isinstance(replica_id, str) or replica_id == "":
+        raise ValueError("identity replicaId must be a non-empty string")
+    if not isinstance(operation_id, str) or operation_id == "":
+        raise ValueError("identity operationId must be a non-empty string")
+    return {"replicaId": replica_id, "operationId": operation_id}
+
+
+def parse_replication_repairs_batch(
+    raw: bytes | str | dict[str, Any],
+) -> tuple[str, str, int, str, list[dict[str, Any]]]:
+    """Parse and validate a repairs/plan or repairs/apply request body.
+
+    Both entries share one body shape — a JSON object with exactly
+    ``peerId``, ``ackId``, ``expectedCheckpoint``,
+    ``expectedReceipts``, and ``suggestions``:
+
+    - ``peerId``/``ackId`` name the targeted sender-side peer and this
+      conditional execution (a non-empty string each);
+    - ``expectedCheckpoint`` is the non-boolean non-negative integer
+      checkpoint cursor the caller expects the peer to currently hold;
+    - ``expectedReceipts`` is the 64-character lowercase hexadecimal
+      SHA-256 the caller expects the peer's committed receipt set to
+      digest to (the ``digest`` reported by the peer receipts query and
+      the delivery-status audit), anchoring the whole receipt history;
+    - ``suggestions`` is the ordered batch, 1-100 entries, executed in
+      request order. A ``resend``/``deduplicate`` entry carries its
+      ``action``, the receipt ``ackId`` it repairs, and a ``location``
+      and ``target`` interval boundary; a ``correct_identity`` entry
+      carries a ``location``/``target`` position and the ``expected``
+      and ``observed`` identities; a ``correct_cursor`` entry carries
+      only its ``location``/``target`` interval boundary.
+
+    Returns the normalized ``(peer_id, ack_id, expected_checkpoint,
+    expected_receipts, suggestions)`` tuple. Nothing here is checked
+    against live state — the structure and value shapes only — so a
+    stale suggestion is a conflict, never a malformed request. Raises
+    ValueError on any structural violation.
+    """
+    payload = _load_json_object_no_duplicate_keys(raw)
+    if set(payload.keys()) != {
+        "peerId",
+        "ackId",
+        "expectedCheckpoint",
+        "expectedReceipts",
+        "suggestions",
+    }:
+        raise ValueError(
+            "body must have only peerId, ackId, expectedCheckpoint, "
+            "expectedReceipts, suggestions"
+        )
+    peer_id = payload["peerId"]
+    if not isinstance(peer_id, str) or peer_id == "":
+        raise ValueError("peerId must be a non-empty string")
+    ack_id = payload["ackId"]
+    if not isinstance(ack_id, str) or ack_id == "":
+        raise ValueError("ackId must be a non-empty string")
+    expected_checkpoint = payload["expectedCheckpoint"]
+    if (
+        isinstance(expected_checkpoint, bool)
+        or not isinstance(expected_checkpoint, int)
+        or expected_checkpoint < 0
+    ):
+        raise ValueError("expectedCheckpoint must be a non-negative integer")
+    expected_receipts = payload["expectedReceipts"]
+    if not _is_sha256_hex64(expected_receipts):
+        raise ValueError(
+            "expectedReceipts must be 64 lowercase hexadecimal characters"
+        )
+    raw_suggestions = payload["suggestions"]
+    if not isinstance(raw_suggestions, list) or not (
+        REPAIR_BATCH_MIN <= len(raw_suggestions) <= REPAIR_BATCH_MAX
+    ):
+        raise ValueError("suggestions must be a list of 1-100 entries")
+
+    suggestions: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw_suggestions):
+        if not isinstance(entry, dict):
+            raise ValueError("each suggestion must be an object")
+        action = entry.get("action")
+        if action not in REPAIR_ACTIONS:
+            raise ValueError(
+                "action must be resend, deduplicate, correct_identity, or correct_cursor"
+            )
+        receipt_ack = entry.get("ackId")
+        if not isinstance(receipt_ack, str) or receipt_ack == "":
+            raise ValueError("suggestion ackId must be a non-empty string")
+        normalized: dict[str, Any] = {"action": action, "ackId": receipt_ack}
+        if action in REPAIR_INTERVAL_ACTIONS or action == "correct_cursor":
+            if set(entry.keys()) != {"action", "ackId", "location", "target"}:
+                raise ValueError(
+                    f"{action} suggestion must have only action, ackId, location, target"
+                )
+            location = _repair_boundary(entry["location"])
+            target = _repair_boundary(entry["target"])
+            normalized["location"] = location
+            normalized["target"] = target
+        else:
+            # correct_identity: a single log position with the identity
+            # the accepted log holds (or is expected to hold) and the
+            # identity the faulty receipt confirmed.
+            if set(entry.keys()) != {
+                "action",
+                "ackId",
+                "location",
+                "target",
+                "expected",
+                "observed",
+            }:
+                raise ValueError(
+                    "correct_identity suggestion must have only action, ackId, "
+                    "location, target, expected, observed"
+                )
+            location = entry["location"]
+            target = entry["target"]
+            if not isinstance(location, dict) or set(location.keys()) != {"position"}:
+                raise ValueError("identity location must have only position")
+            if not isinstance(target, dict) or set(target.keys()) != {"position"}:
+                raise ValueError("identity target must have only position")
+            position = location["position"]
+            if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+                raise ValueError("identity position must be a non-negative integer")
+            if target["position"] != position:
+                raise ValueError("identity target position must match its location")
+            normalized["location"] = {"position": position}
+            normalized["target"] = {"position": position}
+            normalized["expected"] = _repair_identity(entry["expected"])
+            normalized["observed"] = _repair_identity(entry["observed"])
+        suggestions.append(normalized)
+    return peer_id, ack_id, expected_checkpoint, expected_receipts, suggestions
+
+
+def _repair_receipts_digest(
+    peer_id: str, committed: list[tuple[str, dict[str, Any]]]
+) -> str:
+    """Return the receipt-set digest a repair request anchors against.
+
+    This is exactly the digest the peer receipts query and the
+    delivery-status audit report: the SHA-256 of
+    :func:`_receipts_digest_input` over the peer's receipts in creation
+    order (an empty set hashes ``[]``).
+    """
+    return hashlib.sha256(_receipts_digest_input(peer_id, committed)).hexdigest()
+
+
 def _escape_digest_string(value: str) -> str:
     """Escape a string for the canonical verification-digest input.
 
@@ -2080,9 +2300,16 @@ def _receipt_chain_audit_locked(
     ``[start_i, cursor_i)`` where ``start_i`` is derived from the receipt's
     confirmation cursor and its operation count
     (``cursor_i - len(operations_i)``) — the first receipt's start comes
-    from its own count and cursor, and every later segment must begin
-    exactly where the previous one ended. The four anomaly lists are
-    independent and each entry retains where it occurred:
+    from its own count and cursor, and every later non-empty segment must
+    begin exactly where the previous one ended. An empty confirmation
+    segment at the chain head is a legal anchor: a first receipt with no
+    operations is taken to start at ``0`` whatever its confirmation cursor
+    names, so it neither gaps nor overlaps and confirms no identity. A
+    later empty receipt is legal as well but never names a segment: it is
+    compared only against the previous confirmation cursor, and is reported
+    solely as a cursor regression when that cursor moved backwards (never
+    as a gap, an overlap, or an identity mismatch). The four anomaly lists
+    are independent and each entry retains where it occurred:
 
     - ``gaps``: a receipt starts past the previous receipt's end, so the
       accepted records between ``from`` and ``to`` are confirmed by no
@@ -2122,31 +2349,35 @@ def _receipt_chain_audit_locked(
         }
     log_length = len(accepted)
     coverage_start = committed[0][1]["cursor"] - len(committed[0][1]["operations"])
+    if not committed[0][1]["operations"]:
+        # An empty confirmation segment at the chain head is a legal
+        # anchor at 0: it neither gaps nor overlaps and confirms no
+        # identity, whatever confirmation cursor it names.
+        coverage_start = 0
+    # ``previous_cursor`` is the confirmation cursor the immediately
+    # previous receipt claimed (the basis for the cursor-regression
+    # check), while ``confirmed_end`` is the end of the last segment a
+    # non-empty receipt actually confirmed. An empty receipt confirms
+    # nothing, so it updates only the former: a later non-empty receipt
+    # continues seamlessly from the last confirmed boundary instead of
+    # seeing a phantom gap or overlap.
     previous_cursor: int | None = None
+    confirmed_end = 0
     for receipt_index, (ack_id, receipt) in enumerate(committed):
         cursor = receipt["cursor"]
         operations = receipt["operations"]
         start = cursor - len(operations)
-        if previous_cursor is not None:
-            if start > previous_cursor:
-                gaps.append(
-                    {
-                        "receiptIndex": receipt_index,
-                        "ackId": ack_id,
-                        "from": previous_cursor,
-                        "to": start,
-                    }
-                )
-            elif start < previous_cursor:
-                overlaps.append(
-                    {
-                        "receiptIndex": receipt_index,
-                        "ackId": ack_id,
-                        "from": previous_cursor,
-                        "to": start,
-                    }
-                )
-            if cursor < previous_cursor:
+        if not operations:
+            # An empty receipt names no segment, so it can never gap,
+            # overlap, or mismatch an identity. At the chain head it is
+            # a legal anchor and raises nothing; a later empty receipt is
+            # compared only against the immediately previous claimed
+            # cursor — an equal or backwards cursor (the "same cursor"
+            # case included) is reported solely as a cursor regression,
+            # and it never also produces an overlap. The corresponding
+            # suggestion list therefore yields at most the one
+            # cursor-correction item.
+            if receipt_index > 0 and cursor <= previous_cursor:
                 cursor_regressions.append(
                     {
                         "receiptIndex": receipt_index,
@@ -2155,6 +2386,36 @@ def _receipt_chain_audit_locked(
                         "to": cursor,
                     }
                 )
+            previous_cursor = cursor
+            continue
+        if receipt_index > 0:
+            if start > confirmed_end:
+                gaps.append(
+                    {
+                        "receiptIndex": receipt_index,
+                        "ackId": ack_id,
+                        "from": confirmed_end,
+                        "to": start,
+                    }
+                )
+            elif start < confirmed_end:
+                overlaps.append(
+                    {
+                        "receiptIndex": receipt_index,
+                        "ackId": ack_id,
+                        "from": confirmed_end,
+                        "to": start,
+                    }
+                )
+        if previous_cursor is not None and cursor < previous_cursor:
+            cursor_regressions.append(
+                {
+                    "receiptIndex": receipt_index,
+                    "ackId": ack_id,
+                    "from": previous_cursor,
+                    "to": cursor,
+                }
+            )
         for offset, observed in enumerate(operations):
             position = start + offset
             if position < 0 or position >= log_length:
@@ -2185,6 +2446,7 @@ def _receipt_chain_audit_locked(
                         "observed": dict(observed),
                     }
                 )
+        confirmed_end = cursor
         previous_cursor = cursor
     coverage_end = committed[-1][1]["cursor"]
     broken = bool(gaps or overlaps or identity_mismatches or cursor_regressions)
@@ -2286,12 +2548,19 @@ def _receipt_repair_suggestions(
                 }
             )
         for regression in anomalies["cursorRegressions"]:
+            # A cursor regression reported by a later empty receipt
+            # confirms no record, so there is nothing to resend: the
+            # repair only restores the cursor and is therefore suggested
+            # as ``"correct_cursor"``. A regression reported by an
+            # ordinary (non-empty) receipt keeps the established
+            # ``"resend"`` suggestion of the read-only advice query.
+            empty_receipt = not committed[regression["receiptIndex"]][1]["operations"]
             suggestions.append(
                 {
                     "peer": peer_id,
                     "ackId": regression["ackId"],
                     "kind": "cursorRegression",
-                    "action": "resend",
+                    "action": "correct_cursor" if empty_receipt else "resend",
                     "location": {"start": regression["to"], "end": regression["from"]},
                     "length": regression["from"] - regression["to"],
                     "target": {"start": regression["to"], "end": regression["from"]},
@@ -2322,6 +2591,27 @@ class PersistenceError(Exception):
 
     At startup this means the service must refuse to start; while serving
     it means the current write could not be committed durably.
+    """
+
+
+class RepairExpectationConflict(Exception):
+    """Raised when a repair batch's anchors or positions do not match.
+
+    The peer is unregistered, its current checkpoint or receipt-set
+    digest differs from the caller's expectation, or the ordered
+    suggestions do not line up with the peer's current advice positions.
+    It maps to HTTP 409 ``"apply_conflict"`` and leaves the whole batch
+    uncommitted.
+    """
+
+
+class RepairStateConflict(Exception):
+    """Raised when a repair's log location or identity has moved.
+
+    A suggestion is still positionally aligned and names the same
+    receipt, but the accepted log location or the identity it repairs no
+    longer matches the staged view. It maps to HTTP 409
+    ``"repair_conflict"`` and leaves no half execution.
     """
 
 
@@ -2807,6 +3097,211 @@ def _validate_stored_acks(
     return acks
 
 
+def _validate_stored_repair_suggestion(entry: Any) -> dict[str, Any]:
+    """Validate one stored normalized repair-execution suggestion.
+
+    Mirrors the normalized shapes :func:`parse_replication_repairs_batch`
+    produces: an interval action (``resend``/``deduplicate``/
+    ``correct_cursor``) carries ``action``, ``ackId``, and matching
+    ``location``/``target`` interval boundaries; a ``correct_identity``
+    action carries a ``location``/``target`` log position and the
+    ``expected``/``observed`` identities. Raises PersistenceError on any
+    violation.
+    """
+    if not isinstance(entry, dict):
+        raise PersistenceError("each repair suggestion must be an object")
+    action = entry.get("action")
+    if action not in REPAIR_ACTIONS:
+        raise PersistenceError(f"unknown repair action {action!r}")
+    ack_id = entry.get("ackId")
+    if not isinstance(ack_id, str) or ack_id == "":
+        raise PersistenceError("repair suggestion ackId must be a non-empty string")
+    if action in (*REPAIR_INTERVAL_ACTIONS, "correct_cursor"):
+        if set(entry.keys()) != {"action", "ackId", "location", "target"}:
+            raise PersistenceError(
+                f"{action} repair suggestion must have only action, ackId, location, target"
+            )
+        try:
+            location = _repair_boundary(entry["location"])
+            target = _repair_boundary(entry["target"])
+        except ValueError as exc:
+            raise PersistenceError(f"stored repair boundary is invalid: {exc}") from exc
+        return {
+            "action": action,
+            "ackId": ack_id,
+            "location": location,
+            "target": target,
+        }
+    if set(entry.keys()) != {
+        "action",
+        "ackId",
+        "location",
+        "target",
+        "expected",
+        "observed",
+    }:
+        raise PersistenceError(
+            "correct_identity repair suggestion must have only action, ackId, "
+            "location, target, expected, observed"
+        )
+    location = entry["location"]
+    target = entry["target"]
+    if not isinstance(location, dict) or set(location.keys()) != {"position"}:
+        raise PersistenceError("stored identity repair location must have only position")
+    if not isinstance(target, dict) or set(target.keys()) != {"position"}:
+        raise PersistenceError("stored identity repair target must have only position")
+    position = location["position"]
+    if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+        raise PersistenceError("stored identity repair position must be a non-negative integer")
+    if target["position"] != position:
+        raise PersistenceError("stored identity repair target position must match its location")
+    try:
+        expected = _repair_identity(entry["expected"])
+        observed = _repair_identity(entry["observed"])
+    except ValueError as exc:
+        raise PersistenceError(f"stored repair identity is invalid: {exc}") from exc
+    return {
+        "action": action,
+        "ackId": ack_id,
+        "location": {"position": position},
+        "target": {"position": position},
+        "expected": expected,
+        "observed": observed,
+    }
+
+
+def _validate_stored_repair_results(
+    raw: Any, suggestion_actions: list[str]
+) -> list[dict[str, Any]]:
+    """Validate the stored per-suggestion results of one repair execution.
+
+    ``suggestion_actions`` is the action of each normalized suggestion in
+    order; the result count and per-item action must both match it.
+    """
+    count = len(suggestion_actions)
+    if not isinstance(raw, list) or len(raw) != count:
+        raise PersistenceError("repair results must be a list matching its suggestions")
+    results: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict) or set(entry.keys()) != {"action", "boundary"}:
+            raise PersistenceError("each repair result must have only action and boundary")
+        action = entry["action"]
+        if action not in REPAIR_ACTIONS:
+            raise PersistenceError(f"unknown repair result action {action!r}")
+        if action != suggestion_actions[index]:
+            raise PersistenceError("repair result action must match its suggestion")
+        boundary = entry["boundary"]
+        if action == "correct_identity":
+            if not isinstance(boundary, dict) or set(boundary.keys()) != {"position"}:
+                raise PersistenceError("identity repair result boundary must be a position")
+            position = boundary["position"]
+            if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+                raise PersistenceError("identity repair result position must be a non-negative integer")
+            results.append({"action": action, "boundary": {"position": position}})
+        else:
+            try:
+                interval = _repair_boundary(boundary)
+            except ValueError as exc:
+                raise PersistenceError(f"stored repair boundary is invalid: {exc}") from exc
+            results.append({"action": action, "boundary": interval})
+    return results
+
+
+def _validate_stored_repairs(
+    document: Any,
+    checkpoints: dict[str, int],
+    records: list[tuple[str, dict[str, Any]]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Validate the optional ``repairExecutions`` section of a data file.
+
+    Returns a clean ``{(peerId, ackId): binding}`` mapping of committed
+    conditional repair executions. The section is optional (a version:1
+    file written before the repair entries existed recovers with no
+    repair bindings). When present it is a list of records, one per
+    ``(peerId, ackId)`` pair, each carrying exactly ``peerId``,
+    ``ackId``, ``expectedCheckpoint``, ``expectedReceipts``,
+    ``suggestions``, ``results``, and ``cursor``. Because a repair
+    commits its restored checkpoint atomically, every binding must name a
+    registered peer whose checkpoint has reached the binding's cursor;
+    the cursor may not exceed the recovered log length. Anything else is
+    a corrupt file.
+    """
+    if "repairExecutions" not in document:
+        return {}
+    raw = document["repairExecutions"]
+    if not isinstance(raw, list):
+        raise PersistenceError("data file repairExecutions must be a list")
+    repairs: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {
+            "peerId",
+            "ackId",
+            "expectedCheckpoint",
+            "expectedReceipts",
+            "suggestions",
+            "results",
+            "cursor",
+        }:
+            raise PersistenceError(
+                "each repair record must be an object with peerId, ackId, "
+                "expectedCheckpoint, expectedReceipts, suggestions, results, cursor"
+            )
+        peer_id = entry["peerId"]
+        ack_id = entry["ackId"]
+        expected_checkpoint = entry["expectedCheckpoint"]
+        cursor = entry["cursor"]
+        if not isinstance(peer_id, str) or peer_id == "":
+            raise PersistenceError("repair peerId must be a non-empty string")
+        if not isinstance(ack_id, str) or ack_id == "":
+            raise PersistenceError("repair ackId must be a non-empty string")
+        for name, value in (
+            ("expectedCheckpoint", expected_checkpoint),
+            ("cursor", cursor),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise PersistenceError(f"repair {name} must be a non-negative integer")
+        if not _is_sha256_hex64(entry["expectedReceipts"]):
+            raise PersistenceError(
+                "repair expectedReceipts must be 64 lowercase hexadecimal characters"
+            )
+        suggestions_raw = entry["suggestions"]
+        if not isinstance(suggestions_raw, list) or not (
+            REPAIR_BATCH_MIN <= len(suggestions_raw) <= REPAIR_BATCH_MAX
+        ):
+            raise PersistenceError("repair suggestions must be a list of 1-100 entries")
+        suggestions = [
+            _validate_stored_repair_suggestion(item) for item in suggestions_raw
+        ]
+        for index in range(1, len(suggestions)):
+            if REPAIR_ACTIONS.index(suggestions[index]["action"]) < REPAIR_ACTIONS.index(
+                suggestions[index - 1]["action"]
+            ):
+                raise PersistenceError("stored repair suggestions must be in processing order")
+        results = _validate_stored_repair_results(
+            entry["results"], [item["action"] for item in suggestions]
+        )
+        key = (peer_id, ack_id)
+        if key in repairs:
+            raise PersistenceError(f"duplicate repair binding {key!r} in data file")
+        registered = checkpoints.get(peer_id)
+        if registered is None or registered < cursor:
+            raise PersistenceError(
+                f"repair binding {key!r} names a peer whose checkpoint has not reached it"
+            )
+        if cursor > len(records) or cursor < expected_checkpoint:
+            raise PersistenceError(
+                f"repair binding {key!r} restores a cursor outside the recovered log"
+            )
+        repairs[key] = {
+            "expectedCheckpoint": expected_checkpoint,
+            "expectedReceipts": entry["expectedReceipts"],
+            "suggestions": suggestions,
+            "results": results,
+            "cursor": cursor,
+        }
+    return repairs
+
+
 def _is_sha256_hex64(value: Any) -> bool:
     """Return True for exactly 64 lowercase hexadecimal characters."""
     return isinstance(value, str) and len(value) == 64 and all(
@@ -2869,6 +3364,7 @@ def _load_data_file_complete(
     dict[tuple[str, str], str],
     dict[str, list[dict[str, Any]]],
     dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
     list[dict[str, Any]],
 ]:
     """Read and strictly validate a data file, returning every section.
@@ -2878,12 +3374,14 @@ def _load_data_file_complete(
     ``{(replicaId, operationId): policy}`` automatic-resolution policy
     bindings, the persisted ``{transactionId: entries}`` transaction
     bindings, the persisted ``{(peerId, ackId): receipt}`` consumption
-    receipts, and the persisted scope-policy change events (each empty for
-    a version:1 file written before that section existed). Raises
-    PersistenceError when the file is missing-readable, not UTF-8 JSON,
-    has an unexpected structure, or contains records, checkpoints, policy
-    bindings, transaction bindings, receipts, or policy events violating
-    the live constraints.
+    receipts, the persisted ``{(peerId, ackId): repair-binding}``
+    conditional replication-repair executions, and the persisted
+    scope-policy change events (each empty for a version:1 file written
+    before that section existed). Raises PersistenceError when the file
+    is missing-readable, not UTF-8 JSON, has an unexpected structure, or
+    contains records, checkpoints, policy bindings, transaction
+    bindings, receipts, repair executions, or policy events violating the
+    live constraints.
     """
     try:
         with open(path, "rb") as handle:
@@ -2904,12 +3402,13 @@ def _load_data_file_complete(
         "policies",
         "transactions",
         "acks",
+        "repairExecutions",
         "policyEvents",
     } or "version" not in document or "operations" not in document:
         raise PersistenceError(
             "data file root must be an object with version and operations "
-            "and optionally checkpoints, policies, transactions, acks, and "
-            "policyEvents"
+            "and optionally checkpoints, policies, transactions, acks, "
+            "repairExecutions, and policyEvents"
         )
     version = document["version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != DATA_FORMAT_VERSION:
@@ -2931,8 +3430,9 @@ def _load_data_file_complete(
     policies = _validate_stored_policies(document, identities)
     transactions = _validate_stored_transactions(document, identities)
     acks = _validate_stored_acks(document, checkpoints, records)
+    repairs = _validate_stored_repairs(document, checkpoints, records)
     policy_events = _validate_stored_policy_events(document)
-    return records, checkpoints, policies, transactions, acks, policy_events
+    return records, checkpoints, policies, transactions, acks, repairs, policy_events
 
 
 def load_data_file_full(
@@ -2950,7 +3450,7 @@ def load_data_file_full(
     UTF-8 JSON, has an unexpected structure, or contains records,
     checkpoints, or policy bindings violating the live constraints.
     """
-    records, checkpoints, policies, _, _, _ = _load_data_file_complete(path)
+    records, checkpoints, policies, _, _, _, _ = _load_data_file_complete(path)
     return records, checkpoints, policies
 
 
@@ -2961,7 +3461,7 @@ def load_data_file_transactions(path: str) -> dict[str, list[dict[str, Any]]]:
     only need the persisted ``{transactionId: entries}`` bindings; every
     other section is validated the same way but not returned.
     """
-    _, _, _, transactions, _, _ = _load_data_file_complete(path)
+    _, _, _, transactions, _, _, _ = _load_data_file_complete(path)
     return transactions
 
 
@@ -2973,7 +3473,7 @@ def load_data_file_acks(path: str) -> dict[tuple[str, str], dict[str, Any]]:
     receipts; every other section is validated the same way but not
     returned.
     """
-    _, _, _, _, acks, _ = _load_data_file_complete(path)
+    _, _, _, _, acks, _, _ = _load_data_file_complete(path)
     return acks
 
 
@@ -2995,7 +3495,7 @@ def load_data_file_policy_events(path: str) -> list[dict[str, Any]]:
     only need the persisted scope-policy change history; every other
     section is validated the same way but not returned.
     """
-    _, _, _, _, _, policy_events = _load_data_file_complete(path)
+    _, _, _, _, _, _, policy_events = _load_data_file_complete(path)
     return policy_events
 
 
@@ -3007,6 +3507,7 @@ def ensure_data_file(
     dict[tuple[str, str], str],
     dict[str, list[dict[str, Any]]],
     dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
     list[dict[str, Any]],
 ]:
     """Validate the data-file location and return its committed state.
@@ -3014,7 +3515,7 @@ def ensure_data_file(
     A missing target file is accepted (its parent directory must exist and
     be writable); an existing target must be a regular, parseable data
     file. Returns ``(records, checkpoints, policies, transactions, acks,
-    policy_events)``. Anything else raises PersistenceError.
+    repairs, policy_events)``. Anything else raises PersistenceError.
     """
     parent = os.path.dirname(os.path.abspath(path))
     if not os.path.isdir(parent):
@@ -3029,7 +3530,7 @@ def ensure_data_file(
         if not stat.S_ISREG(mode):
             raise PersistenceError(f"data file path is not a regular file: {path!r}")
         return _load_data_file_complete(path)
-    return [], {}, {}, {}, {}, []
+    return [], {}, {}, {}, {}, {}, []
 
 
 def _fsync_directory(directory: str) -> None:
@@ -3245,6 +3746,15 @@ class StateStore:
         # touches the accepted log, and it is committed atomically with the
         # checkpoint advance it caused.
         self._acks: dict[tuple[str, str], dict[str, Any]] = {}
+        # Conditional replication-repair executions, keyed by
+        # ``(peerId, ackId)``. Each binding records the exact locked
+        # request (expected checkpoint, expected receipt digest, and the
+        # ordered suggestions), the per-action results in request order,
+        # and the checkpoint cursor restored when the execution
+        # committed. A repair is not an operation: it never enters the
+        # accepted log; it is committed atomically with the checkpoint
+        # advance it causes and is replayed by ``(peerId, ackId)``.
+        self._repairs: dict[tuple[str, str], dict[str, Any]] = {}
         # Scope-policy change history: one event per successful hot reload,
         # in commit order. Each event is ``{"sequence", "digest",
         # "tokens"}``: a 1-based continuous position, the SHA-256 of the
@@ -3266,6 +3776,7 @@ class StateStore:
                 policies,
                 transactions,
                 acks,
+                repairs,
                 policy_events,
             ) = ensure_data_file(path)
             with self._lock:
@@ -3275,6 +3786,7 @@ class StateStore:
                 self._policies = dict(policies)
                 self._transactions = dict(transactions)
                 self._acks = dict(acks)
+                self._repairs = dict(repairs)
                 self._policy_events = [dict(event) for event in policy_events]
                 self._data_file = path
                 if not records and not os.path.exists(path):
@@ -3361,6 +3873,24 @@ class StateStore:
                     "operations": receipt["operations"],
                 }
                 for (peer_id, ack_id), receipt in self._acks.items()
+            ],
+            # Conditional repair executions ride along in the same atomic
+            # commit as the checkpoint advance they caused. A repair is
+            # not an operation: it is never part of the accepted log or
+            # exported by sync; the binding only records what execution
+            # the ``(peerId, ackId)`` pair is bound to, so an identical
+            # replay appends nothing and advances nothing.
+            "repairExecutions": [
+                {
+                    "peerId": peer_id,
+                    "ackId": ack_id,
+                    "expectedCheckpoint": binding["expectedCheckpoint"],
+                    "expectedReceipts": binding["expectedReceipts"],
+                    "suggestions": binding["suggestions"],
+                    "results": binding["results"],
+                    "cursor": binding["cursor"],
+                }
+                for (peer_id, ack_id), binding in self._repairs.items()
             ],
             # Scope-policy change events ride along in the order their
             # reloads committed, so every successful hot reload and its
@@ -6342,6 +6872,379 @@ class StateStore:
             "conclusion": conclusion,
         }
 
+    def _peer_receipts_locked(
+        self, peer_id: str
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Return one registered peer's receipts in creation order.
+
+        The receipt bindings live in a flat ``(peerId, ackId)`` mapping
+        whose per-key insertion order is the receipt creation order, so
+        this filters for ``peer_id`` preserving that order, exactly like
+        the receipt and delivery-status queries.
+        """
+        return [
+            (receipt_ack, receipt)
+            for (receipt_peer, receipt_ack), receipt in self._acks.items()
+            if receipt_peer == peer_id
+        ]
+
+    def _repair_current_advice_locked(
+        self, peer_id: str, committed: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        """Re-derive one peer's current ordered repair advice.
+
+        The advice is produced by the same derivation as the read-only
+        ``GET /v1/replication/repairs`` entry point, so a suggestion is
+        still executable precisely while it remains present in this list.
+        """
+        return _receipt_repair_suggestions(peer_id, committed, self._accepted)
+
+    @staticmethod
+    def _repair_order_rank(action: str) -> int:
+        """The fixed processing order: resend, deduplicate, identity, cursor."""
+        return REPAIR_ACTIONS.index(action)
+
+    @staticmethod
+    def _repair_action_ordered_advice(
+        current_advice: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Order current advice the way a repair batch processes it.
+
+        The read-only advice query lists anomalies in receipt creation
+        order (boundary anomalies before a receipt's identity
+        mismatches), but an execution processes its suggestions in the
+        fixed action order — resend, deduplicate, correct_identity, then
+        correct_cursor — preserving the stable advice order within each
+        action group (receipt creation order, then log-position order for
+        a receipt's several identity mismatches).
+        """
+        return sorted(
+            current_advice,
+            key=lambda advice: (
+                REPAIR_ACTIONS.index(advice["action"]),
+                advice["_index"],
+            ),
+        )
+
+    @staticmethod
+    def _repair_boundary_of(advice: dict[str, Any]) -> dict[str, Any]:
+        """The boundary a matched advice entry restores (its target)."""
+        return dict(advice["target"])
+
+    @staticmethod
+    def _repair_same_substance(advice: dict[str, Any], entry: dict[str, Any]) -> bool:
+        """Whether the slot's advice still carries the suggestion's content.
+
+        The slot (action, receipt, within-slot ordinal) already aligned;
+        this compares the repair substance — the affected log location
+        and, for an identity correction, the target boundary plus the
+        expected/observed identities.
+        """
+        if advice["location"] != entry["location"]:
+            return False
+        if advice["target"] != entry["target"]:
+            return False
+        if entry["action"] == "correct_identity" and (
+            advice["expected"] != entry["expected"]
+            or advice["observed"] != entry["observed"]
+        ):
+            return False
+        return True
+
+    def _align_repair_suggestions_locked(
+        self,
+        suggestions: list[dict[str, Any]],
+        current_advice: list[dict[str, Any]],
+        *,
+        strict: bool,
+    ) -> list[dict[str, Any] | None]:
+        """Align each batch suggestion with its current advice slot.
+
+        A suggestion is locked by the tuple ``(action, receiptAckId,
+        ordinal)``: the action it executes, the receipt that produced the
+        anomaly, and the 0-based ordinal of that action within the
+        receipt's anomalies (a receipt holds at most one boundary anomaly
+        of each kind but may hold several identity mismatches in
+        log-position order). The current advice is grouped into the fixed
+        action order and suggestion ``k`` for a slot consumes that slot's
+        ``k``-th current entry in stable order, so a batch may cover any
+        subset of receipts without cross-receipt positions coupling.
+
+        Returns the aligned advice entry per suggestion, or ``None`` when
+        the slot no longer exists (a position mismatch). With
+        ``strict=True`` (apply), a slot that still exists for the same
+        receipt but whose log location or identity has moved raises
+        :class:`RepairStateConflict` (a ``"repair_conflict"``); with
+        ``strict=False`` (preflight) it is returned as ``None`` so the
+        preflight can report that item as not executable.
+        """
+        indexed = [dict(advice, _index=index) for index, advice in enumerate(current_advice)]
+        ordered = self._repair_action_ordered_advice(indexed)
+        # Current advice entries per ``(action, ackId)`` slot, in stable
+        # order; the batch consumes each slot's entries from ordinal 0.
+        slots: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for advice in ordered:
+            slots.setdefault((advice["action"], advice["ackId"]), []).append(advice)
+        consumed: dict[tuple[str, str], int] = {}
+        aligned: list[dict[str, Any] | None] = []
+        for entry in suggestions:
+            key = (entry["action"], entry["ackId"])
+            ordinal = consumed.get(key, 0)
+            consumed[key] = ordinal + 1
+            slot_entries = slots.get(key, [])
+            if ordinal >= len(slot_entries):
+                # The slot position the suggestion names no longer
+                # exists in the current advice — a position mismatch.
+                aligned.append(None)
+                continue
+            advice = slot_entries[ordinal]
+            if not self._repair_same_substance(advice, entry):
+                if strict:
+                    # The receipt and slot still exist, but the log
+                    # location or the identity it holds has moved.
+                    raise RepairStateConflict("log location or identity no longer matches")
+                aligned.append(None)
+                continue
+            aligned.append(advice)
+        return aligned
+
+    def _stage_repair_batch_locked(
+        self,
+        peer_id: str,
+        expected_checkpoint: int,
+        expected_receipts: str,
+        suggestions: list[dict[str, Any]],
+        *,
+        strict: bool,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Validate one repair batch against a staged committed snapshot.
+
+        This is the single dry run shared by the read-only preflight and
+        the committing apply. It mutates no state and returns
+        ``(results, restored_cursor)``: one result per requested
+        suggestion in request order, each carrying its ``action`` and the
+        boundary the repair restores — an interval ``{"start","end"}`` or
+        a position ``{"position":P}`` (or ``None`` when non-strict and the
+        item is no longer executable) — and the checkpoint cursor the
+        batch restores once every guard passes.
+
+        With ``strict=True`` (apply), any item not positionally aligned
+        raises :class:`RepairExpectationConflict` (a position mismatch)
+        and an aligned item whose log location or identity moved raises
+        :class:`RepairStateConflict`. With ``strict=False`` (preflight),
+        a non-executable item is reported in place instead. The peer
+        anchors and the fixed processing order are enforced identically
+        in both modes.
+        """
+        checkpoint = self._checkpoints.get(peer_id)
+        if checkpoint is None:
+            raise RepairExpectationConflict("peer has no registered checkpoint")
+        if checkpoint != expected_checkpoint:
+            raise RepairExpectationConflict("expected checkpoint does not match")
+        committed = self._peer_receipts_locked(peer_id)
+        if _repair_receipts_digest(peer_id, committed) != expected_receipts:
+            raise RepairExpectationConflict("expected receipt digest does not match")
+
+        # The batch is processed in one fixed order; an out-of-order
+        # suggestion is a position mismatch (apply_conflict).
+        previous_rank = -1
+        for entry in suggestions:
+            rank = self._repair_order_rank(entry["action"])
+            if rank < previous_rank:
+                raise RepairExpectationConflict("suggestions are out of processing order")
+            previous_rank = rank
+
+        current_advice = self._repair_current_advice_locked(peer_id, committed)
+        aligned = self._align_repair_suggestions_locked(
+            suggestions, current_advice, strict=strict
+        )
+
+        results: list[dict[str, Any]] = []
+        restored_cursor = checkpoint
+        for entry, advice in zip(suggestions, aligned):
+            if advice is None:
+                if strict:
+                    raise RepairExpectationConflict(
+                        "suggestion position no longer matches"
+                    )
+                results.append({"action": entry["action"], "boundary": None})
+                continue
+            boundary = self._repair_boundary_of(advice)
+            results.append({"action": entry["action"], "boundary": boundary})
+            if "end" in boundary:
+                restored_cursor = max(restored_cursor, boundary["end"])
+        return results, restored_cursor
+
+    def preflight_replication_repairs(
+        self,
+        peer_id: str,
+        ack_id: str,
+        expected_checkpoint: int,
+        expected_receipts: str,
+        suggestions: list[dict[str, Any]],
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Read-only preflight for a conditional replication-repair batch.
+
+        This is the non-committing body behind
+        ``POST /v1/replication/repairs/plan``: it stages exactly the same
+        anchors and ordered guards as :meth:`apply_replication_repairs` but
+        writes nothing — no repair record, checkpoint advance,
+        accepted-log record, candidate, metric, or data-file byte, and no
+        temporary file. The peer, expected checkpoint, and expected
+        receipt digest are verified against one committed snapshot, and
+        each requested suggestion is aligned, in request order, with the
+        peer's re-derived current advice.
+
+        Returns ``(200, plan)`` whose ``results`` give, per suggestion in
+        request order, whether it is still executable (``executable``) and
+        the boundary it would restore (``boundary``) — the per-item
+        conclusion and predicted boundary. A peer/checkpoint/digest anchor
+        mismatch or an out-of-order batch returns
+        ``(409, {"error": "apply_conflict"})``; a suggestion the staged
+        view no longer admits is reported per item as not executable
+        (boundary null) rather than rejecting the preflight — the
+        preflight exists to report exactly that.
+        """
+        with self._lock:
+            try:
+                results, _ = self._stage_repair_batch_locked(
+                    peer_id,
+                    expected_checkpoint,
+                    expected_receipts,
+                    suggestions,
+                    strict=False,
+                )
+            except RepairExpectationConflict:
+                return HTTPStatus.CONFLICT, {"error": "apply_conflict"}
+        items = [
+            {
+                "action": result["action"],
+                "executable": result["boundary"] is not None,
+                "boundary": result["boundary"],
+            }
+            for result in results
+        ]
+        return HTTPStatus.OK, {
+            "status": "planned",
+            "peerId": peer_id,
+            "ackId": ack_id,
+            "results": items,
+        }
+
+    def apply_replication_repairs(
+        self,
+        peer_id: str,
+        ack_id: str,
+        expected_checkpoint: int,
+        expected_receipts: str,
+        suggestions: list[dict[str, Any]],
+    ) -> tuple[HTTPStatus, dict[str, Any], str | None]:
+        """Commit a conditional replication-repair batch atomically.
+
+        This is the committing body behind
+        ``POST /v1/replication/repairs/apply`` and the conditional
+        counterpart of :meth:`preflight_replication_repairs`. Under the
+        shared commit lock it first answers a known ``(peerId, ackId)``
+        binding: an identical request replays the committed execution with
+        HTTP 200 and appends no repair record and no checkpoint advance,
+        while a known binding with a different expected anchor or ordered
+        suggestion set returns HTTP 409 ``"operation_conflict"`` with all
+        state unchanged.
+
+        For a new execution every guard in
+        :meth:`_stage_repair_batch_locked` must pass against one
+        committed snapshot — the peer and its expected checkpoint and
+        receipt digest must match and every suggestion, in the fixed
+        processing order (resend, deduplicate, correct_identity,
+        correct_cursor), must still be present in the peer's current
+        advice. Any anchor or ordering mismatch is HTTP 409
+        ``"apply_conflict"``; a suggestion the log or the identities have
+        moved past is HTTP 409 ``"repair_conflict"``. Either rejection
+        leaves the whole batch uncommitted — never half an execution.
+
+        Only when every guard passes are the repair record and the
+        restored checkpoint committed together in one atomic commit
+        (the same temp-file/fsync/rename protocol, under the same lock as
+        writes, imports, repairs, checkpoints, and acknowledgements), and
+        the response is HTTP 201. Results are given per suggestion in
+        request order — each carrying its action and the restored
+        boundary — together with the new-execution and replay counts.
+        Raises PersistenceError when the durable commit fails, in which
+        case memory, the binding, the checkpoint, and the data file are
+        exactly as before and the request can be retried.
+        """
+        with self._lock:
+            binding = self._repairs.get((peer_id, ack_id))
+            if binding is not None:
+                same = (
+                    binding["expectedCheckpoint"] == expected_checkpoint
+                    and binding["expectedReceipts"] == expected_receipts
+                    and binding["suggestions"] == suggestions
+                )
+                if not same:
+                    return HTTPStatus.CONFLICT, {}, "operation_conflict"
+                return (
+                    HTTPStatus.OK,
+                    {
+                        "status": "ok",
+                        "peerId": peer_id,
+                        "ackId": ack_id,
+                        "results": binding["results"],
+                        "newExecutions": 0,
+                        "replayed": len(binding["results"]),
+                    },
+                    None,
+                )
+            try:
+                results, restored_cursor = self._stage_repair_batch_locked(
+                    peer_id,
+                    expected_checkpoint,
+                    expected_receipts,
+                    suggestions,
+                    strict=True,
+                )
+            except RepairExpectationConflict:
+                return HTTPStatus.CONFLICT, {}, "apply_conflict"
+            except RepairStateConflict:
+                return HTTPStatus.CONFLICT, {}, "repair_conflict"
+
+            record = {
+                "expectedCheckpoint": expected_checkpoint,
+                "expectedReceipts": expected_receipts,
+                "suggestions": suggestions,
+                "results": results,
+                "cursor": restored_cursor,
+            }
+            previous_checkpoint = self._checkpoints[peer_id]
+            if self._data_file is not None:
+                # Stage the binding and the restored cursor, make the
+                # atomic rename the single commit point, and move the
+                # visible state only after it succeeds, so a failed
+                # durable commit leaves everything exactly as before.
+                self._repairs[(peer_id, ack_id)] = record
+                self._checkpoints[peer_id] = restored_cursor
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    del self._repairs[(peer_id, ack_id)]
+                    self._checkpoints[peer_id] = previous_checkpoint
+                    raise
+            else:
+                self._repairs[(peer_id, ack_id)] = record
+                self._checkpoints[peer_id] = restored_cursor
+            return (
+                HTTPStatus.CREATED,
+                {
+                    "status": "created",
+                    "peerId": peer_id,
+                    "ackId": ack_id,
+                    "results": results,
+                    "newExecutions": len(results),
+                    "replayed": 0,
+                },
+                None,
+            )
+
     def record_policy_reload(self, digest: str, tokens: int) -> dict[str, Any]:
         """Commit one successful scope-policy hot reload to the audit history.
 
@@ -7905,6 +8808,84 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_replication_repairs_plan_post(self) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those. The route
+        # accepts no query parameters, and that check precedes the body
+        # check. The preflight only stages the batch against one committed
+        # snapshot and commits nothing: no repair record, checkpoint
+        # advance, log record, candidate, or data-file byte, and no
+        # temporary file. The body follows the compact-single-line
+        # contract: ordered UTF-8 JSON, one trailing newline, counts,
+        # cursors, and boundaries only as JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            peer_id, ack_id, expected_checkpoint, expected_receipts, suggestions = (
+                parse_replication_repairs_batch(raw)
+            )
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        status, payload = self._store.preflight_replication_repairs(
+            peer_id, ack_id, expected_checkpoint, expected_receipts, suggestions
+        )
+        self._json_ordered_newline(status, payload)
+
+    def _handle_replication_repairs_apply_post(self) -> None:
+        # The declared-length check (400/413) ran before the write-scope
+        # check, both before this handler and without reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those. The route
+        # accepts no query parameters, and that check precedes the body
+        # check. The batch executes against one committed snapshot in the
+        # fixed action order and, once every guard passes, commits the
+        # repair record and restored checkpoint together atomically; any
+        # conflict rejects the whole batch with no half execution. The
+        # response follows the compact-single-line contract: ordered
+        # UTF-8 JSON, one trailing newline, counts, cursors, and
+        # boundaries only as JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            peer_id, ack_id, expected_checkpoint, expected_receipts, suggestions = (
+                parse_replication_repairs_batch(raw)
+            )
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        try:
+            status, payload, error = self._store.apply_replication_repairs(
+                peer_id, ack_id, expected_checkpoint, expected_receipts, suggestions
+            )
+        except PersistenceError:
+            self._json_ordered_newline(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+            )
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json_ordered_newline(status, {"error": error})
+            return
+        self._json_ordered_newline(status, payload)
+
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)
         if params is None:
@@ -8549,6 +9530,20 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "replication"
             and segments[2] == "consensus"
         )
+        is_replication_repairs_plan_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "repairs"
+            and segments[3] == "plan"
+        )
+        is_replication_repairs_apply_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "repairs"
+            and segments[3] == "apply"
+        )
         if (
             matched
             or matched_ack
@@ -8565,6 +9560,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_replication_plan_post
             or is_replication_apply_post
             or is_replication_consensus_post
+            or is_replication_repairs_plan_post
+            or is_replication_repairs_apply_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -8615,6 +9612,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # read-only — the remote snapshots are aggregated but
                 # never imported — so it is gated like the comparison and
                 # the plan: a read or admin scope suffices.
+                if not self._require_scope(SCOPE_READ):
+                    return
+            elif is_replication_repairs_plan_post:
+                # The repair preflight only checks a staged view and
+                # commits nothing, so it is gated like the other
+                # read-only POSTs: a read or admin scope suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
             elif not self._require_scope(SCOPE_WRITE):
@@ -8690,6 +9693,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_replication_consensus_post:
             self._handle_replication_consensus_post()
+            return
+        if is_replication_repairs_plan_post:
+            self._handle_replication_repairs_plan_post()
+            return
+        if is_replication_repairs_apply_post:
+            self._handle_replication_repairs_apply_post()
             return
         self._handle_sync_post()
 

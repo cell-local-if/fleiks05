@@ -121,17 +121,40 @@ class PeerReceiptsAuditStoreTests(unittest.TestCase):
         self.assertEqual(payload["receiptsCount"], 0)
         self.assertEqual(payload["audit"], audit_ok(0, 0))
 
-    def test_seamless_chain_with_empty_segment_is_ok_end_to_end(self) -> None:
+    def test_mid_chain_same_cursor_empty_receipt_only_reports_regression(self) -> None:
         store = StateStore()
         self.seed_operations(store, 3)
         store.save_checkpoint("peer-a", 0)
         self.ack(store, "peer-a", "ack-1", 2, [identity("r0", "o0"), identity("r1", "o1")])
-        # An empty confirmation segment at the same cursor stays legal.
+        # A later empty receipt at the same cursor confirms nothing: it
+        # never gaps, overlaps, or mismatches an identity — it only
+        # reports that the cursor did not advance (a regression).
         self.ack(store, "peer-a", "ack-2", 2, [])
         self.ack(store, "peer-a", "ack-3", 3, [identity("r2", "o2")])
         status, payload = store.get_peer_receipts_audit("peer-a", 0, 100)
         self.assertIs(status, HTTPStatus.OK)
         self.assertEqual(payload["receiptsCount"], 3)
+        audit = payload["audit"]
+        self.assertEqual(audit["status"], "broken")
+        self.assertEqual(audit["coverage"], {"start": 0, "end": 3})
+        self.assertEqual(audit["gaps"], [])
+        self.assertEqual(audit["overlaps"], [])
+        self.assertEqual(audit["identityMismatches"], [])
+        self.assertEqual(
+            audit["cursorRegressions"],
+            [{"receiptIndex": 1, "ackId": "ack-2", "from": 2, "to": 2}],
+        )
+
+    def test_mid_chain_forward_cursor_empty_receipt_is_clean(self) -> None:
+        store = StateStore()
+        self.seed_operations(store, 3)
+        store.save_checkpoint("peer-a", 0)
+        self.ack(store, "peer-a", "ack-1", 2, [identity("r0", "o0"), identity("r1", "o1")])
+        # An empty receipt at a forward cursor confirms nothing new but
+        # does not move the cursor backwards, so the chain stays seamless.
+        store._acks[("peer-a", "ack-2")] = {"cursor": 3, "operations": []}
+        status, payload = store.get_peer_receipts_audit("peer-a", 0, 100)
+        self.assertIs(status, HTTPStatus.OK)
         self.assertEqual(payload["audit"], audit_ok(0, 3))
 
     def test_first_start_is_derived_from_count_and_cursor(self) -> None:
@@ -432,12 +455,34 @@ class HttpPeerReceiptsAuditTests(unittest.TestCase):
         self.seed(3)
         self.register("peer-a", 0)
         self.acknowledge("peer-a", "ack-1", 2, [identity("r0", "o0"), identity("r1", "o1")])
-        self.acknowledge("peer-a", "ack-2", 2, [])  # legal empty segment
+        self.acknowledge("peer-a", "ack-2", 3, [identity("r2", "o2")])
+        status, payload = self.audit("peer-a")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["receiptsCount"], 2)
+        self.assertEqual(payload["audit"], audit_ok(0, 3))
+
+    def test_mid_chain_same_cursor_empty_receipt_only_reports_regression(self) -> None:
+        self.seed(3)
+        self.register("peer-a", 0)
+        self.acknowledge("peer-a", "ack-1", 2, [identity("r0", "o0"), identity("r1", "o1")])
+        # A later empty receipt at the same cursor confirms nothing: it
+        # never gaps, overlaps, or mismatches an identity — it only
+        # reports that the cursor did not advance (a regression).
+        self.acknowledge("peer-a", "ack-2", 2, [])
         self.acknowledge("peer-a", "ack-3", 3, [identity("r2", "o2")])
         status, payload = self.audit("peer-a")
         self.assertEqual(status, 200)
         self.assertEqual(payload["receiptsCount"], 3)
-        self.assertEqual(payload["audit"], audit_ok(0, 3))
+        audit = payload["audit"]
+        self.assertEqual(audit["status"], "broken")
+        self.assertEqual(audit["coverage"], {"start": 0, "end": 3})
+        self.assertEqual(audit["gaps"], [])
+        self.assertEqual(audit["overlaps"], [])
+        self.assertEqual(audit["identityMismatches"], [])
+        self.assertEqual(
+            audit["cursorRegressions"],
+            [{"receiptIndex": 1, "ackId": "ack-2", "from": 2, "to": 2}],
+        )
 
     def test_paging_is_stable_and_summary_is_page_independent(self) -> None:
         self.seed(2)

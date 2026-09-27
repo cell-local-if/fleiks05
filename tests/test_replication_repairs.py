@@ -340,28 +340,36 @@ class ReplicationRepairsStoreTests(unittest.TestCase):
             self.assertEqual(item["action"], "correct_identity")
             self.assertEqual(item["target"], item["location"])
 
-    def test_cursor_regression_suggests_resend_to_the_prior_boundary(self) -> None:
+    def test_empty_receipt_regression_suggests_only_cursor_correction(self) -> None:
         self.seed_operations(3)
         self.store.save_checkpoint("peer-a", 3)
         self.seed_receipt(
             "peer-a", "ack-1", 2, [identity("r0", "o0"), identity("r1", "o1")]
         )
-        # An empty segment at cursor 1 both overlaps [1,2) and regresses
-        # the cursor 2 -> 1; each anomaly yields its own suggestion.
-        self.seed_receipt("peer-a", "ack-2", 1, [])
+        # A later empty receipt at the same cursor confirms nothing: it
+        # produces no gap, overlap, or identity mismatch — only the one
+        # cursor-correction suggestion.
+        self.seed_receipt("peer-a", "ack-2", 2, [])
         payload = self.plan()
-        kinds = {(item["kind"], item["action"]) for item in payload["suggestions"]}
+        self.assertEqual(len(payload["suggestions"]), 1)
+        suggestion = payload["suggestions"][0]
+        self.assertEqual(list(suggestion), INTERVAL_FIELDS)
         self.assertEqual(
-            kinds,
-            {("overlap", "deduplicate"), ("cursorRegression", "resend")},
+            suggestion,
+            {
+                "peer": "peer-a",
+                "ackId": "ack-2",
+                "kind": "cursorRegression",
+                "action": "correct_cursor",
+                "location": {"start": 2, "end": 2},
+                "length": 0,
+                "target": {"start": 2, "end": 2},
+            },
         )
-        for suggestion in payload["suggestions"]:
-            self.assertEqual(suggestion["ackId"], "ack-2")
-            self.assertEqual(suggestion["location"], {"start": 1, "end": 2})
-            self.assertEqual(suggestion["target"], {"start": 1, "end": 2})
-            self.assertEqual(suggestion["length"], 1)
         self.assertEqual(payload["anomalies"]["cursorRegressions"], 1)
-        self.assertEqual(payload["anomalies"]["overlaps"], 1)
+        self.assertEqual(payload["anomalies"]["overlaps"], 0)
+        self.assertEqual(payload["anomalies"]["gaps"], 0)
+        self.assertEqual(payload["anomalies"]["identityMismatches"], 0)
 
     def test_suggestions_order_by_peer_then_chain_creation_order(self) -> None:
         self.seed_operations(6)
