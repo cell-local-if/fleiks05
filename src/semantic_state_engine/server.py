@@ -7731,6 +7731,393 @@ class StateStore:
                 None,
             )
 
+    def diagnose_replication_repairs(
+        self,
+        peer_id: str,
+        ack_id: str,
+        expected_checkpoint: int,
+        expected_receipts: str,
+        suggestions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Produce the read-only repair-lifecycle diagnosis for one execution.
+
+        This is the body behind ``POST /v1/replication/repairs/diagnosis``.
+        It takes the exact conditional-execution request (the same body the
+        preflight and the committing apply use) and links the four
+        lifecycle stages — advice, preflight, execution, audit — into one
+        evidence report, computed entirely from one committed snapshot
+        under the shared commit lock. It writes nothing: no repair record,
+        checkpoint advance, receipt, accepted-log record, candidate,
+        metric, temporary file, or data-file byte.
+
+        The diagnosis locates the committed execution bound to
+        ``(peer_id, ack_id)``. When it has not committed, ``execution`` is
+        ``null`` and every suggestion is aligned against the peer's live
+        advice exactly like the read-only preflight. When it committed,
+        ``execution`` carries the commit position in the pure
+        creation-order history, the expected anchors, the restored cursor,
+        and ``bindingMatch`` (whether the committed binding equals this
+        request's anchors and ordered suggestions), and each suggestion is
+        aligned by its ``(action, ackId, ordinal)`` slot against the
+        committed results. Each link is one of:
+
+        - ``"current"``: the slot agrees — consistent advice/result;
+        - ``"superseded"``: the slot exists for the same receipt but its
+          log location or identity moved;
+        - ``"unavailable"``: the same ``(action, ackId)`` group no longer
+          holds that ordinal slot.
+
+        ``conclusion`` is ``"ready"`` (execution absent, every link
+        current), ``"unexecuted"`` (execution absent with a non-current
+        link), ``"current"`` (execution present, the whole history
+        anomaly-free, every link current), ``"superseded"`` (execution
+        present, history intact, but a link moved or vanished), or
+        ``"broken"`` (the committed history reports any anomaly — a
+        duplicate binding, out-of-order actions, a boundary mismatch, a
+        cursor violation, or structural damage).
+        ``summary`` reports the suggestion count, the three link-status
+        counts, the executed count (0 or 1), and the total historical
+        anomalies across the five audit classes.
+        """
+        with self._lock:
+            history = self._repair_history_locked()
+            position: int | None = None
+            committed: dict[str, Any] | None = None
+            for index, entry in enumerate(history):
+                if entry["peerId"] == peer_id and entry["ackId"] == ack_id:
+                    position = index
+                    committed = entry
+                    break
+            historical = _repair_executions_verification_locked(
+                history, self._checkpoints, len(self._accepted)
+            )
+            historical_anomalies = self._repair_anomaly_total(historical)
+
+            # Annotate the request suggestions with their within-request
+            # slot ordinal so every link can name the slot it aligns by.
+            annotated = self._diagnosis_request_ordinals(suggestions)
+            links: list[dict[str, Any]] = []
+            if committed is None:
+                anchors_match = self._diagnosis_anchors_match_locked(
+                    peer_id, expected_checkpoint, expected_receipts
+                )
+                if anchors_match:
+                    committed_receipts = self._peer_receipts_locked(peer_id)
+                    current_advice = self._repair_current_advice_locked(
+                        peer_id, committed_receipts
+                    )
+                    aligned = self._diagnosis_align_advice_locked(
+                        annotated, current_advice
+                    )
+                else:
+                    aligned = [None] * len(annotated)
+                for suggestion, match in zip(annotated, aligned):
+                    links.append(
+                        self._diagnosis_link_locked(suggestion, match, None)
+                    )
+                execution_payload: dict[str, Any] | None = None
+            else:
+                binding_match = (
+                    committed["expectedCheckpoint"] == expected_checkpoint
+                    and committed["expectedReceipts"] == expected_receipts
+                    and committed["suggestions"] == suggestions
+                )
+                execution_payload = {
+                    "position": position,
+                    "expectedCheckpoint": committed["expectedCheckpoint"],
+                    "expectedReceipts": committed["expectedReceipts"],
+                    "cursor": committed["cursor"],
+                    "bindingMatch": binding_match,
+                }
+                aligned = self._diagnosis_align_execution_locked(
+                    annotated, committed
+                )
+                for suggestion, match in zip(annotated, aligned):
+                    links.append(
+                        self._diagnosis_link_locked(
+                            suggestion, match, position
+                        )
+                    )
+
+        status_counts = {"current": 0, "superseded": 0, "unavailable": 0}
+        for link in links:
+            status_counts[link["status"]] += 1
+        executed = 0 if committed is None else 1
+        if committed is None:
+            # Before the execution commits, the batch is ready only when
+            # every slot still agrees; a moved location (superseded) or a
+            # missing slot (unavailable) leaves it unexecuted.
+            all_current = (
+                status_counts["superseded"] == 0
+                and status_counts["unavailable"] == 0
+            )
+            conclusion = "ready" if all_current else "unexecuted"
+        elif historical_anomalies > 0:
+            # The committed history reports an anomaly — a duplicate
+            # binding, out-of-order actions, a boundary mismatch, a cursor
+            # violation, or structural damage — so the evidence chain is
+            # broken regardless of how this request's links align.
+            conclusion = "broken"
+        elif (
+            status_counts["superseded"] == 0
+            and status_counts["unavailable"] == 0
+        ):
+            # A committed execution whose every link still agrees.
+            conclusion = "current"
+        else:
+            # The execution committed and the history is intact, but at
+            # least one link's log location moved or its slot vanished.
+            conclusion = "superseded"
+        summary = {
+            "suggestions": len(suggestions),
+            "current": status_counts["current"],
+            "superseded": status_counts["superseded"],
+            "unavailable": status_counts["unavailable"],
+            "executed": executed,
+            "anomalies": historical_anomalies,
+        }
+        return {
+            "status": "diagnosed",
+            "execution": execution_payload,
+            "links": links,
+            "summary": summary,
+            "conclusion": conclusion,
+        }
+
+    def _repair_history_locked(self) -> list[dict[str, Any]]:
+        """Return the complete repair-execution history in creation order.
+
+        One entry per first-committed ``(peerId, ackId)`` binding, in the
+        order bindings first committed (and ride in the data file's
+        ``repairExecutions`` section), each carrying the audit record's
+        seven fields. Deep copies isolate the snapshot from callers.
+        """
+        return [
+            {
+                "peerId": peer_id,
+                "ackId": ack_id,
+                "expectedCheckpoint": binding["expectedCheckpoint"],
+                "expectedReceipts": binding["expectedReceipts"],
+                "suggestions": copy.deepcopy(binding["suggestions"]),
+                "results": copy.deepcopy(binding["results"]),
+                "cursor": binding["cursor"],
+            }
+            for (peer_id, ack_id), binding in self._repairs.items()
+        ]
+
+    @staticmethod
+    def _repair_anomaly_total(verification: dict[str, Any]) -> int:
+        """Count every marker across the five historical anomaly classes."""
+        return sum(
+            len(verification[name])
+            for name in (
+                "duplicateBindings",
+                "outOfOrderActions",
+                "boundaryViolations",
+                "checkpointViolations",
+                "recordViolations",
+            )
+        )
+
+    def _diagnosis_anchors_match_locked(
+        self, peer_id: str, expected_checkpoint: int, expected_receipts: str
+    ) -> bool:
+        """Whether the live peer anchors still match the request.
+
+        Mirrors the first guards of :meth:`_stage_repair_batch_locked`
+        without raising: the peer must be registered at
+        ``expected_checkpoint`` and its whole committed receipt set must
+        digest to ``expected_receipts``. When the anchors do not match, no
+        live advice can align and every link is unavailable.
+        """
+        checkpoint = self._checkpoints.get(peer_id)
+        if checkpoint is None or checkpoint != expected_checkpoint:
+            return False
+        committed = self._peer_receipts_locked(peer_id)
+        return _repair_receipts_digest(peer_id, committed) == expected_receipts
+
+    @staticmethod
+    def _diagnosis_request_ordinals(
+        suggestions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Annotate each suggestion with its within-request slot ordinal.
+
+        The ordinal is the 0-based position of the suggestion among the
+        request's earlier entries sharing its ``(action, ackId)`` group —
+        the same slot identity the preflight, apply, and this diagnosis
+        align by. Returns annotated copies (the parsed request is never
+        mutated).
+        """
+        seen: dict[tuple[str, str], int] = {}
+        annotated: list[dict[str, Any]] = []
+        for entry in suggestions:
+            key = (entry["action"], entry["ackId"])
+            ordinal = seen.get(key, 0)
+            seen[key] = ordinal + 1
+            annotated.append({**entry, "_ordinal": ordinal})
+        return annotated
+
+    @staticmethod
+    def _diagnosis_align_advice_locked(
+        suggestions: list[dict[str, Any]],
+        current_advice: list[dict[str, Any]],
+    ) -> list[dict[str, Any] | None]:
+        """Align request suggestions against the live advice slots.
+
+        Groups the current advice into the fixed action order and each
+        request suggestion consumes its ``(action, ackId)`` group's entry
+        at the suggestion's ordinal (the same slot rule as
+        :meth:`_align_repair_suggestions_locked`). Returns the matched
+        advice entry per suggestion, or ``None`` when the group has no slot
+        at that ordinal. Whether the slot's location/identity agrees with
+        the request (``current`` vs ``superseded``) is decided by
+        :meth:`_diagnosis_link_locked`.
+        """
+        indexed = [
+            dict(advice, _index=index)
+            for index, advice in enumerate(current_advice)
+        ]
+        ordered = StateStore._repair_action_ordered_advice(indexed)
+        slots: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for advice in ordered:
+            slots.setdefault((advice["action"], advice["ackId"]), []).append(advice)
+        aligned: list[dict[str, Any] | None] = []
+        for entry in suggestions:
+            group = slots.get((entry["action"], entry["ackId"]), [])
+            ordinal = entry["_ordinal"]
+            aligned.append(None if ordinal >= len(group) else group[ordinal])
+        return aligned
+
+    @staticmethod
+    def _diagnosis_align_execution_locked(
+        suggestions: list[dict[str, Any]], committed: dict[str, Any]
+    ) -> list[dict[str, Any] | None]:
+        """Align request suggestions against a committed execution's results.
+
+        Groups the committed execution's own ``(suggestion, result)`` pairs
+        by ``(action, ackId)`` in committed order; each request suggestion
+        consumes its group at its ordinal. Returns the matched committed
+        pair (``{"suggestion","result","resultIndex"}``) or ``None`` when
+        the group no longer holds that ordinal slot. The link builder
+        compares the matched suggestion's location/identity with the
+        request and reports the result's restored boundary as evidence.
+
+        An ill-shaped stored suggestion/result pair is skipped here rather
+        than raised: the independent history scan already flags such a
+        record as a ``recordViolations`` anomaly (so the conclusion is
+        ``broken``), and the diagnosis still has to return its evidence
+        report instead of a 500.
+        """
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        committed_suggestions = committed.get("suggestions")
+        committed_results = committed.get("results")
+        if not isinstance(committed_suggestions, list) or not isinstance(
+            committed_results, list
+        ):
+            return [None] * len(suggestions)
+        for result_index, pair in enumerate(
+            zip(committed_suggestions, committed_results)
+        ):
+            committed_suggestion, result = pair
+            if not isinstance(committed_suggestion, dict) or not isinstance(
+                result, dict
+            ):
+                continue
+            action = committed_suggestion.get("action")
+            receipt_ack = committed_suggestion.get("ackId")
+            if action not in REPAIR_ACTIONS or not isinstance(receipt_ack, str):
+                continue
+            if not _repair_suggestion_well_formed(committed_suggestion):
+                continue
+            if not _repair_result_well_formed(result, action):
+                continue
+            groups.setdefault((action, receipt_ack), []).append(
+                {
+                    "suggestion": committed_suggestion,
+                    "result": result,
+                    "resultIndex": result_index,
+                }
+            )
+        aligned: list[dict[str, Any] | None] = []
+        for entry in suggestions:
+            group = groups.get((entry["action"], entry["ackId"]), [])
+            ordinal = entry["_ordinal"]
+            aligned.append(None if ordinal >= len(group) else group[ordinal])
+        return aligned
+
+    @staticmethod
+    def _diagnosis_link_locked(
+        suggestion: dict[str, Any],
+        match: dict[str, Any] | None,
+        execution_position: int | None,
+    ) -> dict[str, Any]:
+        """Build one evidence link for one requested suggestion.
+
+        The link carries exactly seven fields, in suggestion order: the
+        ``action``, the ``ackId`` of the receipt that produced the anomaly,
+        the request ``location`` and ``target``, the observed ``boundary``
+        (the live advice target or the committed result's restored
+        boundary, ``null`` when the slot is absent), the ``evidence``
+        pointer into the execution audit (``null`` before the execution
+        commits or when the slot is absent), and the link ``status``. The
+        within-slot ordinal only drives alignment; it is not emitted.
+
+        Status: ``current`` when the matched slot's location (and, for an
+        identity correction, its expected/observed identities) still
+        equals the request and the restored/predicted boundary equals the
+        target; ``superseded`` when the slot exists for the same receipt
+        but moved; ``unavailable`` when the slot is absent.
+        """
+        if match is None:
+            return {
+                "action": suggestion["action"],
+                "ackId": suggestion["ackId"],
+                "location": copy.deepcopy(suggestion["location"]),
+                "target": copy.deepcopy(suggestion["target"]),
+                "boundary": None,
+                "evidence": None,
+                "status": "unavailable",
+            }
+        if execution_position is None:
+            # Preflight/advice evidence: the matched live advice entry.
+            matched_location = match["location"]
+            boundary = match["target"]
+            matched_identity = (
+                match.get("expected"),
+                match.get("observed"),
+            )
+            evidence = None
+        else:
+            matched_suggestion = match["suggestion"]
+            matched_location = matched_suggestion["location"]
+            matched_identity = (
+                matched_suggestion.get("expected"),
+                matched_suggestion.get("observed"),
+            )
+            boundary = match["result"]["boundary"]
+            evidence = {
+                "execution": execution_position,
+                "result": match["resultIndex"],
+            }
+        moved = matched_location != suggestion["location"]
+        if suggestion["action"] == "correct_identity" and not moved:
+            moved = matched_identity != (
+                suggestion.get("expected"),
+                suggestion.get("observed"),
+            )
+        if not moved:
+            moved = boundary != suggestion["target"]
+        return {
+            "action": suggestion["action"],
+            "ackId": suggestion["ackId"],
+            "location": copy.deepcopy(suggestion["location"]),
+            "target": copy.deepcopy(suggestion["target"]),
+            "boundary": copy.deepcopy(boundary),
+            "evidence": evidence,
+            "status": "superseded" if moved else "current",
+        }
+
+
     def get_replication_repair_executions(
         self, after: int, limit: int
     ) -> tuple[HTTPStatus, dict[str, Any]]:
@@ -9640,6 +10027,44 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json_ordered_newline(status, payload)
 
+    def _handle_replication_repairs_diagnosis_post(self) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those, and a
+        # non-POST method on the path is likewise 404. The route accepts
+        # no query parameters, and that check precedes the body check. The
+        # diagnosis is strictly read-only: it aligns one committed
+        # snapshot and writes no repair record, checkpoint, receipt,
+        # accepted-log record, candidate, metric, temporary file, or
+        # data-file byte. It takes the exact conditional-execution body
+        # the preflight and apply use, and the success body fixes the
+        # top-level field order (status, execution, links, summary,
+        # conclusion; action, ackId, location, target, boundary, evidence,
+        # status per link) and follows the compact-single-line contract:
+        # one trailing newline and explicit Content-Length.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            peer_id, ack_id, expected_checkpoint, expected_receipts, suggestions = (
+                parse_replication_repairs_batch(raw)
+            )
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        payload = self._store.diagnose_replication_repairs(
+            peer_id, ack_id, expected_checkpoint, expected_receipts, suggestions
+        )
+        self._json_ordered_newline(HTTPStatus.OK, payload)
+
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)
         if params is None:
@@ -10298,6 +10723,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "repairs"
             and segments[3] == "apply"
         )
+        is_replication_repairs_diagnosis_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "repairs"
+            and segments[3] == "diagnosis"
+        )
         if (
             matched
             or matched_ack
@@ -10316,6 +10748,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_replication_consensus_post
             or is_replication_repairs_plan_post
             or is_replication_repairs_apply_post
+            or is_replication_repairs_diagnosis_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -10372,6 +10805,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # The repair preflight only checks a staged view and
                 # commits nothing, so it is gated like the other
                 # read-only POSTs: a read or admin scope suffices.
+                if not self._require_scope(SCOPE_READ):
+                    return
+            elif is_replication_repairs_diagnosis_post:
+                # The lifecycle diagnosis only aligns one committed
+                # snapshot and changes no business state, so it is gated
+                # like the preflight and the other read-only POSTs: a read
+                # or admin scope suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
             elif not self._require_scope(SCOPE_WRITE):
@@ -10453,6 +10893,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_replication_repairs_apply_post:
             self._handle_replication_repairs_apply_post()
+            return
+        if is_replication_repairs_diagnosis_post:
+            self._handle_replication_repairs_diagnosis_post()
             return
         self._handle_sync_post()
 
