@@ -809,6 +809,47 @@ def parse_replication_repair_executions_query(query: str) -> tuple[int, int] | N
     return parse_peer_pickup_query(query)
 
 
+def parse_replication_repair_executions_verify_query(
+    query: str,
+) -> tuple[int, int, str, int] | None:
+    """Validate the repair-execution audit-verification query string.
+
+    All four parameters are **required**, each appearing exactly once:
+    the paging parameters ``after`` (a non-negative ASCII decimal
+    integer — the number of committed executions already skipped,
+    starting at ``0``) and ``limit`` (between 1 and 100), plus the two
+    external expectations ``expectedDigest`` (exactly 64 lowercase
+    hexadecimal characters, the full-history SHA-256 the caller expects)
+    and ``expectedCount`` (a non-negative ASCII decimal integer, the
+    full history length the caller expects). A missing, repeated,
+    unknown, blank-named, or blank-valued parameter, a sign, decimal
+    point, whitespace, or non-ASCII numeral on the integer parameters,
+    a ``limit`` outside ``1-100``, and a malformed ``expectedDigest``
+    (uppercase, non-hex, or the wrong length all rejected) return None.
+    The bound on ``after`` against the committed execution count is
+    checked by the store against the committed snapshot (``after`` equal
+    to the count is a valid stable empty page).
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if set(parsed) != {"after", "limit", "expectedDigest", "expectedCount"}:
+        return None
+    expected_digest = parsed["expectedDigest"][0]
+    if not _is_sha256_hex64(expected_digest):
+        return None
+    expected_count = _non_negative_int(parsed["expectedCount"][0])
+    if expected_count is None:
+        return None
+    after = _non_negative_int(parsed["after"][0])
+    if after is None:
+        return None
+    limit = _non_negative_int(parsed["limit"][0])
+    if limit is None or not (1 <= limit <= SYNC_BATCH_MAX):
+        return None
+    return after, limit, expected_digest, expected_count
+
+
 def parse_scope_policy_audit_query(query: str) -> tuple[int, int] | None:
     """Validate the scope-policy change-audit query string.
 
@@ -2653,6 +2694,73 @@ def _repair_executions_verification_locked(
         "boundaryViolations": boundary_violations,
         "checkpointViolations": checkpoint_violations,
         "recordViolations": record_violations,
+    }
+
+
+def _repair_executions_external_verification_locked(
+    entries: list[dict[str, Any]],
+    checkpoints: dict[str, int],
+    log_length: int,
+    expected_digest: str,
+    expected_count: int,
+) -> dict[str, Any]:
+    """Verify the complete repair-execution history plus external claims.
+
+    This is the external-verification companion to
+    :func:`_repair_executions_verification_locked`: it runs the same
+    independent scan over the **complete** ``entries`` history (never the
+    current page) and keeps the original verdict's five anomaly lists
+    unchanged — ``duplicateBindings``, ``outOfOrderActions``,
+    ``boundaryViolations``, ``checkpointViolations``, and
+    ``recordViolations`` keep their original judgement — then adds two
+    external comparisons:
+
+    - ``digestMismatches``: at most one marker
+      ``{"expected": D, "observed": D}`` (the caller's
+      ``expectedDigest`` first, the SHA-256 independently recomputed
+      over the canonical compact JSON array of the whole creation-order
+      history second — the digest of ``[]`` for an empty history);
+    - ``countMismatches``: at most one marker
+      ``{"expected": C, "observed": N}`` (the caller's
+      ``expectedCount`` first, the actual full history length second).
+
+    ``status`` is ``"ok"`` exactly when all seven lists are empty;
+    otherwise it is ``"broken"``. Paging never reaches this scan: the
+    digest, count, and conclusion always cover the whole history from
+    one snapshot, so an empty history verifies as ``"ok"`` for the
+    empty-array digest and count ``0``.
+    """
+    verdict = _repair_executions_verification_locked(entries, checkpoints, log_length)
+    observed_digest = hashlib.sha256(
+        _repair_executions_digest_input(entries)
+    ).hexdigest()
+    digest_mismatches: list[dict[str, Any]] = []
+    if observed_digest != expected_digest:
+        digest_mismatches.append(
+            {"expected": expected_digest, "observed": observed_digest}
+        )
+    count_mismatches: list[dict[str, Any]] = []
+    total = len(entries)
+    if total != expected_count:
+        count_mismatches.append({"expected": expected_count, "observed": total})
+    broken = bool(
+        verdict["duplicateBindings"]
+        or verdict["outOfOrderActions"]
+        or verdict["boundaryViolations"]
+        or verdict["checkpointViolations"]
+        or verdict["recordViolations"]
+        or digest_mismatches
+        or count_mismatches
+    )
+    return {
+        "status": "broken" if broken else "ok",
+        "duplicateBindings": verdict["duplicateBindings"],
+        "outOfOrderActions": verdict["outOfOrderActions"],
+        "boundaryViolations": verdict["boundaryViolations"],
+        "checkpointViolations": verdict["checkpointViolations"],
+        "recordViolations": verdict["recordViolations"],
+        "digestMismatches": digest_mismatches,
+        "countMismatches": count_mismatches,
     }
 
 
@@ -7712,6 +7820,97 @@ class StateStore:
             "verification": verification,
         }
 
+    def get_replication_repair_executions_verify(
+        self,
+        after: int,
+        limit: int,
+        expected_digest: str,
+        expected_count: int,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one execution-audit page plus an external verification.
+
+        This is the read-only external-verification companion to
+        :meth:`get_replication_repair_executions`. The execution page,
+        the resume cursor, the remaining flag, the full-history digest,
+        the algorithm, and the complete execution count are produced
+        exactly as for the plain audit query — same field order, record
+        shape, and ``after``/``limit`` paging — and the only addition is
+        the ``verification`` conclusion produced by
+        :func:`_repair_executions_external_verification_locked`, passed
+        the caller's ``expected_digest`` and ``expected_count``.
+
+        The verification independently scans the **complete** history:
+        it re-runs the five internal anomaly checks and independently
+        recomputes the full-history digest (the digest of ``[]`` for an
+        empty history) rather than trusting the page. Paging trims only
+        the exported ``executions`` page — it never changes the digest,
+        the count, or the conclusion, so both external comparisons and
+        every anomaly list are identical on every page of one snapshot.
+        Pure replays append no record, so they never move the digest or
+        the count. The page slice, cursors, digest, count, and
+        conclusion are computed from one snapshot under the commit lock,
+        so a concurrent commit is observed only as the whole old or the
+        whole new history; the query is strictly read-only and creates
+        no temporary file.
+
+        Returns ``(200, report)`` with the plain audit's seven fields in
+        the same order, whose ``verification`` carries ``status``
+        (``"ok"`` exactly when all seven anomaly lists are empty,
+        otherwise ``"broken"``), the five internal anomaly lists with
+        their original markers and judgement, ``digestMismatches`` (at
+        most one ``{"expected", "observed"}`` marker, the caller's
+        expectation first and the independently recomputed full-history
+        digest second), and ``countMismatches`` (at most one
+        ``{"expected", "observed"}`` marker with the expected count
+        first and the actual full history length second). An ``after``
+        equal to the execution count is a valid stable empty page whose
+        verification still covers the complete history. Raises
+        ValueError when ``after`` is past the execution count of the
+        snapshot. With ``--data-file`` the history is rebuilt identically
+        during recovery, so the page, digest, count, and conclusion are
+        identical before and after a restart.
+        """
+        with self._lock:
+            history: list[dict[str, Any]] = [
+                {
+                    "peerId": peer_id,
+                    "ackId": ack_id,
+                    "expectedCheckpoint": binding["expectedCheckpoint"],
+                    "expectedReceipts": binding["expectedReceipts"],
+                    "suggestions": copy.deepcopy(binding["suggestions"]),
+                    "results": copy.deepcopy(binding["results"]),
+                    "cursor": binding["cursor"],
+                }
+                for (peer_id, ack_id), binding in self._repairs.items()
+            ]
+            total = len(history)
+            if after > total:
+                raise ValueError("after is past the end of the repair execution history")
+            digest_input = _repair_executions_digest_input(history)
+            verification = _repair_executions_external_verification_locked(
+                history,
+                self._checkpoints,
+                len(self._accepted),
+                expected_digest,
+                expected_count,
+            )
+            # The page orders every execution by peerId first and, within
+            # a peer, keeps the creation order; ``history`` already is the
+            # creation order, so a stable sort on peerId alone produces
+            # exactly that arrangement.
+            ordered = sorted(history, key=lambda entry: entry["peerId"])
+            page = [dict(entry) for entry in ordered[after : after + limit]]
+            next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "executions": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "executionsCount": total,
+            "verification": verification,
+        }
+
     def record_policy_reload(self, digest: str, tokens: int) -> dict[str, Any]:
         """Commit one successful scope-policy hot reload to the audit history.
 
@@ -8577,6 +8776,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_replication_status_all_get()
             return
         if (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "repairs"
+            and segments[3] == "executions"
+            and segments[4] == "verify"
+        ):
+            self._handle_replication_repair_executions_verify_get()
+            return
+        if (
             len(segments) == 4
             and segments[0] == "v1"
             and segments[1] == "replication"
@@ -9152,6 +9361,45 @@ class RequestHandler(BaseHTTPRequestHandler):
         after, limit = params
         try:
             status, payload = self._store.get_replication_repair_executions(after, limit)
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_ordered_newline(status, payload)
+
+    def _handle_replication_repair_executions_verify_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before
+        # any query check), so a malformed query is rejected here without
+        # any state being read or changed. Besides the audit query's
+        # after/limit paging, the request requires two external
+        # expectations, ``expectedDigest`` (exactly 64 lowercase
+        # hexadecimal characters) and ``expectedCount`` (a non-negative
+        # ASCII decimal integer, never signed or decimal); any missing,
+        # repeated, unknown, blank, or malformed value is rejected. The
+        # success body keeps the plain audit's contracted field order
+        # (executions, nextCursor, hasMore, algorithm, digest,
+        # executionsCount, verification) with the verification carrying
+        # the original five anomaly lists plus digestMismatches and
+        # countMismatches (each marker stores expected first, observed
+        # second), and follows the compact-single-line contract: one
+        # trailing newline, numbers only as JSON integers. The query is
+        # strictly read-only: it executes nothing and changes no repair
+        # record, checkpoint, receipt, or data file.
+        params = parse_replication_repair_executions_verify_query(
+            urlsplit(self.path).query
+        )
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit, expected_digest, expected_count = params
+        try:
+            status, payload = self._store.get_replication_repair_executions_verify(
+                after, limit, expected_digest, expected_count
+            )
         except ValueError:
             self._json_ordered_newline(
                 HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
