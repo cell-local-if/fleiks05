@@ -777,6 +777,21 @@ def parse_replication_status_all_query(query: str) -> tuple[int, int] | None:
     return parse_peer_pickup_query(query)
 
 
+def parse_replication_repairs_query(query: str) -> tuple[int, int] | None:
+    """Validate the replication repair-suggestions query string.
+
+    Delegates to :func:`parse_peer_pickup_query` — both ``after`` and
+    ``limit`` are required non-repeated ASCII decimal integers, ``after``
+    non-negative (the number of repair suggestions already skipped) and
+    ``limit`` between 1 and 100, and any unknown parameter is rejected.
+    Kept as a named entry point for the repairs route. The bound on
+    ``after`` against the suggestion count is checked by the store
+    against the committed snapshot (``after`` equal to the count is a
+    valid empty page).
+    """
+    return parse_peer_pickup_query(query)
+
+
 def parse_scope_policy_audit_query(query: str) -> tuple[int, int] | None:
     """Validate the scope-policy change-audit query string.
 
@@ -2181,6 +2196,125 @@ def _receipt_chain_audit_locked(
         "identityMismatches": identity_mismatches,
         "cursorRegressions": cursor_regressions,
     }
+
+
+def _receipt_repair_suggestions(
+    peer_id: str,
+    committed: list[tuple[str, dict[str, Any]]],
+    accepted: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Turn one peer's chain-audit anomalies into repair suggestions.
+
+    ``committed`` is the peer's receipts in creation order and
+    ``accepted`` the shared accepted-operation log, exactly as
+    :func:`_receipt_chain_audit_locked` takes them. The peer's chain is
+    walked once in receipt creation order and every anomaly becomes one
+    read-only repair suggestion, so the returned list is stably ordered
+    by the confirmation chain's creation order; the caller concatenates
+    the per-peer lists in ascending peer-id order. Boundary anomalies
+    (gap, overlap, cursor regression) are emitted before the receipt's
+    identity mismatches, which follow their log-position order.
+
+    Every suggestion carries exactly ``peer`` (the sender), ``ackId``
+    (the receipt identity), ``kind`` (the anomaly class), ``action``
+    (the suggested repair), ``location`` (the affected log interval or
+    position), and ``target`` (the boundary the repair should restore):
+
+    - ``gap``: the accepted records in ``[from, to)`` are confirmed by
+      no receipt — ``action`` ``"resend"`` that segment; ``location``
+      and ``target`` are both ``{"start": from, "end": to}`` and
+      ``length`` is the gap length ``to - from``.
+    - ``overlap``: the records in ``[to, from)`` are confirmed twice —
+      ``action`` ``"deduplicate"`` the duplicate confirmation; ``location`` and ``target`` are both
+      ``{"start": to, "end": from}`` and ``length`` is the duplicated
+      length ``from - to``.
+    - ``cursorRegression``: the confirmation cursor moved backwards
+      from ``from`` to ``to`` — ``action`` ``"resend"`` the records in
+      ``[to, from)`` so the chain returns to the previous boundary;
+      ``location`` and ``target`` are both ``{"start": to, "end":
+      from}`` and ``length`` is the regression length ``from - to``.
+    - ``identityMismatch``: the confirmed identity at ``position`` does
+      not match the accepted log — ``action`` ``"correct_identity"``;
+      ``location`` and ``target`` are both ``{"position": position}``
+      and the entry additionally carries ``expected`` (the identity the
+      log holds at that position, or null when the position lies
+      outside the current log) and ``observed`` (the identity the
+      receipt confirms).
+
+    The suggestions are only a plan: nothing is resent, deduplicated,
+    or corrected, and no receipt, checkpoint, log record, candidate, or
+    data-file byte is created or changed.
+    """
+    audit = _receipt_chain_audit_locked(committed, accepted)
+    by_index: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    for kind in ("gaps", "overlaps", "cursorRegressions", "identityMismatches"):
+        for entry in audit[kind]:
+            by_index.setdefault(
+                entry["receiptIndex"],
+                {
+                    "gaps": [],
+                    "overlaps": [],
+                    "cursorRegressions": [],
+                    "identityMismatches": [],
+                },
+            )[kind].append(entry)
+    suggestions: list[dict[str, Any]] = []
+    for receipt_index in sorted(by_index):
+        anomalies = by_index[receipt_index]
+        for gap in anomalies["gaps"]:
+            suggestions.append(
+                {
+                    "peer": peer_id,
+                    "ackId": gap["ackId"],
+                    "kind": "gap",
+                    "action": "resend",
+                    "location": {"start": gap["from"], "end": gap["to"]},
+                    "length": gap["to"] - gap["from"],
+                    "target": {"start": gap["from"], "end": gap["to"]},
+                }
+            )
+        for overlap in anomalies["overlaps"]:
+            suggestions.append(
+                {
+                    "peer": peer_id,
+                    "ackId": overlap["ackId"],
+                    "kind": "overlap",
+                    "action": "deduplicate",
+                    "location": {"start": overlap["to"], "end": overlap["from"]},
+                    "length": overlap["from"] - overlap["to"],
+                    "target": {"start": overlap["to"], "end": overlap["from"]},
+                }
+            )
+        for regression in anomalies["cursorRegressions"]:
+            suggestions.append(
+                {
+                    "peer": peer_id,
+                    "ackId": regression["ackId"],
+                    "kind": "cursorRegression",
+                    "action": "resend",
+                    "location": {"start": regression["to"], "end": regression["from"]},
+                    "length": regression["from"] - regression["to"],
+                    "target": {"start": regression["to"], "end": regression["from"]},
+                }
+            )
+        for mismatch in anomalies["identityMismatches"]:
+            suggestions.append(
+                {
+                    "peer": peer_id,
+                    "ackId": mismatch["ackId"],
+                    "kind": "identityMismatch",
+                    "action": "correct_identity",
+                    "location": {"position": mismatch["position"]},
+                    "expected": (
+                        None
+                        if mismatch["expected"] is None
+                        else dict(mismatch["expected"])
+                    ),
+                    "observed": dict(mismatch["observed"]),
+                    "target": {"position": mismatch["position"]},
+                }
+            )
+    return suggestions
 
 
 class PersistenceError(Exception):
@@ -6079,6 +6213,135 @@ class StateStore:
             "anomalies": anomalies,
         }
 
+    def get_replication_repairs(
+        self, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of read-only receipt-chain repair suggestions.
+
+        Every registered peer's whole confirmation chain is audited
+        against the shared accepted log under the same commit lock used
+        by local writes, sync imports, repairs, checkpoint commits, and
+        acknowledgement commits, so the suggestion page, the summary,
+        the anomaly counts, the coverage, and the conclusion always
+        describe a single commit even while commits are in flight. The
+        query is strictly read-only: it never advances or writes a
+        checkpoint, records no receipt, creates no temporary file, and
+        mutates neither memory nor the data file — the suggested
+        repairs are never executed.
+
+        ``after`` is the number of repair suggestions already skipped
+        (a 0-based resume cursor) and ``limit`` the page size. Raises
+        ``ValueError`` when ``after`` is past the suggestion count
+        (``after`` equal to the count is a valid empty page). Otherwise
+        returns ``(200, report)`` with exactly seven fields, in this
+        order:
+
+        - ``suggestions``: the page. The complete suggestion list
+          orders every registered peer in ascending ``peerId`` (Unicode
+          code point) order and, within a peer, follows the
+          confirmation chain's creation order — see
+          :func:`_receipt_repair_suggestions` for the per-anomaly item
+          shape (``peer``, ``ackId``, ``kind``, ``action``,
+          ``location``, ``target``, plus ``length`` for interval
+          anomalies and ``expected``/``observed`` for identity
+          mismatches).
+        - ``nextCursor``: the number of suggestions skipped after this
+          page — feed it back as the next ``after``.
+        - ``hasMore``: whether further suggestions remain.
+        - ``summary``: ``peers`` (the complete registered peer count),
+          ``receipts`` (the committed receipt count over every
+          registered peer), and ``suggestions`` (the complete
+          suggestion count, never just the page size).
+        - ``anomalies``: for each of the receipt chain-audit's anomaly
+          classes (``gaps``, ``overlaps``, ``identityMismatches``,
+          ``cursorRegressions``), the total number of anomalies of that
+          class across every registered peer's whole chain — each
+          anomaly contributes exactly one suggestion.
+        - ``coverage``: the half-open segment of the shared accepted
+          log spanned by all peers' receipt chains together, from the
+          earliest chain's start to the latest chain's end; peers with
+          an empty receipt set contribute nothing, and when no peer
+          holds any receipt the coverage is the empty interval
+          ``{"start": 0, "end": 0}``.
+        - ``conclusion``: ``"ok"`` exactly when every registered peer's
+          chain is seamless, non-overlapping, identity-consistent, and
+          cursor-monotonic (no anomaly of any class), else
+          ``"broken"``.
+
+        Paging trims only the suggestion list: the summary, the anomaly
+        counts, the coverage, and the conclusion are always computed
+        from all committed receipts and the full accepted log. An empty
+        registered set reports an empty page and an empty plan with an
+        all-zero summary, the empty coverage, and conclusion ``"ok"``.
+        With ``--data-file`` the log, the checkpoints, and the receipts
+        are rebuilt identically during recovery, so the same state
+        yields the same plan, summary, counts, and locations before and
+        after a restart.
+        """
+        with self._lock:
+            peer_ids = sorted(self._checkpoints)
+            receipts_by_peer: dict[str, list[tuple[str, dict[str, Any]]]] = {
+                peer_id: [] for peer_id in peer_ids
+            }
+            for (receipt_peer, ack_id), receipt in self._acks.items():
+                committed = receipts_by_peer.get(receipt_peer)
+                if committed is not None:
+                    committed.append((ack_id, receipt))
+            suggestions: list[dict[str, Any]] = []
+            anomalies = {
+                "gaps": 0,
+                "overlaps": 0,
+                "identityMismatches": 0,
+                "cursorRegressions": 0,
+            }
+            receipt_total = 0
+            coverage_start: int | None = None
+            coverage_end: int | None = None
+            for peer_id in peer_ids:
+                committed = receipts_by_peer[peer_id]
+                receipt_total += len(committed)
+                chain = _receipt_chain_audit_locked(committed, self._accepted)
+                for name in anomalies:
+                    anomalies[name] += len(chain[name])
+                if committed:
+                    start = chain["coverage"]["start"]
+                    end = chain["coverage"]["end"]
+                    coverage_start = (
+                        start
+                        if coverage_start is None
+                        else min(coverage_start, start)
+                    )
+                    coverage_end = (
+                        end if coverage_end is None else max(coverage_end, end)
+                    )
+                suggestions.extend(
+                    _receipt_repair_suggestions(peer_id, committed, self._accepted)
+                )
+            total = len(suggestions)
+            if after > total:
+                raise ValueError("after is past the end of the repair suggestions")
+            page = suggestions[after : after + limit]
+            next_cursor = after + len(page)
+            summary = {
+                "peers": len(peer_ids),
+                "receipts": receipt_total,
+                "suggestions": total,
+            }
+            coverage = {
+                "start": 0 if coverage_start is None else coverage_start,
+                "end": 0 if coverage_end is None else coverage_end,
+            }
+            conclusion = "broken" if suggestions else "ok"
+        return HTTPStatus.OK, {
+            "suggestions": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "summary": summary,
+            "anomalies": anomalies,
+            "coverage": coverage,
+            "conclusion": conclusion,
+        }
+
     def record_policy_reload(self, digest: str, tokens: int) -> dict[str, Any]:
         """Commit one successful scope-policy hot reload to the audit history.
 
@@ -6943,6 +7206,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_replication_status_all_get()
             return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "repairs"
+        ):
+            self._handle_replication_repairs_get()
+            return
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
@@ -7445,6 +7716,33 @@ class RequestHandler(BaseHTTPRequestHandler):
         after, limit = params
         try:
             status, payload = self._store.get_replication_status_all(after, limit)
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_ordered_newline(status, payload)
+
+    def _handle_replication_repairs_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before
+        # any query check), so a malformed query is rejected here without
+        # any state being read or changed. The success body fixes the
+        # field order (suggestions, nextCursor, hasMore, summary,
+        # anomalies, coverage, conclusion; peer, ackId, kind, action,
+        # location, ... per suggestion) and follows the
+        # compact-single-line contract: one trailing newline, numbers
+        # only as JSON integers. The query is strictly read-only: the
+        # suggested repairs are never executed.
+        params = parse_replication_repairs_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_replication_repairs(after, limit)
         except ValueError:
             self._json_ordered_newline(
                 HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
