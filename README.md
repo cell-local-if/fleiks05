@@ -1092,6 +1092,33 @@ Only after all guards pass are the repair record and the restored checkpoint com
 
 The `GET /v1/replication/repairs` advice entry point, the receipt audits, sync, transactions, and recovery behavior are unchanged apart from the corrected empty-receipt classification: an empty confirmation receipt at the chain head is legal and raises nothing, and a later empty receipt at the same cursor reports only a cursor regression (advice `correct_cursor`) — it never produces a gap, overlap, or identity mismatch.
 
+### Replication-repair execution audit
+
+`GET /v1/replication/repairs/executions?after=N&limit=N` is the strictly read-only audit entry point over the committed history of conditional repair executions. It pages one record per execution that committed successfully through `POST /v1/replication/repairs/apply`; an identical replay answered from an existing binding appends no record, so replayed executions never appear twice. The query writes no repair record, advances no checkpoint, records no receipt, creates no temporary file, and changes neither the repair advice, the preflight, executions, receipts, nor persistence behavior.
+
+The query string carries exactly two parameters under the same contract as the repair-advice route: both `after` and `limit` are **required** and appear exactly once; `after` counts executions already skipped (a 0-based resume cursor starting at `0`) and `limit` accepts only ASCII decimal digits from 1 to 100. A missing, repeated, or unknown parameter, an empty value, a sign, a decimal point, whitespace, or non-ASCII numerals returns HTTP 400 with `{"error":"invalid_request"}` without changing any state, as does an `after` past the committed execution count. An `after` equal to the count is a valid stable empty page.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with an explicit `Content-Length` and exactly seven fields in this order:
+
+```json
+{"executions":[{"peerId":"peer-a","ackId":"exec-1","expectedCheckpoint":4,"expectedReceipts":"<64 lowercase hex chars>","suggestions":[{"action":"resend","ackId":"ack-2","location":{"start":1,"end":2},"target":{"start":1,"end":2}}],"results":[{"action":"resend","boundary":{"start":1,"end":2}}],"cursor":4}],"nextCursor":1,"hasMore":false,"algorithm":"sha256","digest":"<64 lowercase hex chars>","executionsCount":1,"verification":{"status":"ok","duplicateBindings":[],"outOfOrderActions":[],"boundaryViolations":[],"checkpointViolations":[],"recordViolations":[]}}
+```
+
+- `executions`: the page, ordered by `peerId` in ascending (Unicode code point) order and, within a peer, in creation (first-commit) order. `after` trims only this current list. Each item carries exactly `peerId`, `ackId`, `expectedCheckpoint`, `expectedReceipts`, `suggestions`, `results`, and `cursor` — the execution's `(peerId, ackId)` binding, its expected anchor checkpoint and receipt-set digest, the ordered suggestions it committed (keeping their interval/position boundaries and, for an identity correction, the expected/observed identities), the per-suggestion result evidence in request order, and the checkpoint cursor the execution restored.
+- `nextCursor`: the number of executions skipped after this page — feed it back as the next `after`; `hasMore` reports whether further executions remain.
+- `algorithm` is `"sha256"`; `digest` is the 64-character lowercase SHA-256 of the canonical compact JSON array of **all** executions in pure creation order — the order the bindings first committed, which is also the order they ride in the data file's `repairExecutions` section — with each record's fields in the fixed order `peerId`, `ackId`, `expectedCheckpoint`, `expectedReceipts`, `suggestions`, `results`, `cursor`; an empty history hashes `[]`.
+- `executionsCount` is the full history length, never the page length.
+- `verification` is the independent integrity conclusion over the complete history (a snapshot identical to the page, digest, and count): `status` is `"ok"` or `"broken"`, followed by five anomaly lists, each marker retaining the offending execution's 0-based `executionIndex` in creation order plus its `peerId` and `ackId`:
+  - `duplicateBindings`: an execution whose `(peerId, ackId)` was already claimed by an earlier execution (the repeated occurrence only);
+  - `outOfOrderActions`: an execution whose suggestions are not in the fixed processing order (resend, deduplicate, correct_identity, correct_cursor);
+  - `boundaryViolations`: a result whose restored boundary differs from its suggestion's target, additionally naming the 0-based `suggestionIndex` and the `expected`/`observed` boundaries;
+  - `checkpointViolations`: an execution whose restored cursor precedes its `expectedCheckpoint`, exceeds the recovered log length, or names a peer whose registered checkpoint has not reached it — the marker gives `expected` (`checkpoint`, the current `registered` checkpoint or `null`, and `logLength`) and `observed` (`cursor`);
+  - `recordViolations`: an otherwise malformed stored record (a bad binding, anchor digest, cursor, suggestion, or result shape).
+
+**Paging never changes the summary**: the digest, `executionsCount`, and the `verification` conclusion always cover the whole history from one snapshot under the commit lock used by local writes, sync imports, repairs, checkpoint commits, and acknowledgement commits, so every page of one snapshot reports identical values, and a concurrent commit is observed only as the complete old or new history. With `--data-file` the history is rebuilt identically during recovery (an old file without the `repairExecutions` section recovers as an empty, intact history), so the page, digest, count, and verification are identical before and after a restart and a recovered binding still replays as `200` without appending.
+
+A missing or extra path segment (for example `/v1/replication/repairs/executions/` or `.../executions/extra`) or any unknown route returns HTTP 404 with `{"error":"not_found"}`; the route-shape decision takes precedence over the query check, while — like every other route — authentication runs before an unknown route's 404, and a non-`GET` method on the path answers HTTP 404. A missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 with `{"error":"unauthorized"}` and the `WWW-Authenticate: Bearer` challenge; in scope-policy mode an authenticated token lacking the `read` or `admin` scope is HTTP 403 with `{"error":"forbidden"}` and no challenge (a `read`-only token suffices); `/health` stays anonymous. This entry point changes neither the repair advice, preflight, execution, receipt, checkpoint, sync, transaction, write, nor persistence behavior.
+
 ## Tests
 
 ```bash

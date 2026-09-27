@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import hmac
 import json
@@ -788,6 +789,22 @@ def parse_replication_repairs_query(query: str) -> tuple[int, int] | None:
     ``after`` against the suggestion count is checked by the store
     against the committed snapshot (``after`` equal to the count is a
     valid empty page).
+    """
+    return parse_peer_pickup_query(query)
+
+
+def parse_replication_repair_executions_query(query: str) -> tuple[int, int] | None:
+    """Validate the replication-repair execution-audit query string.
+
+    Shares the repair-advice route's paging contract exactly: both
+    ``after`` and ``limit`` are required non-repeated ASCII decimal
+    integers, ``after`` non-negative (the number of committed repair
+    executions already skipped, starting at ``0``), ``limit`` between 1
+    and 100, and any unknown parameter is rejected. Kept as a named entry
+    point for the executions route; the bound on ``after`` against the
+    committed execution count is checked by the store against the
+    committed snapshot (``after`` equal to the count is a valid stable
+    empty page).
     """
     return parse_peer_pickup_query(query)
 
@@ -2275,6 +2292,367 @@ def _policy_events_verification_locked(
         "duplicateSequences": duplicate,
         "outOfRangeSequences": out_of_range,
         "digestMismatches": digest_mismatches,
+    }
+
+
+def _repair_execution_suggestion_json(entry: dict[str, Any]) -> str:
+    """Serialize one normalized repair suggestion for the digest input.
+
+    The field order matches the request encoding: ``action``, ``ackId``,
+    ``location``, ``target``, plus ``expected``/``observed`` for an
+    identity correction. Interval and position boundaries are emitted as
+    compact JSON.
+    """
+    parts = ['{"action":', _escape_digest_string(entry["action"])]
+    parts.append(',"ackId":')
+    parts.append(_escape_digest_string(entry["ackId"]))
+    if "start" in entry["location"]:
+        location = (
+            '{"start":' + str(entry["location"]["start"])
+            + ',"end":' + str(entry["location"]["end"]) + "}"
+        )
+    else:
+        location = '{"position":' + str(entry["location"]["position"]) + "}"
+    parts.append(',"location":')
+    parts.append(location)
+    parts.append(',"target":')
+    if "start" in entry["target"]:
+        target = (
+            '{"start":' + str(entry["target"]["start"])
+            + ',"end":' + str(entry["target"]["end"]) + "}"
+        )
+    else:
+        target = '{"position":' + str(entry["target"]["position"]) + "}"
+    parts.append(target)
+    if "expected" in entry:
+        for label, identity in (("expected", entry["expected"]), ("observed", entry["observed"])):
+            parts.append(f',"{label}":{{"replicaId":')
+            parts.append(_escape_digest_string(identity["replicaId"]))
+            parts.append(',"operationId":')
+            parts.append(_escape_digest_string(identity["operationId"]))
+            parts.append("}")
+    parts.append("}")
+    return "".join(parts)
+
+
+def _repair_executions_digest_input(entries: list[dict[str, Any]]) -> bytes:
+    """Serialize the complete repair-execution history to digest input.
+
+    The result is a compact UTF-8 JSON array with one entry per committed
+    conditional repair execution, in creation order (the order the
+    bindings were first committed). Each entry carries its fields in the
+    fixed order ``peerId``, ``ackId``, ``expectedCheckpoint``,
+    ``expectedReceipts``, ``suggestions``, ``results``, ``cursor``; the
+    suggestions keep their request order and each uses the normalized
+    encoding produced by :func:`_repair_execution_suggestion_json`, and
+    each result carries its ``action`` and restored ``boundary`` in
+    request order. No whitespace is emitted anywhere, numbers are plain
+    JSON integers, and strings are escaped exactly as in
+    :func:`_escape_digest_string`. An empty history serializes to ``[]``.
+    """
+    parts: list[str] = ["["]
+    for index, entry in enumerate(entries):
+        if index:
+            parts.append(",")
+        parts.append('{"peerId":')
+        parts.append(_escape_digest_string(entry["peerId"]))
+        parts.append(',"ackId":')
+        parts.append(_escape_digest_string(entry["ackId"]))
+        parts.append(',"expectedCheckpoint":')
+        parts.append(str(entry["expectedCheckpoint"]))
+        parts.append(',"expectedReceipts":')
+        parts.append(_escape_digest_string(entry["expectedReceipts"]))
+        parts.append(',"suggestions":[')
+        for suggestion_index, suggestion in enumerate(entry["suggestions"]):
+            if suggestion_index:
+                parts.append(",")
+            parts.append(_repair_execution_suggestion_json(suggestion))
+        parts.append('],"results":[')
+        for result_index, result in enumerate(entry["results"]):
+            if result_index:
+                parts.append(",")
+            parts.append('{"action":')
+            parts.append(_escape_digest_string(result["action"]))
+            parts.append(',"boundary":')
+            boundary = result["boundary"]
+            if "start" in boundary:
+                parts.append(
+                    '{"start":' + str(boundary["start"])
+                    + ',"end":' + str(boundary["end"]) + "}"
+                )
+            else:
+                parts.append('{"position":' + str(boundary["position"]) + "}")
+            parts.append("}")
+        parts.append('],"cursor":')
+        parts.append(str(entry["cursor"]))
+        parts.append("}")
+    parts.append("]")
+    return "".join(parts).encode("utf-8")
+
+
+def _repair_interval_boundary_well_formed(boundary: Any) -> bool:
+    """Return whether ``boundary`` is a non-negative ``{"start","end"}``.
+
+    Mirrors :func:`_repair_boundary`: both fields are non-boolean
+    non-negative JSON integers with ``start <= end``. The boundary is
+    not bounded by the log length here, exactly as the recovery
+    validator treats stored suggestion boundaries.
+    """
+    if not isinstance(boundary, dict) or set(boundary.keys()) != {"start", "end"}:
+        return False
+    start = boundary["start"]
+    end = boundary["end"]
+    if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+        return False
+    if isinstance(end, bool) or not isinstance(end, int) or end < 0:
+        return False
+    return start <= end
+
+
+def _repair_suggestion_well_formed(suggestion: Any) -> bool:
+    """Return whether one stored repair suggestion has the legal shape.
+
+    This is the shape-level half of the verification scan: it mirrors
+    :func:`_validate_stored_repair_suggestion` without raising, so a
+    history that recovery accepts is never reported malformed here.
+    """
+    if not isinstance(suggestion, dict):
+        return False
+    action = suggestion.get("action")
+    if action not in REPAIR_ACTIONS:
+        return False
+    ack_id = suggestion.get("ackId")
+    if not isinstance(ack_id, str) or ack_id == "":
+        return False
+    if action in (*REPAIR_INTERVAL_ACTIONS, "correct_cursor"):
+        if set(suggestion.keys()) != {"action", "ackId", "location", "target"}:
+            return False
+        return _repair_interval_boundary_well_formed(
+            suggestion["location"]
+        ) and _repair_interval_boundary_well_formed(suggestion["target"])
+    if set(suggestion.keys()) != {
+        "action",
+        "ackId",
+        "location",
+        "target",
+        "expected",
+        "observed",
+    }:
+        return False
+    location = suggestion["location"]
+    target = suggestion["target"]
+    if not isinstance(location, dict) or set(location.keys()) != {"position"}:
+        return False
+    if not isinstance(target, dict) or set(target.keys()) != {"position"}:
+        return False
+    position = location["position"]
+    if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+        return False
+    if target["position"] != position:
+        return False
+    try:
+        _repair_identity(suggestion["expected"])
+        _repair_identity(suggestion["observed"])
+    except ValueError:
+        return False
+    return True
+
+
+def _repair_result_well_formed(result: Any, action: str) -> bool:
+    """Return whether one stored result matches its suggestion's action shape.
+
+    Mirrors :func:`_validate_stored_repair_results` without raising: an
+    identity-correction result carries a non-negative position and the
+    other actions carry a non-negative interval boundary.
+    """
+    if not isinstance(result, dict) or set(result.keys()) != {"action", "boundary"}:
+        return False
+    if result["action"] != action:
+        return False
+    boundary = result["boundary"]
+    if action == "correct_identity":
+        if not isinstance(boundary, dict) or set(boundary.keys()) != {"position"}:
+            return False
+        position = boundary["position"]
+        return (
+            not isinstance(position, bool)
+            and isinstance(position, int)
+            and position >= 0
+        )
+    return _repair_interval_boundary_well_formed(boundary)
+
+
+def _repair_executions_verification_locked(
+    entries: list[dict[str, Any]],
+    checkpoints: dict[str, int],
+    log_length: int,
+) -> dict[str, Any]:
+    """Verify the complete repair-execution history in one pass.
+
+    ``entries`` is the complete execution history in creation order (a
+    snapshot taken under the commit lock). The conclusion is always
+    computed over the complete history, never the current page::
+
+        {"status": "ok" | "broken",
+         "duplicateBindings": [...], "outOfOrderActions": [...],
+         "boundaryViolations": [...], "checkpointViolations": [...],
+         "recordViolations": [...]}
+
+    Every anomaly is marked with the execution's 0-based
+    ``executionIndex`` in the complete creation-order history plus its
+    ``peerId`` and ``ackId``:
+
+    - ``duplicateBindings``: an execution whose ``(peerId, ackId)``
+      binding was already claimed by an earlier execution —
+      ``{"executionIndex": I, "peerId": P, "ackId": A}`` for the repeated
+      occurrence only.
+    - ``outOfOrderActions``: an execution whose suggestions are not in
+      the fixed processing order (resend, deduplicate,
+      correct_identity, correct_cursor).
+    - ``boundaryViolations``: a result whose restored boundary does not
+      equal its suggestion's ``target`` — the marker additionally names
+      the 0-based ``suggestionIndex`` within the execution and gives
+      ``expected`` (the suggestion target) and ``observed`` (the stored
+      result boundary).
+    - ``checkpointViolations``: an execution whose restored cursor
+      precedes its ``expectedCheckpoint`` (a repair never moves a
+      checkpoint backwards), exceeds the recovered log length, or names
+      a peer whose registered checkpoint has not reached it —
+      ``expected`` carries the anchor checkpoint, the registered
+      checkpoint (``null`` when the peer is unknown), and the log length,
+      and ``observed`` carries the stored cursor.
+    - ``recordViolations``: an execution whose stored record is otherwise
+      malformed — a non-string binding, a bad anchor digest shape, an
+      illegal anchor or restored cursor, an empty or oversized
+      suggestion set, an ill-shaped suggestion, or a result list that
+      does not match the suggestions in count, action, or boundary shape.
+
+    ``status`` is ``"ok"`` exactly when every check passes and every
+    stored record has the legal shape. Live history is appended one
+    validated execution at a time under the commit lock, so the
+    conclusion is ``"ok"`` by construction; the scan exists to detect a
+    damaged history (and paging, the digest, and ``executionsCount``
+    never influence it — they are all derived from the same complete
+    snapshot). An empty history verifies as ``"ok"`` with five empty
+    lists.
+    """
+    duplicates: list[dict[str, Any]] = []
+    out_of_order: list[dict[str, Any]] = []
+    boundary_violations: list[dict[str, Any]] = []
+    checkpoint_violations: list[dict[str, Any]] = []
+    record_violations: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for execution_index, entry in enumerate(entries):
+        peer_id = entry.get("peerId") if isinstance(entry, dict) else None
+        ack_id = entry.get("ackId") if isinstance(entry, dict) else None
+        marker = {
+            "executionIndex": execution_index,
+            "peerId": peer_id,
+            "ackId": ack_id,
+        }
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(peer_id, str)
+            or peer_id == ""
+            or not isinstance(ack_id, str)
+            or ack_id == ""
+        ):
+            record_violations.append(marker)
+            continue
+        binding = (peer_id, ack_id)
+        if binding in seen:
+            # Only the later occurrence is a duplicate; the first keeps
+            # its claim on the execution binding.
+            duplicates.append(dict(marker))
+        seen.add(binding)
+        suggestions = entry.get("suggestions")
+        results = entry.get("results")
+        expected_checkpoint = entry.get("expectedCheckpoint")
+        expected_receipts = entry.get("expectedReceipts")
+        cursor = entry.get("cursor")
+        record_bad = (
+            isinstance(expected_checkpoint, bool)
+            or not isinstance(expected_checkpoint, int)
+            or expected_checkpoint < 0
+            or isinstance(cursor, bool)
+            or not isinstance(cursor, int)
+            or cursor < 0
+            or not _is_sha256_hex64(expected_receipts)
+            or not isinstance(suggestions, list)
+            or not (REPAIR_BATCH_MIN <= len(suggestions) <= REPAIR_BATCH_MAX)
+            or not isinstance(results, list)
+            or len(results) != len(suggestions)
+        )
+        if not record_bad and not all(
+            _repair_suggestion_well_formed(suggestion) for suggestion in suggestions
+        ):
+            record_bad = True
+        if record_bad:
+            record_violations.append(dict(marker))
+            continue
+
+        previous_rank = -1
+        for suggestion in suggestions:
+            rank = REPAIR_ACTIONS.index(suggestion["action"])
+            if rank < previous_rank:
+                out_of_order.append(dict(marker))
+                break
+            previous_rank = rank
+
+        for suggestion_index, (suggestion, result) in enumerate(
+            zip(suggestions, results)
+        ):
+            action = suggestion["action"]
+            if not _repair_result_well_formed(result, action):
+                record_violations.append(dict(marker))
+                record_bad = True
+                break
+            if result["boundary"] != suggestion["target"]:
+                boundary_violations.append(
+                    {
+                        **marker,
+                        "suggestionIndex": suggestion_index,
+                        "expected": suggestion["target"],
+                        "observed": result["boundary"],
+                    }
+                )
+        if record_bad:
+            continue
+
+        registered = checkpoints.get(peer_id)
+        if (
+            registered is None
+            or registered < cursor
+            or cursor > log_length
+            or cursor < expected_checkpoint
+        ):
+            checkpoint_violations.append(
+                {
+                    **marker,
+                    "expected": {
+                        "checkpoint": expected_checkpoint,
+                        "registered": registered,
+                        "logLength": log_length,
+                    },
+                    "observed": {"cursor": cursor},
+                }
+            )
+
+    broken = bool(
+        duplicates
+        or out_of_order
+        or boundary_violations
+        or checkpoint_violations
+        or record_violations
+    )
+    return {
+        "status": "broken" if broken else "ok",
+        "duplicateBindings": duplicates,
+        "outOfOrderActions": out_of_order,
+        "boundaryViolations": boundary_violations,
+        "checkpointViolations": checkpoint_violations,
+        "recordViolations": record_violations,
     }
 
 
@@ -7245,6 +7623,95 @@ class StateStore:
                 None,
             )
 
+    def get_replication_repair_executions(
+        self, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of the committed repair-execution audit history.
+
+        The stream is the history of conditional repair executions that
+        committed successfully — one record per new
+        ``POST /v1/replication/repairs/apply`` execution; an identical
+        replay answered from the committed binding appends no record.
+        ``after`` is the number of executions already skipped (a 0-based
+        resume cursor) and ``limit`` the page size. The page slice,
+        cursors, the full-history digest and count, and the integrity
+        conclusion are all computed against the same snapshot under the
+        commit lock used by local writes, sync imports, repairs,
+        checkpoint commits, and acknowledgement commits, so a concurrent
+        commit is observed only as the whole old or the whole new
+        history. The query is strictly read-only: it writes no repair
+        record, advances no checkpoint, records no receipt, creates no
+        temporary file, and changes neither suggestions, preflight,
+        execution, receipt, nor persistence behavior.
+
+        The page lists executions in ascending ``peerId`` (Unicode code
+        point) order and, within a peer, in creation (first-commit)
+        order; ``after`` trims only that current list. The ``digest`` and
+        ``executionsCount`` instead cover **all** executions in pure
+        creation order — the order bindings were first appended, which is
+        also the order they ride in the data file's
+        ``repairExecutions`` section — so they are identical on every
+        page. An empty history pages as an empty list with
+        ``executionsCount`` 0 and the digest of ``[]``.
+
+        Returns ``(200, report)`` with exactly seven fields:
+        ``executions`` (the page; each item carries exactly ``peerId``,
+        ``ackId``, ``expectedCheckpoint``, ``expectedReceipts``,
+        ``suggestions``, ``results``, and ``cursor`` — the same binding,
+        expected anchors, ordered suggestions, and per-item result
+        evidence the execution committed with), ``nextCursor`` (the
+        number of executions skipped after this page), ``hasMore``,
+        ``algorithm`` (``"sha256"``), ``digest`` (the 64-character
+        lowercase SHA-256 of the canonical compact JSON array over the
+        whole creation-order history), ``executionsCount`` (the full
+        history length, never the page length), and ``verification``
+        produced by :func:`_repair_executions_verification_locked`. An
+        ``after`` equal to the execution count is a valid stable empty
+        tail whose summary and verification still cover the complete
+        history. Raises ValueError when ``after`` is past the execution
+        count of the snapshot. With ``--data-file`` the history is
+        rebuilt identically during recovery (a file written before
+        repair executions existed recovers with an empty history), so
+        the page, digest, count, and conclusion are identical before and
+        after a restart.
+        """
+        with self._lock:
+            history: list[dict[str, Any]] = [
+                {
+                    "peerId": peer_id,
+                    "ackId": ack_id,
+                    "expectedCheckpoint": binding["expectedCheckpoint"],
+                    "expectedReceipts": binding["expectedReceipts"],
+                    "suggestions": copy.deepcopy(binding["suggestions"]),
+                    "results": copy.deepcopy(binding["results"]),
+                    "cursor": binding["cursor"],
+                }
+                for (peer_id, ack_id), binding in self._repairs.items()
+            ]
+            total = len(history)
+            if after > total:
+                raise ValueError("after is past the end of the repair execution history")
+            digest_input = _repair_executions_digest_input(history)
+            verification = _repair_executions_verification_locked(
+                history, self._checkpoints, len(self._accepted)
+            )
+            # The page orders every execution by peerId first and, within
+            # a peer, keeps the creation order; ``history`` already is the
+            # creation order, so a stable sort on peerId alone produces
+            # exactly that arrangement.
+            ordered = sorted(history, key=lambda entry: entry["peerId"])
+            page = [dict(entry) for entry in ordered[after : after + limit]]
+            next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "executions": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "executionsCount": total,
+            "verification": verification,
+        }
+
     def record_policy_reload(self, digest: str, tokens: int) -> dict[str, Any]:
         """Commit one successful scope-policy hot reload to the audit history.
 
@@ -8110,6 +8577,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_replication_status_all_get()
             return
         if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "repairs"
+            and segments[3] == "executions"
+        ):
+            self._handle_replication_repair_executions_get()
+            return
+        if (
             len(segments) == 3
             and segments[0] == "v1"
             and segments[1] == "replication"
@@ -8646,6 +9122,36 @@ class RequestHandler(BaseHTTPRequestHandler):
         after, limit = params
         try:
             status, payload = self._store.get_replication_repairs(after, limit)
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_ordered_newline(status, payload)
+
+    def _handle_replication_repair_executions_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before
+        # any query check), so a malformed query is rejected here without
+        # any state being read or changed. The success body fixes the
+        # field order (executions, nextCursor, hasMore, algorithm,
+        # digest, executionsCount, verification; peerId, ackId,
+        # expectedCheckpoint, expectedReceipts, suggestions, results,
+        # cursor per execution) and follows the compact-single-line
+        # contract: one trailing newline, numbers only as JSON integers.
+        # The query is strictly read-only: it executes nothing and
+        # changes no repair record, checkpoint, receipt, or data file.
+        params = parse_replication_repair_executions_query(
+            urlsplit(self.path).query
+        )
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_replication_repair_executions(after, limit)
         except ValueError:
             self._json_ordered_newline(
                 HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
