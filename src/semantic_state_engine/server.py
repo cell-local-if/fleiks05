@@ -7418,6 +7418,25 @@ class StateStore:
         return dict(advice["target"])
 
     @staticmethod
+    def _repair_evidence_of(source: dict[str, Any]) -> dict[str, Any]:
+        """Copy one advice/suggestion slot's location evidence.
+
+        The evidence is the current advice's affected location and target
+        boundary, and for an identity correction also the expected and
+        observed identities the slot holds. The diagnosis embeds this as
+        the per-link ``evidence`` object, so a moved location is visible
+        directly beside the link's requested location.
+        """
+        evidence: dict[str, Any] = {
+            "location": copy.deepcopy(source["location"]),
+            "target": copy.deepcopy(source["target"]),
+        }
+        if source.get("action") == "correct_identity" or "expected" in source:
+            evidence["expected"] = copy.deepcopy(source["expected"])
+            evidence["observed"] = copy.deepcopy(source["observed"])
+        return evidence
+
+    @staticmethod
     def _repair_same_substance(advice: dict[str, Any], entry: dict[str, Any]) -> bool:
         """Whether the slot's advice still carries the suggestion's content.
 
@@ -7910,6 +7929,225 @@ class StateStore:
             "executionsCount": total,
             "verification": verification,
         }
+
+    def _diagnose_repair_links_locked(
+        self,
+        suggestions: list[dict[str, Any]],
+        current_advice: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Align suggestion slots with current advice into diagnosis links.
+
+        One link is produced per suggestion in request order, each carrying
+        the suggestion's ``action``, ``ackId``, ``location``, and
+        ``target``, the current aligned boundary, the current slot's
+        evidence, and a three-way status:
+
+        - ``"current"``: the ``(action, ackId, ordinal)`` slot still
+          exists in the current advice with the same location, target,
+          and, for an identity correction, the same expected/observed
+          identities — the slot is consistent (一致).
+        - ``"superseded"``: the slot still exists for the same action and
+          receipt at the same ordinal, but its log location or identity
+          has moved (定位变化); ``boundary`` and ``evidence`` name the new
+          current slot.
+        - ``"unavailable"``: the action/receipt group no longer holds that
+          ordinal (同组缺失); ``boundary`` and ``evidence`` are ``null``.
+
+        The slot grouping and stable order are exactly the alignment the
+        preflight and apply use (fixed action order, then stable advice
+        order within a slot), so a link is ``current`` precisely while the
+        corresponding suggestion is still executable.
+        """
+        indexed = [
+            dict(advice, _index=index)
+            for index, advice in enumerate(current_advice)
+        ]
+        ordered = self._repair_action_ordered_advice(indexed)
+        slots: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for advice in ordered:
+            slots.setdefault((advice["action"], advice["ackId"]), []).append(advice)
+        consumed: dict[tuple[str, str], int] = {}
+        links: list[dict[str, Any]] = []
+        for entry in suggestions:
+            key = (entry["action"], entry["ackId"])
+            ordinal = consumed.get(key, 0)
+            consumed[key] = ordinal + 1
+            group = slots.get(key, [])
+            link: dict[str, Any] = {
+                "action": entry["action"],
+                "ackId": entry["ackId"],
+                "location": copy.deepcopy(entry["location"]),
+                "target": copy.deepcopy(entry["target"]),
+            }
+            if ordinal >= len(group):
+                # The slot ordinal the suggestion names no longer exists in
+                # this action/receipt group — the group is missing it.
+                link["boundary"] = None
+                link["evidence"] = None
+                link["status"] = "unavailable"
+            else:
+                advice = group[ordinal]
+                evidence = self._repair_evidence_of(advice)
+                link["boundary"] = copy.deepcopy(advice["target"])
+                link["evidence"] = evidence
+                link["status"] = (
+                    "current"
+                    if self._repair_same_substance(advice, entry)
+                    else "superseded"
+                )
+            links.append(link)
+        return links
+
+    def diagnose_replication_repair(
+        self,
+        peer_id: str,
+        ack_id: str,
+        expected_checkpoint: int,
+        expected_receipts: str,
+        suggestions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Read-only diagnosis of one conditional repair-execution lifecycle.
+
+        This is the body behind ``POST /v1/replication/repairs/diagnosis``.
+        The request body is the same conditional-execution shape the
+        preflight and the committing apply use, and ``(peerId, ackId)``
+        locks the one execution under diagnosis. It chains the suggestion,
+        preflight, execution, and audit stages into evidence but writes
+        nothing: no repair record, checkpoint move, receipt, accepted-log
+        record or candidate, metric, temporary file, or data-file byte.
+
+        When no execution is committed for ``(peerId, ackId)``,
+        ``execution`` is ``null`` and the request's own suggestions are
+        aligned against the peer's current advice; the conclusion is
+        ``"ready"`` when every link is still current (the batch would
+        stage cleanly now) and ``"unexecuted"`` otherwise. When an
+        execution is committed, ``execution`` reports its creation-order
+        position, the anchor it expected, the cursor it restored, and
+        whether the stored binding exactly matches the presented lock; the
+        committed suggestions are aligned against the current advice and
+        the conclusion is ``"broken"`` when the history integrity scan
+        implicates this execution (a duplicate binding, out-of-order
+        actions, a boundary mismatch, a cursor out of bounds, or a
+        structurally damaged record), ``"current"`` when every link is
+        current, and ``"superseded"`` otherwise.
+
+        The summary always covers the request plus the complete history:
+        the suggestion count, the three per-link status counts, the
+        executed count (the committed result count, zero when nothing is
+        committed), and the total number of five-class integrity
+        anomalies over the whole repair-execution history. The links, the
+        anchor comparison, the history scan, and the conclusion are all
+        computed from one snapshot under the shared commit lock, so a
+        concurrent commit is observed only as a complete old or new
+        snapshot. With ``--data-file`` the bindings are rebuilt
+        identically on restart, so the same lock yields the identical
+        diagnosis after a restart.
+        """
+        with self._lock:
+            # The complete creation-order history, exactly as the executions
+            # audit pages and hashes it; ``dict.items`` preserves the order
+            # bindings first committed (and ride in the data file), which a
+            # restart rebuilds identically.
+            history: list[dict[str, Any]] = [
+                {
+                    "peerId": history_peer,
+                    "ackId": history_ack,
+                    "expectedCheckpoint": binding["expectedCheckpoint"],
+                    "expectedReceipts": binding["expectedReceipts"],
+                    "suggestions": copy.deepcopy(binding["suggestions"]),
+                    "results": copy.deepcopy(binding["results"]),
+                    "cursor": binding["cursor"],
+                }
+                for (history_peer, history_ack), binding in self._repairs.items()
+            ]
+            verification = _repair_executions_verification_locked(
+                history, self._checkpoints, len(self._accepted)
+            )
+            anomaly_keys = (
+                "duplicateBindings",
+                "outOfOrderActions",
+                "boundaryViolations",
+                "checkpointViolations",
+                "recordViolations",
+            )
+            history_anomalies = sum(
+                len(verification[name]) for name in anomaly_keys
+            )
+
+            binding = self._repairs.get((peer_id, ack_id))
+            committed = binding is not None
+            position: int | None = None
+            execution: dict[str, Any] | None = None
+            implicated = False
+            if binding is not None:
+                for index, entry in enumerate(history):
+                    if entry["peerId"] == peer_id and entry["ackId"] == ack_id:
+                        position = index
+                        break
+                implicated = any(
+                    any(
+                        marker.get("executionIndex") == position
+                        for marker in verification[name]
+                    )
+                    for name in anomaly_keys
+                )
+                binding_matches = (
+                    binding["expectedCheckpoint"] == expected_checkpoint
+                    and binding["expectedReceipts"] == expected_receipts
+                    and binding["suggestions"] == suggestions
+                )
+                execution = {
+                    "position": position,
+                    "expectedCheckpoint": binding["expectedCheckpoint"],
+                    "expectedReceipts": binding["expectedReceipts"],
+                    "cursor": binding["cursor"],
+                    "bindingMatches": binding_matches,
+                }
+                diagnosed_suggestions = binding["suggestions"]
+            else:
+                diagnosed_suggestions = suggestions
+
+            peer_receipts = self._peer_receipts_locked(peer_id)
+            current_advice = self._repair_current_advice_locked(
+                peer_id, peer_receipts
+            )
+            links = self._diagnose_repair_links_locked(
+                diagnosed_suggestions, current_advice
+            )
+
+            status_counts = {"current": 0, "superseded": 0, "unavailable": 0}
+            for link in links:
+                status_counts[link["status"]] += 1
+
+            if committed:
+                if implicated:
+                    conclusion = "broken"
+                elif status_counts["current"] == len(links):
+                    conclusion = "current"
+                else:
+                    conclusion = "superseded"
+                executed = len(links)
+            else:
+                conclusion = (
+                    "ready" if status_counts["current"] == len(links) else "unexecuted"
+                )
+                executed = 0
+
+            summary = {
+                "suggestions": len(links),
+                "current": status_counts["current"],
+                "superseded": status_counts["superseded"],
+                "unavailable": status_counts["unavailable"],
+                "executed": executed,
+                "anomalies": history_anomalies,
+            }
+            return {
+                "status": "diagnosed",
+                "execution": execution,
+                "links": links,
+                "summary": summary,
+                "conclusion": conclusion,
+            }
 
     def record_policy_reload(self, digest: str, tokens: int) -> dict[str, Any]:
         """Commit one successful scope-policy hot reload to the audit history.
@@ -9640,6 +9878,43 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json_ordered_newline(status, payload)
 
+    def _handle_replication_repairs_diagnosis_post(self) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — a missing, extra, or trailing segment,
+        # or a non-POST method — fall through to the generic 404 before
+        # any of those. The route accepts no query parameters, and that
+        # check precedes the body check. The diagnosis only aligns the
+        # request's suggestions (or the committed binding's) against the
+        # peer's current advice and scans the complete execution history
+        # from one snapshot: it writes no repair record, moves no
+        # checkpoint, records no receipt or log record, creates no
+        # temporary file, and touches no data-file byte. The response
+        # follows the compact-single-line contract: ordered UTF-8 JSON,
+        # one trailing newline, and counts, cursors, and boundaries only
+        # as JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            peer_id, ack_id, expected_checkpoint, expected_receipts, suggestions = (
+                parse_replication_repairs_batch(raw)
+            )
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        payload = self._store.diagnose_replication_repair(
+            peer_id, ack_id, expected_checkpoint, expected_receipts, suggestions
+        )
+        self._json_ordered_newline(HTTPStatus.OK, payload)
+
     def _handle_sync_get(self) -> None:
         params = parse_sync_query(urlsplit(self.path).query)
         if params is None:
@@ -10298,6 +10573,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "repairs"
             and segments[3] == "apply"
         )
+        is_replication_repairs_diagnosis_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "replication"
+            and segments[2] == "repairs"
+            and segments[3] == "diagnosis"
+        )
         if (
             matched
             or matched_ack
@@ -10316,6 +10598,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_replication_consensus_post
             or is_replication_repairs_plan_post
             or is_replication_repairs_apply_post
+            or is_replication_repairs_diagnosis_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -10372,6 +10655,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # The repair preflight only checks a staged view and
                 # commits nothing, so it is gated like the other
                 # read-only POSTs: a read or admin scope suffices.
+                if not self._require_scope(SCOPE_READ):
+                    return
+            elif is_replication_repairs_diagnosis_post:
+                # The lifecycle diagnosis only chains the suggestion,
+                # preflight, execution, and audit evidence from one
+                # snapshot and commits nothing, so it is gated like the
+                # other read-only POSTs: a read or admin scope suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
             elif not self._require_scope(SCOPE_WRITE):
@@ -10453,6 +10743,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_replication_repairs_apply_post:
             self._handle_replication_repairs_apply_post()
+            return
+        if is_replication_repairs_diagnosis_post:
+            self._handle_replication_repairs_diagnosis_post()
             return
         self._handle_sync_post()
 
