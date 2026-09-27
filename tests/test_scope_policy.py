@@ -623,6 +623,7 @@ class ScopePolicyPersistenceTests(unittest.TestCase):
                 "policies",
                 "transactions",
                 "acks",
+                "repairExecutions",
                 "policyEvents",
             },
         )

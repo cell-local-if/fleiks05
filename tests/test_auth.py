@@ -474,6 +474,7 @@ class AuthPersistenceTests(unittest.TestCase):
                 "policies",
                 "transactions",
                 "acks",
+                "repairExecutions",
                 "policyEvents",
             },
         )

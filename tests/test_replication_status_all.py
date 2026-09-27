@@ -270,7 +270,9 @@ class ReplicationStatusAllStoreTests(unittest.TestCase):
             "cursor": 1,
             "operations": [identity("r9", "o9")],
         }
-        # peer-d: the confirmation cursor regresses (which also overlaps).
+        # peer-d: the confirmation cursor regresses via a later empty
+        # receipt; an empty receipt confirms nothing, so it reports the
+        # regression without also overlapping.
         self.store._acks[("peer-d", "ack-1")] = {
             "cursor": 2,
             "operations": [identity("r0", "o0"), identity("r1", "o1")],
@@ -289,7 +291,7 @@ class ReplicationStatusAllStoreTests(unittest.TestCase):
         )
         self.assertEqual(
             payload["anomalies"],
-            {"gaps": 1, "overlaps": 2, "identityMismatches": 1, "cursorRegressions": 1},
+            {"gaps": 1, "overlaps": 1, "identityMismatches": 1, "cursorRegressions": 1},
         )
         self.assertEqual(payload["totals"]["acks"], 8)
 
