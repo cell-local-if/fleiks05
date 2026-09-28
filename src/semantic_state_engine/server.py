@@ -3304,6 +3304,115 @@ def _repair_executions_external_verification_locked(
     }
 
 
+def _cross_stream_verification_locked(
+    transactions: list[tuple[str, list[dict[str, Any]]]],
+    operations_index: dict[tuple[str, str], dict[str, Any]],
+    accepted: list[tuple[str, dict[str, Any]]],
+    repairs: list[dict[str, Any]],
+    repair_verdict: dict[str, Any],
+    checkpoints: dict[str, int],
+    log_length: int,
+) -> dict[str, Any]:
+    """Cross-check the transaction and repair streams against the shared log.
+
+    Unlike :func:`_transactions_verification_locked` and
+    :func:`_repair_executions_verification_locked`, this scan reports only
+    inconsistencies *between* the two local audit streams and the shared
+    accepted-operation log — it never repeats a pure intra-group anomaly
+    (duplicate bindings or transaction ids, malformed records, action
+    ordering, result boundaries, identity content mismatch, and in-batch
+    duplicates stay with their own group's verdict)::
+
+        {"status": "ok" | "broken",
+         "missingTransactionOperations": [...],
+         "unconfirmedRepairCursors": [...]}
+
+    - ``missingTransactionOperations``: a well-formed transaction operation
+      whose ``(replicaId, operationId)`` identity the accepted-operation
+      archive carries but the shared accepted log does not place — the
+      transaction ledger references an identity the shared log never
+      committed. (An identity absent from the archive too is already an
+      ``identityMismatches`` group anomaly and is not repeated here.) The
+      marker retains the 0-based ``transactionIndex``, the ``transactionId``,
+      the 0-based ``operationIndex`` within the transaction, and the
+      ``replicaId``/``operationId``.
+    - ``unconfirmedRepairCursors``: a structurally well-formed repair
+      execution whose restored ``cursor`` exceeds the shared log length or
+      names a peer whose registered checkpoint has not reached it — the
+      repair stream claims a cursor position the shared log/checkpoints do
+      not confirm. A cursor merely below the execution's own anchor is the
+      group's ``checkpointViolations`` condition and is not repeated here.
+      The marker retains the 0-based ``executionIndex``, ``peerId``, and
+      ``ackId``, with ``expected`` carrying the current ``registered``
+      checkpoint (``null`` for an unknown peer) and ``logLength`` and
+      ``observed`` carrying the restored ``cursor``.
+
+    ``status`` is ``"ok"`` exactly when both lists are empty. Live commits
+    append validated, consistent records under the commit lock, so the
+    conclusion is ``"ok"`` by construction; the scan independently
+    re-checks one committed snapshot. Empty transaction and repair
+    histories verify as ``"ok"`` with two empty lists.
+    """
+    missing_transaction_operations: list[dict[str, Any]] = []
+    log_positions: dict[tuple[str, str], int] = {
+        (replica_id, operation["operationId"]): position
+        for position, (replica_id, operation) in enumerate(accepted)
+    }
+    for transaction_index, (transaction_id, entries) in enumerate(transactions):
+        if not _is_well_formed_transaction_record(transaction_id, entries):
+            # Structural damage is the transaction group's recordViolation.
+            continue
+        for operation_index, entry in enumerate(entries):
+            identity = (entry["replicaId"], entry["operationId"])
+            if identity in log_positions:
+                continue
+            if identity not in operations_index:
+                # No accepted operation carries this identity at all:
+                # already reported as an identityMismatch (expected null).
+                continue
+            missing_transaction_operations.append(
+                {
+                    "transactionIndex": transaction_index,
+                    "transactionId": transaction_id,
+                    "operationIndex": operation_index,
+                    "replicaId": entry["replicaId"],
+                    "operationId": entry["operationId"],
+                }
+            )
+
+    unconfirmed_repair_cursors: list[dict[str, Any]] = []
+    record_bad_indexes = {
+        marker["executionIndex"]
+        for marker in repair_verdict["recordViolations"]
+    }
+    for execution_index, entry in enumerate(repairs):
+        if execution_index in record_bad_indexes:
+            continue
+        peer_id = entry["peerId"]
+        cursor = entry["cursor"]
+        registered = checkpoints.get(peer_id)
+        if cursor > log_length or registered is None or registered < cursor:
+            unconfirmed_repair_cursors.append(
+                {
+                    "executionIndex": execution_index,
+                    "peerId": peer_id,
+                    "ackId": entry["ackId"],
+                    "expected": {
+                        "registered": registered,
+                        "logLength": log_length,
+                    },
+                    "observed": {"cursor": cursor},
+                }
+            )
+
+    broken = bool(missing_transaction_operations or unconfirmed_repair_cursors)
+    return {
+        "status": "broken" if broken else "ok",
+        "missingTransactionOperations": missing_transaction_operations,
+        "unconfirmedRepairCursors": unconfirmed_repair_cursors,
+    }
+
+
 def _receipt_chain_audit_locked(
     committed: list[tuple[str, dict[str, Any]]],
     accepted: list[tuple[str, dict[str, Any]]],
@@ -8560,6 +8669,139 @@ class StateStore:
             "verification": verification,
         }
 
+    def get_integrity_verify(self) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Cross-check the transaction and repair streams from one snapshot.
+
+        This is the read-only entry point
+        ``GET /v1/integrity/verify``: it reads the shared accepted-operation
+        log, the transaction bindings, the repair-execution records, and the
+        registered checkpoints in one snapshot under the commit lock and
+        reports both per-stream audit conclusions and the cross-stream
+        conclusion, with no paging and no caller-supplied expectations.
+
+        The ``transactions`` group reports ``algorithm`` (always
+        ``"sha256"``), the full-history ``digest`` produced by
+        :func:`_transactions_digest_input`, the full ``count``, and the
+        four internal anomaly lists produced by
+        :func:`_transactions_verification_locked` (duplicate transaction
+        bindings, malformed records, operation-identity content mismatches
+        against the accepted-operation archive, and repeated keys or
+        identities inside one transaction). The ``repairExecutions``
+        group reports the same summary shape using
+        :func:`_repair_executions_digest_input` and the five internal
+        anomaly lists produced by
+        :func:`_repair_executions_verification_locked` — duplicate
+        bindings, action ordering, result boundaries, checkpoint
+        violations, and malformed records — keeping that audit's existing
+        judgement and markers. The ``cross`` group is produced by
+        :func:`_cross_stream_verification_locked` and reports only the
+        two streams' inconsistencies against the shared log (transaction
+        identities the ledger binds but the shared log never placed, and
+        repair cursors the shared log length or the peer's registered
+        checkpoint does not confirm), never the purely intra-group
+        anomalies.
+
+        Returns ``(200, report)`` with exactly four fields in order:
+        ``status`` (``"ok"`` exactly when every group is intact, otherwise
+        ``"broken"``), ``transactions``, ``repairExecutions``, and
+        ``cross``. Every count and position is a JSON integer; an empty
+        transaction or repair history still hashes ``[]``, counts ``0``,
+        and verifies ``"ok"``. The query is strictly read-only: it takes
+        the commit lock only to snapshot state, creates no temporary file,
+        and changes neither memory nor the data file; an internal failure
+        raises so the handler can answer HTTP 500 with all state intact.
+        """
+        with self._lock:
+            transaction_history: list[tuple[str, list[dict[str, Any]]]] = list(
+                self._transactions.items()
+            )
+            repair_history: list[dict[str, Any]] = [
+                {
+                    "peerId": peer_id,
+                    "ackId": ack_id,
+                    "expectedCheckpoint": binding["expectedCheckpoint"],
+                    "expectedReceipts": binding["expectedReceipts"],
+                    "suggestions": copy.deepcopy(binding["suggestions"]),
+                    "results": copy.deepcopy(binding["results"]),
+                    "cursor": binding["cursor"],
+                }
+                for (peer_id, ack_id), binding in self._repairs.items()
+            ]
+            accepted = list(self._accepted)
+            checkpoints = dict(self._checkpoints)
+            operations_index = dict(self._operations)
+            log_length = len(accepted)
+
+            transaction_verdict = _transactions_verification_locked(
+                transaction_history, operations_index
+            )
+            transaction_digest = hashlib.sha256(
+                _transactions_digest_input(transaction_history)
+            ).hexdigest()
+            repair_verdict = _repair_executions_verification_locked(
+                repair_history, checkpoints, log_length
+            )
+            repair_digest = hashlib.sha256(
+                _repair_executions_digest_input(repair_history)
+            ).hexdigest()
+            cross_verdict = _cross_stream_verification_locked(
+                transaction_history,
+                operations_index,
+                accepted,
+                repair_history,
+                repair_verdict,
+                checkpoints,
+                log_length,
+            )
+
+        transactions_report = {
+            "algorithm": "sha256",
+            "digest": transaction_digest,
+            "count": len(transaction_history),
+            "anomalies": {
+                "duplicateTransactionIds": transaction_verdict[
+                    "duplicateTransactionIds"
+                ],
+                "recordViolations": transaction_verdict["recordViolations"],
+                "identityMismatches": transaction_verdict["identityMismatches"],
+                "batchViolations": transaction_verdict["batchViolations"],
+            },
+        }
+        repair_report = {
+            "algorithm": "sha256",
+            "digest": repair_digest,
+            "count": len(repair_history),
+            "anomalies": {
+                "duplicateBindings": repair_verdict["duplicateBindings"],
+                "outOfOrderActions": repair_verdict["outOfOrderActions"],
+                "boundaryViolations": repair_verdict["boundaryViolations"],
+                "checkpointViolations": repair_verdict["checkpointViolations"],
+                "recordViolations": repair_verdict["recordViolations"],
+            },
+        }
+        cross_report = {
+            "status": cross_verdict["status"],
+            "anomalies": {
+                "missingTransactionOperations": cross_verdict[
+                    "missingTransactionOperations"
+                ],
+                "unconfirmedRepairCursors": cross_verdict[
+                    "unconfirmedRepairCursors"
+                ],
+            },
+        }
+        intact = (
+            transaction_verdict["status"] == "ok"
+            and repair_verdict["status"] == "ok"
+            and cross_verdict["status"] == "ok"
+        )
+        return HTTPStatus.OK, {
+            "status": "ok" if intact else "broken",
+            "transactions": transactions_report,
+            "repairExecutions": repair_report,
+            "cross": cross_report,
+        }
+
     def _diagnose_repair_links_locked(
         self,
         suggestions: list[dict[str, Any]],
@@ -9613,6 +9855,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         if (
             len(segments) == 3
             and segments[0] == "v1"
+            and segments[1] == "integrity"
+            and segments[2] == "verify"
+        ):
+            self._handle_integrity_verify_get()
+            return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
             and segments[1] == "verification"
             and segments[2] == "digest"
         ):
@@ -10019,6 +10269,34 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         self._json(HTTPStatus.OK, self._store.get_metrics())
+
+    def _handle_integrity_verify_get(self) -> None:
+        # The route-shape check in do_GET already ran: a missing or extra
+        # segment, a trailing slash, a non-GET method, or any unknown route
+        # is 404 there, before any query check, so a wrong path shape with
+        # an illegal query is still 404. The endpoint accepts no request
+        # parameters — an unknown, repeated, blank, or otherwise present
+        # parameter is 400 invalid_request without reading or changing any
+        # state. The success body fixes the field order (status,
+        # transactions, repairExecutions, cross) and follows the
+        # compact-single-line contract: ordered UTF-8 JSON, one trailing
+        # newline, every count and position a JSON integer. The query reads
+        # one committed snapshot and is strictly read-only: it creates no
+        # temporary file and changes neither memory nor the data file; an
+        # internal failure is 500 internal_error with all state unchanged.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        try:
+            status, payload = self._store.get_integrity_verify()
+        except Exception:
+            self._json_ordered_newline(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+            )
+            return
+        self._json_ordered_newline(status, payload)
 
     def _handle_state_at_get(self, key: str) -> None:
         # The route-shape check in do_GET already ran (missing or extra
@@ -11416,6 +11694,35 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_replication_repairs_diagnosis_post()
             return
         self._handle_sync_post()
+
+    def _answer_unpublished_method(self) -> None:
+        # Only GET and POST are published verbs. A request using any
+        # other method (PUT, DELETE, PATCH, OPTIONS, HEAD, ...) is an
+        # unknown route, so it authenticates and checks the write scope
+        # exactly like the unmatched-route tail of do_POST — a missing or
+        # bad credential is 401 and a token lacking write/admin is 403 —
+        # and then always answers 404 not_found, regardless of the path
+        # shape, query, or any request body. This keeps "non-GET or POST
+        # on a published path is an unknown route" uniform with the GET
+        # and POST handlers instead of the standard library's 501 page.
+        if not self._require_scope(SCOPE_WRITE):
+            return
+        self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def do_PUT(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._answer_unpublished_method()
+
+    def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._answer_unpublished_method()
+
+    def do_PATCH(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._answer_unpublished_method()
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._answer_unpublished_method()
+
+    def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._answer_unpublished_method()
 
     def log_message(self, format: str, *args: object) -> None:
         return
