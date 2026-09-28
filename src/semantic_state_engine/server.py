@@ -681,6 +681,42 @@ def parse_integrity_root_query(query: str) -> str | None:
     return expected
 
 
+def parse_replication_export_query(
+    query: str,
+) -> tuple[int, int, str] | None:
+    """Validate the read-only candidate-export query string.
+
+    All three parameters are **required**, each appearing exactly once:
+    ``after`` (a non-negative ASCII decimal integer — the number of
+    business keys already exported, starting at ``0``), ``limit``
+    (between 1 and 100), and ``expectedDigest`` (exactly 64 lowercase
+    hexadecimal characters, the complete candidate digest the caller
+    expects). A missing, repeated, unknown, blank, empty, signed,
+    decimal-point, whitespace-bearing, or non-ASCII-decimal value, a
+    ``limit`` outside ``1-100``, and a malformed digest (uppercase,
+    non-hex, or the wrong length) return None so the caller answers
+    HTTP 400 ``invalid_request``. The bound on ``after`` against the
+    committed key count is checked by the store against the committed
+    snapshot (``after`` equal to the key count is a valid stable empty
+    page).
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if set(parsed) != {"after", "limit", "expectedDigest"}:
+        return None
+    after = _non_negative_int(parsed["after"][0])
+    if after is None:
+        return None
+    limit = _non_negative_int(parsed["limit"][0])
+    if limit is None or not (1 <= limit <= SYNC_BATCH_MAX):
+        return None
+    expected_digest = parsed["expectedDigest"][0]
+    if not _is_sha256_hex64(expected_digest):
+        return None
+    return after, limit, expected_digest
+
+
 def parse_peer_pickup_query(query: str) -> tuple[int, int] | None:
     """Validate the peer-progress pickup query string.
 
@@ -6052,6 +6088,87 @@ class StateStore:
             "checkpoints": checkpoints,
         }
 
+    def export_replication_candidates(
+        self, after: int, limit: int, expected_digest: str
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Export one page of the complete local candidate snapshot.
+
+        This is the read-only entry point ``GET /v1/replication/export``:
+        in one committed snapshot it reads the complete current candidate
+        state — the same state the comparison entry point digests as the
+        local side — under the same commit lock used by local writes, sync
+        imports, repairs, and checkpoint commits, so the page groups, the
+        cursor, the remaining flag, the full-snapshot digest, and both
+        counts always describe a single commit: a read can never observe
+        half an import batch or a partially applied repair. The query is
+        strictly read-only — it creates no temporary file and changes
+        neither memory nor the data file — so with ``--data-file`` the
+        same state yields the same pages and digest after a restart.
+
+        ``after`` is the number of business keys already exported (a
+        0-based resume cursor starting at ``0``) and ``limit`` the maximum
+        number of business keys per page, between 1 and 100. The snapshot
+        is grouped by business key in lexicographic (Unicode code point)
+        order; paging trims only whole key groups, never the candidates of
+        a single key, so every group on a page carries the key's complete
+        candidate set. Each candidate keeps the comparison entry point's
+        shape exactly — ``value``, ``clock``, ``replicaId``,
+        ``operationId`` — with the clock copied componentwise, and is
+        ordered by ``(replicaId, operationId)`` ascending, exactly like
+        the existing identity ordering. ``nextCursor`` is the number of
+        keys skipped after this page and ``hasMore`` reports whether
+        further keys remain; an ``after`` equal to the current key count
+        is a valid stable empty page.
+
+        ``expected_digest`` must equal the 64-character lowercase
+        hexadecimal SHA-256 of the complete current candidate snapshot,
+        following exactly the verification-digest rules
+        (:func:`_verification_digest_input`; an empty snapshot hashes the
+        empty array ``[]``). The digest covers the **whole** snapshot, so
+        it is identical on every page; on mismatch the state is returned
+        unchanged as ``(409, {"error": "export_conflict"})`` and no page
+        content is produced — the caller keeps its prior page, fetches
+        the new digest through the existing snapshot/verification entry
+        point, and re-requests. Raises ValueError when ``after`` is past
+        the current key count.
+        """
+        with self._lock:
+            snapshot = {
+                key: [
+                    {
+                        "value": candidate["value"],
+                        "clock": dict(candidate["clock"]),
+                        "replicaId": candidate["replicaId"],
+                        "operationId": candidate["operationId"],
+                    }
+                    for candidate in sorted(
+                        candidates,
+                        key=lambda c: (c["replicaId"], c["operationId"]),
+                    )
+                ]
+                for key, candidates in self._candidates.items()
+            }
+        total_keys = len(snapshot)
+        candidate_versions = sum(len(candidates) for candidates in snapshot.values())
+        digest = hashlib.sha256(_verification_digest_input(snapshot)).hexdigest()
+        if digest != expected_digest:
+            return HTTPStatus.CONFLICT, {"error": "export_conflict"}
+        if after > total_keys:
+            raise ValueError("after is past the end of the key groups")
+        ordered_keys = sorted(snapshot)
+        page_keys = ordered_keys[after : after + limit]
+        page = [{"key": key, "candidates": snapshot[key]} for key in page_keys]
+        next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "snapshot": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total_keys,
+            "algorithm": "sha256",
+            "digest": digest,
+            "keys": total_keys,
+            "candidateVersions": candidate_versions,
+        }
+
     def compare_replication_snapshot(
         self, replica_id: str, snapshot: dict[str, list[dict[str, Any]]]
     ) -> dict[str, Any]:
@@ -10220,6 +10337,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             len(segments) == 3
             and segments[0] == "v1"
             and segments[1] == "replication"
+            and segments[2] == "export"
+        ):
+            self._handle_replication_export_get()
+            return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "replication"
             and segments[2] == "status"
         ):
             self._handle_replication_status_get()
@@ -10794,6 +10919,39 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._json_canonical_newline(
             HTTPStatus.OK, self._store.get_replication_snapshot()
         )
+
+    def _handle_replication_export_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before
+        # any query check), so a malformed query is rejected here without
+        # any state being read or changed. All three parameters are
+        # required: after (a non-negative ASCII decimal key cursor),
+        # limit (1-100), and expectedDigest (64 lowercase hex chars of
+        # the complete candidate snapshot). The success body fixes the
+        # field order (snapshot, nextCursor, hasMore, algorithm, digest,
+        # keys, candidateVersions) and follows the compact-single-line
+        # contract: one trailing newline, counts and the cursor only as
+        # JSON integers. A digest mismatch answers 409 export_conflict
+        # with no page content; the caller keeps the prior page, reads
+        # the new digest from the snapshot/verification entry point, and
+        # re-requests.
+        params = parse_replication_export_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit, expected_digest = params
+        try:
+            status, payload = self._store.export_replication_candidates(
+                after, limit, expected_digest
+            )
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_ordered_newline(status, payload)
 
     def _handle_replication_status_get(self) -> None:
         # The route-shape check in do_GET already ran (missing or extra

@@ -860,6 +860,28 @@ The candidate state, the log cursor, and the checkpoint mapping are read from on
 
 The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}` without reading any state. A missing or extra path segment, an unknown route, or a trailing slash (for example `/v1/replication/snapshot/`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
 
+### Read-only complete-candidate export
+
+`GET /v1/replication/export` incrementally exports the **complete** local candidate snapshot — the same current candidates `GET /v1/replication/snapshot` and `POST /v1/replication/compare` summarize — grouped by business key. The query is strictly read-only: it modifies neither memory nor the data file and creates no temporary file. It accepts exactly three required query parameters:
+
+- `after`: the number of business keys already exported, a 0-based resume cursor that starts at `0`. An `after` equal to the current key count is a valid stable empty page; an `after` past it is HTTP 400.
+- `limit`: an ASCII decimal integer between `1` and `100` inclusive, bounding the number of **business key groups** per page.
+- `expectedDigest`: exactly 64 lowercase hexadecimal characters — the complete candidate digest the caller expects, i.e. the `candidateDigest` of `GET /v1/replication/snapshot` (the verification-digest rules over the current candidate sets).
+
+A missing, repeated, unknown, blank, signed, decimal-point, whitespace-bearing, or non-ASCII-decimal parameter, a `limit` outside `1-100`, or an `expectedDigest` that is not 64 lowercase hexadecimal characters returns HTTP 400 with `{"error":"invalid_request"}`. A missing or extra path segment, an unknown route, or a trailing slash (for example `/v1/replication/export/`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check. A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with an explicit `Content-Length` and exactly seven fields in this order:
+
+```json
+{"snapshot":[{"key":"color","candidates":[{"clock":{"r1":1},"operationId":"op-1","replicaId":"r1","value":"blue"}]}],"nextCursor":1,"hasMore":false,"algorithm":"sha256","digest":"<64 lowercase hex chars>","keys":1,"candidateVersions":1}
+```
+
+- `snapshot`: one page of business-key groups in lexicographic (Unicode code point) key order. Each group carries exactly `key` and `candidates`; the candidate list is the key's **complete** current candidate set in that snapshot — paging trims only whole business keys and never splits the candidates of one key across pages. Each candidate keeps exactly the comparison entry point's shape and ordering: `value`, `clock`, `replicaId`, `operationId`, sorted by `(replicaId, operationId)` ascending.
+- `nextCursor`: the number of business keys skipped after this page — feed it back as the next `after`; `hasMore` reports whether further key groups remain.
+- `algorithm` is always `"sha256"`.
+- `digest` covers the **complete** snapshot under exactly the verification-digest rules (one `{"key","candidates"}` entry per key, fixed candidate/clock field order, compact UTF-8 JSON, minimal string escaping), so it is identical on every page; an empty snapshot hashes the empty array `[]`.
+- `keys` and `candidateVersions` count the whole snapshot, never just the page — the same key and candidate totals reported by `GET /v1/metrics` and `GET /v1/verification/digest`. Every count and cursor in the response is a JSON integer; no float, `-0.0`, or non-finite value can appear.
+
+If the committed snapshot's digest does not equal `expectedDigest`, the response is HTTP 409 with `{"error":"export_conflict"}` and carries no page; state is unchanged. The caller keeps the prior page, reads the new digest from `GET /v1/replication/snapshot`, and re-exports from the appropriate cursor. The page groups, cursor, remaining flag, digest, and both counts are all computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so a read observes only the whole old or whole new snapshot, never half an import batch or a partially applied repair. With `--data-file`, the candidate state is rebuilt identically during recovery, so the same snapshot yields the same pages and digest after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 `{"error":"unauthorized"}` with the `WWW-Authenticate: Bearer` challenge, and in scope-policy mode an authenticated token lacking the `read` or `admin` scope is HTTP 403 `{"error":"forbidden"}` with no challenge; `/health` stays anonymous. A `POST` on the path is an unknown route and answers HTTP 404.
+
 ### Cross-replica candidate comparison
 
 `POST /v1/replication/compare` returns a read-only diff between the local current candidates and a remote replica's complete candidate snapshot, so a caller can locate exactly which candidate versions still need to converge. The request body is a JSON object with exactly two fields:
