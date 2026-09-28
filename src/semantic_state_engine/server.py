@@ -660,6 +660,27 @@ def parse_audit_log_verify_query(
     return after, limit, head, count
 
 
+def parse_integrity_root_query(query: str) -> str | None:
+    """Validate the unified audit-root query string.
+
+    Exactly one parameter is accepted: ``expectedDigest``, which must be
+    present exactly once and hold exactly 64 lowercase hexadecimal
+    characters (a SHA-256 digest). A missing, repeated, unknown, blank,
+    empty, uppercase, non-hex, or wrong-length value returns None so the
+    caller answers HTTP 400 ``invalid_request``; ``keep_blank_values``
+    ensures a bare ``expectedDigest=`` is rejected rather than dropped.
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if set(parsed) != {"expectedDigest"}:
+        return None
+    expected = parsed["expectedDigest"][0]
+    if not _is_sha256_hex64(expected):
+        return None
+    return expected
+
+
 def parse_peer_pickup_query(query: str) -> tuple[int, int] | None:
     """Validate the peer-progress pickup query string.
 
@@ -2749,6 +2770,61 @@ def _receipts_digest_input(
             parts.append("}")
         parts.append("]}")
     parts.append("]")
+    return "".join(parts).encode("utf-8")
+
+
+def _receipts_stream_digest_input(
+    peers: list[tuple[str, list[tuple[str, dict[str, Any]]]]],
+) -> bytes:
+    """Serialize every peer receipt to the unified audit-root digest input.
+
+    The peer-receipt evidence stream aggregates the per-peer receipts of
+    :func:`_receipts_digest_input` over all registered senders: the senders
+    are ordered lexicographically by ``peerId`` (Unicode code point order)
+    and within one sender the receipts keep their first-commit (creation)
+    order. Each receipt is written with that stream's existing canonical
+    encoding — ``{"peerId","ackId","cursor","operations"}`` with every
+    confirmed identity as ``{"replicaId","operationId"}`` in confirmation
+    order — so the stream reuses the existing receipt audit digest
+    verbatim, only aggregated and sender-sorted. No whitespace is emitted
+    anywhere, numbers are plain JSON integers, and strings are escaped
+    exactly as in :func:`_escape_digest_string`. With no receipt anywhere
+    the stream serializes to the empty array ``[]``.
+    """
+    parts: list[str] = ["["]
+    first = True
+    for peer_id, committed in peers:
+        encoded = _receipts_digest_input(peer_id, committed)
+        # Strip the per-peer array brackets and splice the elements into
+        # one sender-sorted aggregate array.
+        inner = encoded[1:-1].decode("utf-8")
+        if inner:
+            if not first:
+                parts.append(",")
+            parts.append(inner)
+            first = False
+    parts.append("]")
+    return "".join(parts).encode("utf-8")
+
+
+def _checkpoints_digest_input(checkpoints: dict[str, int]) -> bytes:
+    """Serialize the peer-to-cursor checkpoint mapping to digest input.
+
+    The result is a compact UTF-8 JSON object mapping every registered
+    sender ``peerId`` to its checkpoint cursor, with the peer ids sorted
+    lexicographically (Unicode code point order) — the same canonical
+    mapping encoding the replication-snapshot summary embeds. No
+    whitespace is emitted anywhere and cursors are plain JSON integers.
+    An empty mapping serializes to ``{}``.
+    """
+    parts: list[str] = ["{"]
+    for index, peer_id in enumerate(sorted(checkpoints)):
+        if index:
+            parts.append(",")
+        parts.append(_escape_digest_string(peer_id))
+        parts.append(":")
+        parts.append(str(checkpoints[peer_id]))
+    parts.append("}")
     return "".join(parts).encode("utf-8")
 
 
@@ -8802,6 +8878,262 @@ class StateStore:
             "cross": cross_report,
         }
 
+    def get_integrity_root(self, expected_digest: str) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Produce the unified audit root over all persisted audit streams.
+
+        This is the read-only entry point ``GET /v1/integrity/root``: in
+        one committed snapshot it reads every persisted audit stream —
+        the shared accepted-operation log (the global audit chain), the
+        atomic-transaction bindings, the conditional replication-repair
+        executions, the per-peer consumption receipts, the scope-policy
+        change events, and the registered sender checkpoint mapping — and
+        binds them under one SHA-256 root.
+
+        Each stream reports a stable ``name``, its existing full-history
+        ``digest`` (the receipts stream aggregated by sender in ascending
+        ``peerId`` order and the checkpoints stream covering the
+        peer-to-cursor mapping; the other streams keep their first-commit
+        order), the record (or mapping) ``count``, and its existing
+        integrity ``status`` with the existing anomaly locations. The
+        root digest is the SHA-256 of a whitespace-free UTF-8 JSON array
+        with one ``{"name","digest","count"}`` element per stream in the
+        fixed stream order. ``verification`` re-checks all six streams:
+        its ``status`` is ``"ok"`` exactly when every stream is intact and
+        the recomputed root equals ``expected_digest``; otherwise it is
+        ``"broken"`` and ``rootMismatches`` carries at most one
+        ``{"expected","observed"}`` marker (the caller's expectation
+        first, the recomputed root second).
+
+        Returns ``(200, report)``. All six streams are read once under
+        the commit lock, so a concurrent commit is observed only as the
+        whole old or the whole new root. The query is strictly read-only:
+        it creates no temporary file and changes neither memory nor the
+        data file; an internal failure raises so the handler answers 500.
+        """
+        with self._lock:
+            accepted = list(self._accepted)
+            log_length = len(accepted)
+            checkpoints = dict(self._checkpoints)
+            operations_index = dict(self._operations)
+
+            # 1. Accepted-operation log: the global audit chain, in first
+            # commit order, with its chain-head digest.
+            previous = _AUDIT_CHAIN_GENESIS
+            all_entries: list[dict[str, Any]] = []
+            for index, (replica_id, operation) in enumerate(accepted):
+                sequence = index + 1
+                digest = _audit_chain_link(previous, sequence, replica_id, operation)
+                all_entries.append(
+                    {
+                        "sequence": sequence,
+                        "prevDigest": previous,
+                        "digest": digest,
+                    }
+                )
+                previous = digest
+            log_head = previous
+            log_verdict = _audit_log_verification_locked(
+                accepted, all_entries, log_head, log_length
+            )
+
+            # 2. Transaction bindings: complete creation-order history.
+            transaction_history: list[tuple[str, list[dict[str, Any]]]] = list(
+                self._transactions.items()
+            )
+            transaction_digest = hashlib.sha256(
+                _transactions_digest_input(transaction_history)
+            ).hexdigest()
+            transaction_verdict = _transactions_verification_locked(
+                transaction_history, operations_index
+            )
+
+            # 3. Repair executions: complete creation-order history.
+            repair_history: list[dict[str, Any]] = [
+                {
+                    "peerId": peer_id,
+                    "ackId": ack_id,
+                    "expectedCheckpoint": binding["expectedCheckpoint"],
+                    "expectedReceipts": binding["expectedReceipts"],
+                    "suggestions": copy.deepcopy(binding["suggestions"]),
+                    "results": copy.deepcopy(binding["results"]),
+                    "cursor": binding["cursor"],
+                }
+                for (peer_id, ack_id), binding in self._repairs.items()
+            ]
+            repair_digest = hashlib.sha256(
+                _repair_executions_digest_input(repair_history)
+            ).hexdigest()
+            repair_verdict = _repair_executions_verification_locked(
+                repair_history, checkpoints, log_length
+            )
+
+            # 4. Consumption receipts: aggregated by sender, peers sorted
+            # by peerId, receipts within a peer in first-commit order.
+            receipts_by_peer: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+            for (receipt_peer, ack_id), receipt in self._acks.items():
+                receipts_by_peer.setdefault(receipt_peer, []).append(
+                    (ack_id, copy.deepcopy(receipt))
+                )
+            receipt_peers = [
+                (peer_id, receipts_by_peer[peer_id])
+                for peer_id in sorted(receipts_by_peer)
+            ]
+            receipts_count = sum(len(committed) for _, committed in receipt_peers)
+            receipts_digest = hashlib.sha256(
+                _receipts_stream_digest_input(receipt_peers)
+            ).hexdigest()
+            receipt_anomalies = {
+                "gaps": [],
+                "overlaps": [],
+                "identityMismatches": [],
+                "cursorRegressions": [],
+            }
+            receipts_broken = False
+            for peer_id, committed in receipt_peers:
+                chain = _receipt_chain_audit_locked(committed, accepted)
+                if chain["status"] != "ok":
+                    receipts_broken = True
+                for name in (
+                    "gaps",
+                    "overlaps",
+                    "identityMismatches",
+                    "cursorRegressions",
+                ):
+                    for marker in chain[name]:
+                        receipt_anomalies[name].append(
+                            {"peerId": peer_id, **marker}
+                        )
+            receipts_verdict = {
+                "status": "broken" if receipts_broken else "ok",
+                "anomalies": receipt_anomalies,
+            }
+
+            # 5. Scope-policy change events: first-commit order.
+            policy_events = [dict(event) for event in self._policy_events]
+            policy_digest = hashlib.sha256(
+                _policy_events_digest_input(policy_events)
+            ).hexdigest()
+            policy_verdict = _policy_events_verification_locked(policy_events)
+
+            # 6. Checkpoint mapping: peerId -> cursor, peers sorted.
+            checkpoints_digest = hashlib.sha256(
+                _checkpoints_digest_input(checkpoints)
+            ).hexdigest()
+            checkpoints_count = len(checkpoints)
+
+        log_anomalies = {
+            "missingSequences": log_verdict["missingSequences"],
+            "duplicateSequences": log_verdict["duplicateSequences"],
+            "outOfRangeSequences": log_verdict["outOfRangeSequences"],
+            "brokenLinks": log_verdict["brokenLinks"],
+            "digestMismatches": log_verdict["digestMismatches"],
+        }
+        transaction_anomalies = {
+            "duplicateTransactionIds": transaction_verdict[
+                "duplicateTransactionIds"
+            ],
+            "recordViolations": transaction_verdict["recordViolations"],
+            "identityMismatches": transaction_verdict["identityMismatches"],
+            "batchViolations": transaction_verdict["batchViolations"],
+        }
+        repair_anomalies = {
+            "duplicateBindings": repair_verdict["duplicateBindings"],
+            "outOfOrderActions": repair_verdict["outOfOrderActions"],
+            "boundaryViolations": repair_verdict["boundaryViolations"],
+            "checkpointViolations": repair_verdict["checkpointViolations"],
+            "recordViolations": repair_verdict["recordViolations"],
+        }
+        policy_anomalies = {
+            "missingSequences": policy_verdict["missingSequences"],
+            "duplicateSequences": policy_verdict["duplicateSequences"],
+            "outOfRangeSequences": policy_verdict["outOfRangeSequences"],
+            "digestMismatches": policy_verdict["digestMismatches"],
+        }
+
+        streams: list[dict[str, Any]] = [
+            {
+                "name": "acceptedOperations",
+                "digest": log_head,
+                "count": log_length,
+                "status": log_verdict["status"],
+                "anomalies": log_anomalies,
+            },
+            {
+                "name": "transactions",
+                "digest": transaction_digest,
+                "count": len(transaction_history),
+                "status": transaction_verdict["status"],
+                "anomalies": transaction_anomalies,
+            },
+            {
+                "name": "repairExecutions",
+                "digest": repair_digest,
+                "count": len(repair_history),
+                "status": repair_verdict["status"],
+                "anomalies": repair_anomalies,
+            },
+            {
+                "name": "receipts",
+                "digest": receipts_digest,
+                "count": receipts_count,
+                "status": receipts_verdict["status"],
+                "anomalies": receipts_verdict["anomalies"],
+            },
+            {
+                "name": "policyEvents",
+                "digest": policy_digest,
+                "count": len(policy_events),
+                "status": policy_verdict["status"],
+                "anomalies": policy_anomalies,
+            },
+            {
+                "name": "checkpoints",
+                "digest": checkpoints_digest,
+                "count": checkpoints_count,
+                "status": "ok",
+                "anomalies": {},
+            },
+        ]
+
+        root_input = _ordered_json_bytes(
+            [
+                {
+                    "name": stream["name"],
+                    "digest": stream["digest"],
+                    "count": stream["count"],
+                }
+                for stream in streams
+            ]
+        )
+        root_digest = hashlib.sha256(root_input).hexdigest()
+
+        record_count = sum(
+            stream["count"]
+            for stream in streams
+            if stream["name"] != "checkpoints"
+        )
+        root_mismatches: list[dict[str, Any]] = []
+        streams_intact = all(stream["status"] == "ok" for stream in streams)
+        if root_digest != expected_digest:
+            root_mismatches.append(
+                {"expected": expected_digest, "observed": root_digest}
+            )
+        intact = streams_intact and not root_mismatches
+        return HTTPStatus.OK, {
+            "algorithm": "sha256",
+            "digest": root_digest,
+            "evidenceCount": {
+                "streams": len(streams),
+                "records": record_count,
+                "mappings": checkpoints_count,
+            },
+            "streams": streams,
+            "verification": {
+                "status": "ok" if intact else "broken",
+                "rootMismatches": root_mismatches,
+            },
+        }
+
     def _diagnose_repair_links_locked(
         self,
         suggestions: list[dict[str, Any]],
@@ -9863,6 +10195,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         if (
             len(segments) == 3
             and segments[0] == "v1"
+            and segments[1] == "integrity"
+            and segments[2] == "root"
+        ):
+            self._handle_integrity_root_get()
+            return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
             and segments[1] == "verification"
             and segments[2] == "digest"
         ):
@@ -10291,6 +10631,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         try:
             status, payload = self._store.get_integrity_verify()
+        except Exception:
+            self._json_ordered_newline(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+            )
+            return
+        self._json_ordered_newline(status, payload)
+
+    def _handle_integrity_root_get(self) -> None:
+        # The route-shape check in do_GET already ran: a missing or extra
+        # segment, a trailing slash, a non-GET method, or any unknown route
+        # is 404 there, before any query check, so a wrong path shape with
+        # an illegal query is still 404. The endpoint takes exactly one
+        # parameter — ``expectedDigest``, a 64-character lowercase
+        # hexadecimal SHA-256 digest appearing exactly once; a missing,
+        # repeated, unknown, blank, empty, uppercase, non-hex, or
+        # wrong-length value is 400 invalid_request without reading or
+        # changing any state. The success body fixes the field order
+        # (algorithm, digest, evidenceCount, streams, verification) and
+        # follows the compact-single-line contract: ordered UTF-8 JSON,
+        # one trailing newline, every count a JSON integer. All six
+        # streams are read from one committed snapshot and the query is
+        # strictly read-only: it creates no temporary file and changes
+        # neither memory nor the data file; an internal failure is 500
+        # internal_error with all state unchanged.
+        expected_digest = parse_integrity_root_query(urlsplit(self.path).query)
+        if expected_digest is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        try:
+            status, payload = self._store.get_integrity_root(expected_digest)
         except Exception:
             self._json_ordered_newline(
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
