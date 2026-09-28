@@ -3304,6 +3304,89 @@ def _repair_executions_external_verification_locked(
     }
 
 
+def _integrity_cross_transaction_mismatches_locked(
+    transactions: list[tuple[str, list[dict[str, Any]]]],
+    accepted: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Cross-check transaction operation identities against the shared log.
+
+    Unlike the per-group identity scan (which compares a transaction
+    operation's stored content with the accepted-operation archive),
+    this cross-stream scan asks where each well-formed transaction
+    operation's ``(replicaId, operationId)`` identity actually rides in
+    the shared accepted-operation log and whether the log record at that
+    position carries the exact same content. Damaged transaction records
+    (the ones the group scan flags as ``recordViolations``) are skipped:
+    a malformed record is a purely in-group anomaly, not a cross-stream
+    one.
+
+    Each marker retains the operation's 0-based ``transactionIndex`` and
+    ``transactionId``, its 0-based ``operationIndex`` within the
+    transaction, the ``replicaId``/``operationId`` business identity, the
+    shared-log ``position`` (``null`` when the identity is absent from
+    the accepted log), and ``expected``/``observed`` identity content as
+    ``{"operationId","key","value","clock"}`` — ``expected`` is the
+    accepted-log content (``null`` when the identity is absent) and
+    ``observed`` the content the transaction binding names.
+    """
+    positions: dict[tuple[str, str], int] = {}
+    for position, (replica_id, operation) in enumerate(accepted):
+        positions.setdefault((replica_id, operation["operationId"]), position)
+
+    mismatches: list[dict[str, Any]] = []
+    for transaction_index, (transaction_id, entries) in enumerate(transactions):
+        if not _is_well_formed_transaction_record(transaction_id, entries):
+            # Structural damage is reported by the transaction group's
+            # recordViolations and must not be double-counted here.
+            continue
+        for operation_index, entry in enumerate(entries):
+            replica_id = entry["replicaId"]
+            operation_id = entry["operationId"]
+            identity = (replica_id, operation_id)
+            observed = {
+                "operationId": operation_id,
+                "key": entry["key"],
+                "value": entry["value"],
+                "clock": dict(entry["clock"]),
+            }
+            position = positions.get(identity)
+            if position is None:
+                mismatches.append(
+                    {
+                        "transactionIndex": transaction_index,
+                        "transactionId": transaction_id,
+                        "operationIndex": operation_index,
+                        "replicaId": replica_id,
+                        "operationId": operation_id,
+                        "position": None,
+                        "expected": None,
+                        "observed": observed,
+                    }
+                )
+                continue
+            accepted_operation = accepted[position][1]
+            expected = {
+                "operationId": accepted_operation["operationId"],
+                "key": accepted_operation["key"],
+                "value": accepted_operation["value"],
+                "clock": dict(accepted_operation["clock"]),
+            }
+            if expected != observed:
+                mismatches.append(
+                    {
+                        "transactionIndex": transaction_index,
+                        "transactionId": transaction_id,
+                        "operationIndex": operation_index,
+                        "replicaId": replica_id,
+                        "operationId": operation_id,
+                        "position": position,
+                        "expected": expected,
+                        "observed": observed,
+                    }
+                )
+    return mismatches
+
+
 def _receipt_chain_audit_locked(
     committed: list[tuple[str, dict[str, Any]]],
     accepted: list[tuple[str, dict[str, Any]]],
@@ -8560,6 +8643,177 @@ class StateStore:
             "verification": verification,
         }
 
+    def get_integrity_verify(self) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Cross-check the transaction ledger and repair-execution history.
+
+        This is the read-only entry point
+        ``GET /v1/integrity/verify``: from one committed snapshot it
+        reads the shared accepted-operation log, the transaction
+        bindings, the repair-execution bindings, and the registered
+        checkpoints together, then reports the two per-stream audit
+        conclusions plus a cross-stream consistency conclusion.
+
+        The ``transactions`` group reports ``algorithm`` (always
+        ``"sha256"``), ``digest`` (the full-history digest of
+        :func:`_transactions_digest_input`, the digest of ``[]`` for an
+        empty history), ``count`` (the full transaction count), and
+        ``anomalies`` — the four internal anomaly lists produced by
+        :func:`_transactions_verification_locked` (duplicate bindings,
+        malformed records, identity-content mismatches against the
+        accepted-operation archive, and in-batch repeats). The
+        ``repairExecutions`` group reports the same three summary fields
+        using :func:`_repair_executions_digest_input` and the five
+        internal anomaly lists produced by
+        :func:`_repair_executions_verification_locked` (duplicate
+        bindings, action ordering, result boundaries, checkpoint
+        violations, and structural damage). Neither group re-runs the
+        external digest/count comparisons: there are no external
+        expectations on this route.
+
+        The ``cross`` group reports only inconsistencies between the two
+        streams and the shared log — never a group's purely internal
+        anomalies:
+
+        - ``transactionLogMismatches``: each well-formed transaction
+          operation whose ``(replicaId, operationId)`` identity is not
+          the exact content of the accepted log at the position the
+          shared commit order assigns it. An identity absent from the
+          accepted log is reported against ``observedPosition`` ``null``;
+          an identity present at a different position is reported with
+          the observed position. ``expected``/``observed`` carry the two
+          sides' identity content
+          (``{"operationId","key","value","clock"}``).
+        - ``checkpointViolations``: the repair group's existing
+          checkpoint-violation markers over the shared log — an
+          execution whose restored cursor precedes the restore starting
+          point (its ``expectedCheckpoint``), runs past the current
+          shared-log length, or names a peer whose registered checkpoint
+          has not confirmed up to it. The marker keeps the 0-based
+          ``executionIndex`` in creation order, the ``peerId``/``ackId``,
+          and ``expected`` (the ``checkpoint`` anchor, the current
+          ``registered`` checkpoint or ``null``, and ``logLength``) with
+          ``observed`` (the restored ``cursor``). The audit emits these
+          only for structurally valid records, so a damaged record is a
+          group ``recordViolation`` and never appears here.
+
+        Both groups are computed, with the cross scan, from a single
+        snapshot taken under the commit lock used by writes, imports,
+        transactions, repairs, and checkpoint/acknowledgement commits, so
+        a concurrent commit is observed only as the whole old or the
+        whole new state. Empty transaction and repair histories are both
+        intact: each reports the empty-array digest, count ``0``, and no
+        anomalies, and the overall and cross conclusions stay ``"ok"``.
+        The query is strictly read-only: it creates no temporary file and
+        changes neither memory nor the data file. With ``--data-file``
+        the same recovered history yields the same digests, counts,
+        conclusions, and anomaly positions after a restart.
+        """
+        with self._lock:
+            transaction_history: list[tuple[str, list[dict[str, Any]]]] = list(
+                self._transactions.items()
+            )
+            repair_history: list[dict[str, Any]] = [
+                {
+                    "peerId": peer_id,
+                    "ackId": ack_id,
+                    "expectedCheckpoint": binding["expectedCheckpoint"],
+                    "expectedReceipts": binding["expectedReceipts"],
+                    "suggestions": copy.deepcopy(binding["suggestions"]),
+                    "results": copy.deepcopy(binding["results"]),
+                    "cursor": binding["cursor"],
+                }
+                for (peer_id, ack_id), binding in self._repairs.items()
+            ]
+            accepted = list(self._accepted)
+            operations_index = dict(self._operations)
+            checkpoints = dict(self._checkpoints)
+
+            transaction_verdict = _transactions_verification_locked(
+                transaction_history, operations_index
+            )
+            transaction_digest = hashlib.sha256(
+                _transactions_digest_input(transaction_history)
+            ).hexdigest()
+
+            repair_verdict = _repair_executions_verification_locked(
+                repair_history, checkpoints, len(accepted)
+            )
+            repair_digest = hashlib.sha256(
+                _repair_executions_digest_input(repair_history)
+            ).hexdigest()
+
+            cross_transaction = _integrity_cross_transaction_mismatches_locked(
+                transaction_history, accepted
+            )
+            # The repair cursor's checkpoint violations are the existing
+            # execution audit's judgement over the *shared* accepted log and
+            # the shared registered-checkpoint map (a cursor below the
+            # restore origin, past the log length, or not yet confirmed by
+            # the peer's checkpoint). The spec keeps that judgement for the
+            # cross stream, and the audit already emits it only for
+            # structurally valid records, so a damaged record is never
+            # repeated here; the repair group's purely internal anomalies
+            # (duplicate bindings, action order, result boundaries, record
+            # damage) stay only in its own group.
+            cross_checkpoint = repair_verdict["checkpointViolations"]
+
+        transactions_broken = any(
+            transaction_verdict[name]
+            for name in (
+                "duplicateTransactionIds",
+                "recordViolations",
+                "identityMismatches",
+                "batchViolations",
+            )
+        )
+        repairs_broken = any(
+            repair_verdict[name]
+            for name in (
+                "duplicateBindings",
+                "outOfOrderActions",
+                "boundaryViolations",
+                "checkpointViolations",
+                "recordViolations",
+            )
+        )
+        cross_broken = bool(cross_transaction or cross_checkpoint)
+        overall_broken = transactions_broken or repairs_broken or cross_broken
+        return HTTPStatus.OK, {
+            "status": "broken" if overall_broken else "ok",
+            "transactions": {
+                "algorithm": "sha256",
+                "digest": transaction_digest,
+                "count": len(transaction_history),
+                "anomalies": {
+                    "duplicateTransactionIds": transaction_verdict[
+                        "duplicateTransactionIds"
+                    ],
+                    "recordViolations": transaction_verdict["recordViolations"],
+                    "identityMismatches": transaction_verdict["identityMismatches"],
+                    "batchViolations": transaction_verdict["batchViolations"],
+                },
+            },
+            "repairExecutions": {
+                "algorithm": "sha256",
+                "digest": repair_digest,
+                "count": len(repair_history),
+                "anomalies": {
+                    "duplicateBindings": repair_verdict["duplicateBindings"],
+                    "outOfOrderActions": repair_verdict["outOfOrderActions"],
+                    "boundaryViolations": repair_verdict["boundaryViolations"],
+                    "checkpointViolations": repair_verdict["checkpointViolations"],
+                    "recordViolations": repair_verdict["recordViolations"],
+                },
+            },
+            "cross": {
+                "status": "broken" if cross_broken else "ok",
+                "anomalies": {
+                    "identityMismatches": cross_transaction,
+                    "checkpointViolations": cross_checkpoint,
+                },
+            },
+        }
+
     def _diagnose_repair_links_locked(
         self,
         suggestions: list[dict[str, Any]],
@@ -9715,6 +9969,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_transactions_verify_get()
             return
         if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "integrity"
+            and segments[2] == "verify"
+        ):
+            self._handle_integrity_verify_get()
+            return
+        if (
             len(segments) == 4
             and segments[0] == "v1"
             and segments[1] == "audit"
@@ -10673,6 +10935,33 @@ class RequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._json_canonical_newline(
                 HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_ordered_newline(status, payload)
+
+    def _handle_integrity_verify_get(self) -> None:
+        # The route-shape check in do_GET already ran (a missing or extra
+        # segment, a trailing slash, a non-GET method, or any unknown route
+        # is 404 there, before any query check), so only the exact path
+        # reaches here. The endpoint accepts no query parameters: any
+        # unknown, repeated, blank-named, or blank-valued parameter is an
+        # invalid request. The success body fixes the field order
+        # (status, transactions, repairExecutions, cross; each group
+        # carrying algorithm/digest/count/anomalies) and follows the
+        # compact-single-line contract: one trailing newline, every count
+        # and position a JSON integer. The query is strictly read-only:
+        # it creates no temporary file and changes no state; an internal
+        # verification failure is a 500 that leaves all state unchanged.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        try:
+            status, payload = self._store.get_integrity_verify()
+        except PersistenceError:
+            self._json_canonical_newline(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
             )
             return
         self._json_ordered_newline(status, payload)
