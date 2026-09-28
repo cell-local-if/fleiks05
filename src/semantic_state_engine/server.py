@@ -850,6 +850,47 @@ def parse_replication_repair_executions_verify_query(
     return after, limit, expected_digest, expected_count
 
 
+def parse_transactions_verify_query(
+    query: str,
+) -> tuple[int, int, str, int] | None:
+    """Validate the transaction-ledger audit-verification query string.
+
+    All four parameters are **required**, each appearing exactly once:
+    the paging parameters ``after`` (a non-negative ASCII decimal
+    integer — the number of committed transactions already skipped,
+    starting at ``0``) and ``limit`` (between 1 and 100), plus the two
+    external expectations ``expectedDigest`` (exactly 64 lowercase
+    hexadecimal characters, the full-ledger SHA-256 the caller expects)
+    and ``expectedCount`` (a non-negative ASCII decimal integer, the
+    full transaction count the caller expects). A missing, repeated,
+    unknown, blank-named, or blank-valued parameter, a sign, decimal
+    point, whitespace, or non-ASCII numeral on the integer parameters,
+    a ``limit`` outside ``1-100``, and a malformed ``expectedDigest``
+    (uppercase, non-hex, or the wrong length all rejected) return None.
+    The bound on ``after`` against the committed transaction count is
+    checked by the store against the committed snapshot (``after``
+    equal to the count is a valid stable empty page).
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if set(parsed) != {"after", "limit", "expectedDigest", "expectedCount"}:
+        return None
+    expected_digest = parsed["expectedDigest"][0]
+    if not _is_sha256_hex64(expected_digest):
+        return None
+    expected_count = _non_negative_int(parsed["expectedCount"][0])
+    if expected_count is None:
+        return None
+    after = _non_negative_int(parsed["after"][0])
+    if after is None:
+        return None
+    limit = _non_negative_int(parsed["limit"][0])
+    if limit is None or not (1 <= limit <= SYNC_BATCH_MAX):
+        return None
+    return after, limit, expected_digest, expected_count
+
+
 def parse_scope_policy_audit_query(query: str) -> tuple[int, int] | None:
     """Validate the scope-policy change-audit query string.
 
@@ -2759,6 +2800,368 @@ def _repair_executions_external_verification_locked(
         "boundaryViolations": verdict["boundaryViolations"],
         "checkpointViolations": verdict["checkpointViolations"],
         "recordViolations": verdict["recordViolations"],
+        "digestMismatches": digest_mismatches,
+        "countMismatches": count_mismatches,
+    }
+
+
+def _transaction_clock_well_formed(clock: Any, replica_id: Any) -> bool:
+    """Return whether a transaction entry carries a legal clock.
+
+    Mirrors :func:`_validate_clock` without raising: a non-empty object
+    whose component names are non-empty strings and whose ticks are
+    non-boolean non-negative integers, and which contains the entry's
+    own (non-empty string) ``replicaId``.
+    """
+    if not isinstance(replica_id, str) or replica_id == "":
+        return False
+    if not isinstance(clock, dict) or not clock:
+        return False
+    for name, tick in clock.items():
+        if not isinstance(name, str) or name == "":
+            return False
+        if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
+            return False
+    return replica_id in clock
+
+
+def _transaction_candidates_well_formed(candidates: Any) -> bool:
+    """Return whether one entry's expected candidate set is well shaped.
+
+    A list (empty allowed) of distinct ``{"replicaId","operationId"}``
+    identities with non-empty string fields — mirrors
+    :func:`_parse_transaction_entries` without raising.
+    """
+    if not isinstance(candidates, list):
+        return False
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or set(candidate.keys()) != {
+            "replicaId",
+            "operationId",
+        }:
+            return False
+        replica_id = candidate["replicaId"]
+        operation_id = candidate["operationId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            return False
+        if not isinstance(operation_id, str) or operation_id == "":
+            return False
+        identity = (replica_id, operation_id)
+        if identity in seen:
+            return False
+        seen.add(identity)
+    return True
+
+
+def _transaction_entry_well_formed(entry: Any) -> bool:
+    """Return whether one stored transaction operation entry is legal.
+
+    Mirrors the shape half of :func:`_parse_transaction_entries`: an
+    object with exactly ``key``, ``replicaId``, ``operationId``,
+    ``value``, ``clock``, and ``candidates``, the four identifier and
+    value fields non-empty strings, a legal clock containing the
+    entry's replica, and a well-formed expected candidate set.
+    """
+    if not isinstance(entry, dict) or set(entry.keys()) != {
+        "key",
+        "replicaId",
+        "operationId",
+        "value",
+        "clock",
+        "candidates",
+    }:
+        return False
+    for field in ("key", "replicaId", "operationId", "value"):
+        value = entry[field]
+        if not isinstance(value, str) or value == "":
+            return False
+    if not _transaction_clock_well_formed(entry["clock"], entry["replicaId"]):
+        return False
+    return _transaction_candidates_well_formed(entry["candidates"])
+
+
+def _transaction_record_well_formed(record: Any) -> bool:
+    """Return whether one stored ``{"transactionId","operations"}`` is legal."""
+    if not isinstance(record, dict) or set(record.keys()) != {
+        "transactionId",
+        "operations",
+    }:
+        return False
+    transaction_id = record["transactionId"]
+    if not isinstance(transaction_id, str) or transaction_id == "":
+        return False
+    operations = record["operations"]
+    if not isinstance(operations, list) or not (
+        TRANSACTION_MIN_OPERATIONS
+        <= len(operations)
+        <= TRANSACTION_MAX_OPERATIONS
+    ):
+        return False
+    return all(_transaction_entry_well_formed(entry) for entry in operations)
+
+
+def _transaction_op_content(entry: dict[str, Any]) -> dict[str, Any]:
+    """Project one ledger entry to its five-field operation content.
+
+    The expected candidate set is a local pre-commit expectation rather
+    than accepted-log content, so the identity comparison and the
+    anomaly markers cover ``key``, ``replicaId``, ``operationId``,
+    ``value``, and ``clock`` only.
+    """
+    return {
+        "key": entry["key"],
+        "replicaId": entry["replicaId"],
+        "operationId": entry["operationId"],
+        "value": entry["value"],
+        "clock": dict(entry["clock"]),
+    }
+
+
+def _transaction_op_digest_json(entry: Any) -> str:
+    """Serialize one transaction operation to its fixed-order digest form.
+
+    The fields keep the committed entry order ``key``, ``replicaId``,
+    ``operationId``, ``value``, ``clock``, ``candidates``; the clock's
+    component names and the candidate identities (each
+    ``{"replicaId","operationId"}`` in that fixed field order) are
+    sorted lexicographically (Unicode code point order).
+    """
+    clock_items = sorted(entry["clock"].items(), key=lambda item: item[0])
+    clock = ",".join(
+        f"{_escape_digest_string(name)}:{tick}" for name, tick in clock_items
+    )
+    candidates = sorted(
+        entry["candidates"],
+        key=lambda candidate: (candidate["replicaId"], candidate["operationId"]),
+    )
+    candidate_jsons: list[str] = []
+    for candidate in candidates:
+        candidate_jsons.append(
+            '{"replicaId":'
+            + _escape_digest_string(candidate["replicaId"])
+            + ',"operationId":'
+            + _escape_digest_string(candidate["operationId"])
+            + "}"
+        )
+    return (
+        '{"key":'
+        + _escape_digest_string(entry["key"])
+        + ',"replicaId":'
+        + _escape_digest_string(entry["replicaId"])
+        + ',"operationId":'
+        + _escape_digest_string(entry["operationId"])
+        + ',"value":'
+        + _escape_digest_string(entry["value"])
+        + ',"clock":{'
+        + clock
+        + '},"candidates":['
+        + ",".join(candidate_jsons)
+        + "]}"
+    )
+
+
+def _transactions_digest_input(records: list[dict[str, Any]]) -> bytes:
+    """Serialize the complete transaction ledger to its digest input.
+
+    The result is a compact UTF-8 JSON array with one element per
+    committed transaction in creation order (the order the bindings
+    first committed, which is also the order they ride in the data
+    file's ``transactions`` section). Each element keeps the fixed
+    field order ``transactionId``, ``operations``; the operations keep
+    their original transaction order, and within each operation the
+    clock component names and the expected candidate identities are
+    sorted lexicographically. No whitespace is emitted anywhere,
+    numbers are plain JSON integers, and strings are escaped exactly
+    as in :func:`_escape_digest_string`. An empty ledger serializes to
+    ``[]``.
+
+    A record that fails :func:`_transaction_record_well_formed` (only
+    reachable by corrupting an in-memory store; recovery and the apply
+    endpoint never admit one) is emitted deterministically from its
+    raw value with the generic compact encoder, so the independently
+    recomputed digest stays well defined while the same damage is
+    independently reported under ``recordViolations``.
+    """
+    parts: list[str] = ["["]
+    for index, record in enumerate(records):
+        if index:
+            parts.append(",")
+        if _transaction_record_well_formed(record):
+            parts.append('{"transactionId":')
+            parts.append(_escape_digest_string(record["transactionId"]))
+            parts.append(',"operations":[')
+            parts.append(
+                ",".join(
+                    _transaction_op_digest_json(entry)
+                    for entry in record["operations"]
+                )
+            )
+            parts.append("]}")
+        else:
+            # Deterministic bytes for a damaged record; the anomaly is
+            # independently reported as a record violation.
+            parts.append(_ordered_json_bytes(record).decode("utf-8"))
+    parts.append("]")
+    return "".join(parts).encode("utf-8")
+
+
+def _transactions_verification_locked(
+    records: list[dict[str, Any]],
+    accepted: list[tuple[str, dict[str, Any]]],
+    expected_digest: str,
+    expected_count: int,
+) -> dict[str, Any]:
+    """Verify the complete transaction ledger in one independent scan.
+
+    ``records`` is the complete creation-order ledger (a snapshot
+    taken under the commit lock) and ``accepted`` the shared
+    accepted-operation log in global commit order. The conclusion
+    always covers the complete ledger, never the current page::
+
+        {"status": "ok" | "broken",
+         "duplicateTransactionIds": [...], "recordViolations": [...],
+         "identityMismatches": [...], "batchViolations": [...],
+         "digestMismatches": [...], "countMismatches": [...]}
+
+    Every internal marker retains the transaction's 0-based
+    ``transactionIndex`` in creation order and its ``transactionId``
+    (``null`` when the damaged record does not carry a string id):
+
+    - ``duplicateTransactionIds``: a later binding claiming a
+      ``transactionId`` an earlier binding already claimed (the
+      repeated occurrence only).
+    - ``recordViolations``: an otherwise malformed stored record (a
+      bad binding shape, a non-string/empty transaction id, an empty
+      or oversized operations list, or an ill-shaped operation entry,
+      clock, or candidate identity).
+    - ``identityMismatches``: an operation entry whose
+      ``(replicaId, operationId)`` names no accepted operation or
+      whose stored content (key/value/clock) differs from the accepted
+      record — the marker additionally carries the 0-based
+      ``operationIndex`` within the transaction and ``expected`` (the
+      accepted log's operation content, or ``null`` when the identity
+      was never accepted) followed by ``observed`` (the ledger
+      entry's operation content).
+    - ``batchViolations``: a transaction whose operations array
+      repeats a key or a ``(replicaId, operationId)`` identity — one
+      marker per offending transaction.
+
+    The two external comparisons follow:
+
+    - ``digestMismatches``: at most one ``{"expected","observed"}``
+      marker, the caller's ``expectedDigest`` first and the SHA-256
+      independently recomputed over the canonical compact JSON array
+      of the whole creation-order ledger second (the digest of ``[]``
+      for an empty ledger);
+    - ``countMismatches``: at most one ``{"expected","observed"}``
+      marker, the caller's ``expectedCount`` first and the actual full
+      ledger length second.
+
+    ``status`` is ``"ok"`` exactly when all six lists are empty. Live
+    bindings are appended one validated transaction at a time under
+    the commit lock, so the conclusion is ``"ok"`` by construction;
+    the scan exists to detect a damaged ledger, and paging never
+    influences it. An empty ledger verifies as ``"ok"`` for the
+    empty-array digest and count ``0``.
+    """
+    duplicate_transaction_ids: list[dict[str, Any]] = []
+    record_violations: list[dict[str, Any]] = []
+    identity_mismatches: list[dict[str, Any]] = []
+    batch_violations: list[dict[str, Any]] = []
+    seen_transaction_ids: set[str] = set()
+
+    # First-accepted content per identity; the accepted log holds each
+    # identity at most once, so the first position is the authority.
+    accepted_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+    for replica_id, operation in accepted:
+        accepted_by_identity.setdefault(
+            (replica_id, operation["operationId"]), operation
+        )
+
+    for transaction_index, record in enumerate(records):
+        transaction_id = (
+            record.get("transactionId") if isinstance(record, dict) else None
+        )
+        marker = {
+            "transactionIndex": transaction_index,
+            "transactionId": transaction_id,
+        }
+        if not _transaction_record_well_formed(record):
+            record_violations.append(dict(marker))
+            continue
+        if transaction_id in seen_transaction_ids:
+            # Only the later occurrence is a duplicate; the first keeps
+            # its claim on the transaction id.
+            duplicate_transaction_ids.append(dict(marker))
+        seen_transaction_ids.add(transaction_id)
+
+        entries = record["operations"]
+        seen_keys: set[str] = set()
+        seen_identities: set[tuple[str, str]] = set()
+        batch_bad = False
+        for operation_index, entry in enumerate(entries):
+            identity = (entry["replicaId"], entry["operationId"])
+            if entry["key"] in seen_keys or identity in seen_identities:
+                batch_bad = True
+            seen_keys.add(entry["key"])
+            seen_identities.add(identity)
+
+            observed = _transaction_op_content(entry)
+            accepted_operation = accepted_by_identity.get(identity)
+            if accepted_operation is None:
+                expected: dict[str, Any] | None = None
+            else:
+                expected = {
+                    "key": accepted_operation["key"],
+                    "replicaId": identity[0],
+                    "operationId": identity[1],
+                    "value": accepted_operation["value"],
+                    "clock": dict(accepted_operation["clock"]),
+                }
+            if expected is None or (
+                expected["key"] != observed["key"]
+                or expected["value"] != observed["value"]
+                or expected["clock"] != observed["clock"]
+            ):
+                identity_mismatches.append(
+                    {
+                        **marker,
+                        "operationIndex": operation_index,
+                        "expected": expected,
+                        "observed": observed,
+                    }
+                )
+        if batch_bad:
+            batch_violations.append(dict(marker))
+
+    observed_digest = hashlib.sha256(
+        _transactions_digest_input(records)
+    ).hexdigest()
+    digest_mismatches: list[dict[str, Any]] = []
+    if observed_digest != expected_digest:
+        digest_mismatches.append(
+            {"expected": expected_digest, "observed": observed_digest}
+        )
+    count_mismatches: list[dict[str, Any]] = []
+    total = len(records)
+    if total != expected_count:
+        count_mismatches.append({"expected": expected_count, "observed": total})
+
+    broken = bool(
+        duplicate_transaction_ids
+        or record_violations
+        or identity_mismatches
+        or batch_violations
+        or digest_mismatches
+        or count_mismatches
+    )
+    return {
+        "status": "broken" if broken else "ok",
+        "duplicateTransactionIds": duplicate_transaction_ids,
+        "recordViolations": record_violations,
+        "identityMismatches": identity_mismatches,
+        "batchViolations": batch_violations,
         "digestMismatches": digest_mismatches,
         "countMismatches": count_mismatches,
     }
@@ -7930,6 +8333,86 @@ class StateStore:
             "verification": verification,
         }
 
+    def get_transactions_verify(
+        self,
+        after: int,
+        limit: int,
+        expected_digest: str,
+        expected_count: int,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one transaction-ledger page plus an external verification.
+
+        This is the read-only audit behind
+        ``GET /v1/transactions/verify``. It pages the committed atomic
+        transaction bindings in creation order — the order the bindings
+        first committed, which ``dict.items`` preserves and which is
+        also the order they ride in the data file's ``transactions``
+        section — and independently verifies the **complete** ledger
+        against the caller's ``expected_digest`` and
+        ``expected_count`` via
+        :func:`_transactions_verification_locked`. An identical replay
+        answered from an existing binding appends no record, so a
+        replayed transaction never moves the page, digest, or count.
+
+        ``after`` is the number of transactions already skipped (a
+        0-based resume cursor) and ``limit`` the page size. The page
+        slice, the resume cursor, the remaining flag, the full-ledger
+        digest, the complete count, and the verification conclusion
+        are all computed against one snapshot under the commit lock,
+        so a concurrent commit is observed only as the whole old or
+        the whole new ledger. Paging trims only the exported
+        ``transactions`` page — the digest, ``transactionsCount``, and
+        the conclusion always cover the whole ledger on every page.
+
+        Returns ``(200, report)`` with exactly seven fields in order:
+        ``transactions`` (the page; each record carries exactly
+        ``transactionId`` and ``operations``, the latter preserving
+        its original transaction order and entry structure, including
+        the normalized expected candidate identities), ``nextCursor``
+        (the number of transactions skipped after this page),
+        ``hasMore``, ``algorithm`` (``"sha256"``), ``digest`` (the
+        64-character lowercase SHA-256 of the canonical compact JSON
+        array over the whole creation-order ledger),
+        ``transactionsCount`` (the full ledger length, never the page
+        length), and ``verification``. An ``after`` equal to the
+        transaction count is a valid stable empty page whose summary
+        and verification still cover the complete ledger; an empty
+        ledger verifies as ``"ok"`` for the digest of ``[]`` and count
+        ``0``. Raises ValueError when ``after`` is past the
+        transaction count of the snapshot. The query is strictly
+        read-only and creates no temporary file. With ``--data-file``
+        the ledger is rebuilt identically during recovery (an old file
+        without the ``transactions`` section recovers as an empty,
+        intact ledger), so the page, digest, count, and conclusion are
+        identical before and after a restart.
+        """
+        with self._lock:
+            history: list[dict[str, Any]] = [
+                {
+                    "transactionId": transaction_id,
+                    "operations": copy.deepcopy(entries),
+                }
+                for transaction_id, entries in self._transactions.items()
+            ]
+            total = len(history)
+            if after > total:
+                raise ValueError("after is past the end of the transaction ledger")
+            digest_input = _transactions_digest_input(history)
+            verification = _transactions_verification_locked(
+                history, self._accepted, expected_digest, expected_count
+            )
+            page = [dict(record) for record in history[after : after + limit]]
+            next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "transactions": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "transactionsCount": total,
+            "verification": verification,
+        }
+
     def _diagnose_repair_links_locked(
         self,
         suggestions: list[dict[str, Any]],
@@ -9077,6 +9560,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_sync_get()
             return
         if (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "transactions"
+            and segments[2] == "verify"
+        ):
+            self._handle_transactions_verify_get()
+            return
+        if (
             len(segments) == 4
             and segments[0] == "v1"
             and segments[1] == "audit"
@@ -9636,6 +10127,41 @@ class RequestHandler(BaseHTTPRequestHandler):
         after, limit, expected_digest, expected_count = params
         try:
             status, payload = self._store.get_replication_repair_executions_verify(
+                after, limit, expected_digest, expected_count
+            )
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_ordered_newline(status, payload)
+
+    def _handle_transactions_verify_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before
+        # any query check), so a malformed query is rejected here without
+        # any state being read or changed. All four parameters are
+        # required: ``after``/``limit`` paging plus the two external
+        # expectations ``expectedDigest`` (exactly 64 lowercase
+        # hexadecimal characters) and ``expectedCount`` (a non-negative
+        # ASCII decimal integer, never signed or decimal); any missing,
+        # repeated, unknown, blank, or malformed value is rejected. The
+        # success body fixes the field order (transactions, nextCursor,
+        # hasMore, algorithm, digest, transactionsCount, verification)
+        # and follows the compact-single-line contract: one trailing
+        # newline, numbers only as JSON integers. The query is strictly
+        # read-only: it records no transaction or operation, changes no
+        # binding, candidate, metric, or data file, and creates no
+        # temporary file.
+        params = parse_transactions_verify_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit, expected_digest, expected_count = params
+        try:
+            status, payload = self._store.get_transactions_verify(
                 after, limit, expected_digest, expected_count
             )
         except ValueError:
