@@ -681,6 +681,36 @@ def parse_integrity_root_query(query: str) -> str | None:
     return expected
 
 
+def parse_audit_proof_query(query: str) -> tuple[int, str] | None:
+    """Validate the per-operation inclusion-proof query string.
+
+    Exactly two parameters are accepted, both required and each appearing
+    exactly once: ``treeSize`` (a non-negative ASCII decimal integer naming
+    the log prefix the proof must be anchored to) and ``root`` (exactly 64
+    lowercase hexadecimal characters, the prefix-tree root the caller
+    expects). A missing, repeated, blank-named, blank-valued, or unknown
+    parameter, a signed, decimal-point, whitespace-bearing, or
+    non-ASCII-decimal ``treeSize``, and an uppercase, non-hex, blank, or
+    wrong-length ``root`` return None so the caller answers HTTP 400
+    ``invalid_request``; ``keep_blank_values`` ensures a bare
+    ``treeSize=``/``root=`` is rejected rather than dropped. The bound on
+    ``treeSize`` against the current log length is checked by the store
+    against the committed snapshot, not here.
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if set(parsed) != {"treeSize", "root"}:
+        return None
+    tree_size = _non_negative_int(parsed["treeSize"][0])
+    if tree_size is None:
+        return None
+    expected_root = parsed["root"][0]
+    if not _is_sha256_hex64(expected_root):
+        return None
+    return tree_size, expected_root
+
+
 def parse_replication_export_query(
     query: str,
 ) -> tuple[int, int, str] | None:
@@ -2570,6 +2600,113 @@ def _audit_chain_link(
         + _audit_record_bytes(replica_id, operation)
     )
     return hashlib.sha256(hash_input).hexdigest()
+
+
+# Offline inclusion-proof prefix tree rules.
+#
+# The prefix tree is a binary SHA-256 Merkle tree over one prefix of the
+# shared accepted-operation log in global commit order. Its rules are fixed
+# so a third party can recompute every value offline from only the returned
+# record's canonical bytes (:func:`_audit_record_bytes`) and the proof:
+#
+# - **Leaves** carry a one-byte ``\\x00`` domain prefix before the record's
+#   canonical bytes, so a leaf can never be confused with an internal node:
+#   ``leafDigest = SHA256(b"\\x00" + recordBytes)`` as 64 lowercase hex.
+# - **Internal nodes** carry a one-byte ``\\x01`` domain prefix followed by
+#   the two children's raw 32 digest bytes in left-to-right order:
+#   ``nodeDigest = SHA256(b"\\x01" + left32 + right32)``.
+# - Levels pair nodes left-to-right; a lone node on an odd-length level is
+#   **promoted unchanged** to the next level (it is not rehashed). The
+#   promotion therefore emits no sibling and no proof item.
+# - The root of an empty prefix is ``SHA256(b"")`` — the hash of no leaves —
+#   which neither prefixed leaf nor prefixed node input can equal.
+#
+# Inclusion proof items run leaf-to-root and appear only for levels where the
+# tracked node actually has a sibling (promotion levels contribute none).
+# Each item carries ``side`` (``"left"`` when the sibling is the tracked
+# node's left neighbour — combine ``SHA256(b"\\x01" + sibling32 + running32)``
+# — or ``"right"`` for the reverse order), ``digest`` (the sibling's 64
+# lowercase hex digest), and ``position`` (the sibling node's 0-based
+# position counted from the left within that level). Sides, positions, and
+# the item count are uniquely determined by the leaf's 0-based index and the
+# prefix size, so an offline verifier reconstructs the expected structure
+# itself and never has to trust the proof's layout.
+_AUDIT_TREE_LEAF_PREFIX = b"\x00"
+_AUDIT_TREE_NODE_PREFIX = b"\x01"
+_AUDIT_TREE_EMPTY_ROOT = hashlib.sha256(b"").hexdigest()
+
+
+def _audit_tree_leaf_digest(record_bytes: bytes) -> str:
+    """Return one prefix-tree leaf digest for a record's canonical bytes."""
+    return hashlib.sha256(_AUDIT_TREE_LEAF_PREFIX + record_bytes).hexdigest()
+
+
+def _audit_tree_node_digest(left_digest: str, right_digest: str) -> str:
+    """Combine two level neighbours into one internal-node digest."""
+    return hashlib.sha256(
+        _AUDIT_TREE_NODE_PREFIX
+        + bytes.fromhex(left_digest)
+        + bytes.fromhex(right_digest)
+    ).hexdigest()
+
+
+def _audit_tree_parent_level(level: list[str]) -> list[str]:
+    """Fold one tree level into the next, promoting a lone odd node."""
+    parents: list[str] = []
+    for index in range(0, len(level), 2):
+        if index + 1 < len(level):
+            parents.append(_audit_tree_node_digest(level[index], level[index + 1]))
+        else:
+            # Odd leaf (or odd subtree) at this level: promote unchanged.
+            parents.append(level[index])
+    return parents
+
+
+def _audit_tree_root(leaves: list[str]) -> str:
+    """Return the prefix-tree root over the leaf digests, bottom-up."""
+    if not leaves:
+        return _AUDIT_TREE_EMPTY_ROOT
+    level = leaves
+    while len(level) > 1:
+        level = _audit_tree_parent_level(level)
+    return level[0]
+
+
+def _audit_tree_inclusion_proof(
+    leaves: list[str], leaf_index: int
+) -> list[dict[str, Any]]:
+    """Build the leaf-to-root inclusion proof for ``leaf_index``.
+
+    Emits one item per level where the tracked node has a sibling; levels
+    where the tracked node is a lone odd node promoted to the next level
+    emit nothing. Each item is ``{"side", "digest", "position"}`` with
+    ``position`` the sibling's 0-based index within that level.
+    """
+    proof: list[dict[str, Any]] = []
+    level = list(leaves)
+    index = leaf_index
+    while len(level) > 1:
+        if index % 2 == 1:
+            proof.append(
+                {
+                    "side": "left",
+                    "digest": level[index - 1],
+                    "position": index - 1,
+                }
+            )
+        elif index + 1 < len(level):
+            proof.append(
+                {
+                    "side": "right",
+                    "digest": level[index + 1],
+                    "position": index + 1,
+                }
+            )
+        # A trailing even index with no right neighbour is promoted and
+        # contributes no proof item at this level.
+        level = _audit_tree_parent_level(level)
+        index //= 2
+    return proof
 
 
 def _audit_log_verification_locked(
@@ -6939,6 +7076,150 @@ class StateStore:
             "verification": verification,
         }
 
+    @staticmethod
+    def _audit_chain_head_locked(
+        accepted: list[tuple[str, dict[str, Any]]],
+    ) -> str:
+        """Recompute the audit-chain tail digest over one committed log slice.
+
+        Walks the slice with the same genesis, sequence numbering (1-based
+        over the whole shared log), and link rule as
+        :meth:`get_audit_log_chain`; an empty slice yields the 64-``"0"``
+        genesis. The slice must always be a log prefix (``accepted[:n]``),
+        so its link numbering matches the complete chain's numbering.
+        """
+        previous = _AUDIT_CHAIN_GENESIS
+        for index, (replica_id, operation) in enumerate(accepted):
+            previous = _audit_chain_link(
+                previous, index + 1, replica_id, operation
+            )
+        return previous
+
+    def get_audit_proofs_root(self) -> dict[str, Any]:
+        """Return the current log prefix's offline-inclusion root summary.
+
+        This is the read-only entry point ``GET /v1/audit/proofs/root``: in
+        one committed snapshot it summarizes the whole current accepted-log
+        prefix under the stable SHA-256 prefix tree used by the offline
+        inclusion proofs. It returns exactly ``algorithm`` (``"sha256"``),
+        ``treeSize`` (the current log length), ``root`` (the prefix-tree
+        root over every record in commit order), and ``auditHead`` (the
+        global audit-chain tail over the same prefix — 64 ``"0"``
+        characters for an empty log).
+
+        The tree and the chain tail are computed from the same records under
+        the commit lock, so they always describe one commit even while
+        commits are in flight. Appending to the log never changes an older
+        (smaller) ``treeSize`` prefix's root or proofs — those cover only the
+        prefix records. The query mutates neither memory nor the data file
+        and creates no temporary file. With ``--data-file`` the log is
+        rebuilt identically during recovery, so the same history yields the
+        same ``treeSize``, ``root``, and ``auditHead`` after a restart.
+        """
+        with self._lock:
+            accepted = list(self._accepted)
+            leaves = [
+                _audit_tree_leaf_digest(_audit_record_bytes(replica_id, operation))
+                for replica_id, operation in accepted
+            ]
+            root = _audit_tree_root(leaves)
+            audit_head = self._audit_chain_head_locked(accepted)
+            tree_size = len(accepted)
+        return {
+            "algorithm": "sha256",
+            "treeSize": tree_size,
+            "root": root,
+            "auditHead": audit_head,
+        }
+
+    def get_operation_proof(
+        self,
+        replica_id: str,
+        operation_id: str,
+        tree_size: int,
+        expected_root: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one record's offline inclusion proof for a log prefix.
+
+        This is the read-only entry point
+        ``GET /v1/replicas/{replicaId}/operations/{operationId}/proof``. The
+        prefix is the first ``tree_size`` records of the shared accepted log
+        (``tree_size`` from 0 through the current log length). Everything is
+        computed from one snapshot under the commit lock, so ``record``,
+        ``sequence``, ``treeSize``, ``root``, ``auditHead``, ``leafDigest``,
+        and ``proof`` always describe a single commit — never half a batch.
+
+        ``record`` is the existing archive record
+        (``{"replicaId","operation"}`` with the operation's four committed
+        fields), ``sequence`` its global 1-based position, ``leafDigest``
+        the prefix-tree leaf digest of its canonical bytes, and ``proof``
+        the leaf-to-root inclusion items (``{"side","digest","position"}``)
+        produced by :func:`_audit_tree_inclusion_proof`. ``root`` and
+        ``auditHead`` summarize the prefix exactly as
+        :meth:`get_audit_proofs_root` would at ``tree_size``.
+
+        Returns ``(404, {"error": "not_found"})`` for an identity that was
+        never first-accepted or whose record lies outside the requested
+        prefix (its sequence is greater than ``tree_size``), and
+        ``(409, {"error": "proof_conflict"})`` when the recomputed prefix
+        root does not equal ``expected_root``. Raises ValueError when
+        ``tree_size`` is past the snapshot's log length; the caller maps
+        that to HTTP 400. The query is strictly read-only and creates no
+        temporary file. With ``--data-file`` the log rebuilds identically,
+        so the same prefix yields the same proof, root, and audit head after
+        a restart.
+        """
+        with self._lock:
+            total = len(self._accepted)
+            if tree_size > total:
+                raise ValueError("treeSize is past the current log length")
+            prefix = list(self._accepted[:tree_size])
+
+            leaf_index: int | None = None
+            for index, (record_replica, record_operation) in enumerate(
+                self._accepted
+            ):
+                if (
+                    record_replica == replica_id
+                    and record_operation["operationId"] == operation_id
+                ):
+                    leaf_index = index
+                    break
+            if leaf_index is None or leaf_index >= tree_size:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+
+            leaves = [
+                _audit_tree_leaf_digest(_audit_record_bytes(record_replica, operation))
+                for record_replica, operation in prefix
+            ]
+            root = _audit_tree_root(leaves)
+            if root != expected_root:
+                return HTTPStatus.CONFLICT, {"error": "proof_conflict"}
+
+            audit_head = self._audit_chain_head_locked(prefix)
+            record_replica, record_operation = prefix[leaf_index]
+            record = {
+                "replicaId": record_replica,
+                "operation": {
+                    "operationId": record_operation["operationId"],
+                    "key": record_operation["key"],
+                    "value": record_operation["value"],
+                    "clock": dict(record_operation["clock"]),
+                },
+            }
+            leaf_digest = leaves[leaf_index]
+            proof = _audit_tree_inclusion_proof(leaves, leaf_index)
+            sequence = leaf_index + 1
+        return HTTPStatus.OK, {
+            "record": record,
+            "sequence": sequence,
+            "treeSize": tree_size,
+            "root": root,
+            "auditHead": audit_head,
+            "leafDigest": leaf_digest,
+            "proof": proof,
+        }
+
     def import_operations(
         self, records: list[tuple[str, dict[str, Any]]]
     ) -> tuple[HTTPStatus, int, int]:
@@ -10448,6 +10729,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_audit_log_verify_get()
             return
         if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "audit"
+            and segments[2] == "proofs"
+            and segments[3] == "root"
+        ):
+            self._handle_audit_proofs_root_get()
+            return
+        if (
             len(segments) == 5
             and segments[0] == "v1"
             and segments[1] == "audit"
@@ -10472,6 +10762,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[3] == "operations"
         ):
             self._handle_operation_archive_get(segments[2], segments[4])
+            return
+        if (
+            len(segments) == 6
+            and segments[0] == "v1"
+            and segments[1] == "replicas"
+            and segments[3] == "operations"
+            and segments[5] == "proof"
+        ):
+            self._handle_operation_proof_get(segments[2], segments[4])
             return
         if (
             len(segments) == 3
@@ -11503,6 +11802,61 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         status, payload = self._store.get_operation(replica_id, operation_id)
         self._json(status, payload)
+
+    def _handle_audit_proofs_root_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing, empty, or
+        # extra segments — including a trailing slash — are 404 there,
+        # before any query check), so a malformed query is rejected here
+        # without any state being read or changed. The endpoint accepts no
+        # query parameters: any parameter — repeated, blank-named, or
+        # blank-valued — is 400 invalid_request. The success body fixes the
+        # field order (algorithm, treeSize, root, auditHead) and follows the
+        # compact-single-line contract: ordered UTF-8 JSON, one trailing
+        # newline, the size a JSON integer. The summary reads one committed
+        # snapshot and is strictly read-only: it creates no temporary file
+        # and changes neither memory nor the data file.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_ordered_newline(
+            HTTPStatus.OK, self._store.get_audit_proofs_root()
+        )
+
+    def _handle_operation_proof_get(
+        self, replica_id: str, operation_id: str
+    ) -> None:
+        # The route-shape check in do_GET already ran (missing, empty, or
+        # extra segments — including a trailing slash — are 404 there,
+        # before any query check), so a malformed query is rejected here
+        # without any state being read or changed. Exactly two parameters
+        # are accepted, both required and appearing once: ``treeSize`` (a
+        # non-negative ASCII decimal integer prefix length) and ``root``
+        # (exactly 64 lowercase hex chars). A missing, repeated, unknown,
+        # blank, or malformed value is 400 invalid_request. The store then
+        # answers 404 not_found for an unknown identity or one outside the
+        # prefix, 400 for a treeSize past the current log length, and 409
+        # proof_conflict when the recomputed prefix root disagrees. The
+        # success body fixes the field order and is one newline-terminated
+        # ordered JSON line computed from a single committed snapshot.
+        params = parse_audit_proof_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        tree_size, expected_root = params
+        try:
+            status, payload = self._store.get_operation_proof(
+                replica_id, operation_id, tree_size, expected_root
+            )
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        self._json_ordered_newline(status, payload)
 
     def _handle_causal_get(self, replica_id: str, operation_id: str) -> None:
         # The route-shape check in do_GET already ran (missing, empty, or

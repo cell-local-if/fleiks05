@@ -711,6 +711,50 @@ Paging trims only the `entries` page: the `head`, the count comparison, and the 
 
 The page, the expectation comparison, and the verification conclusion are computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoint commits, so they always describe a single commit even while commits are in flight. The request is strictly read-only — it changes no candidates, operation logs, checkpoints, receipts, transactions, policy audits, metrics, or data files, and creates no temporary file. With `--data-file`, the log is rebuilt identically during recovery, so the same recovery history yields the same page, head, count comparison, and verification before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing, duplicated, malformed, or mismatched `Authorization` header is HTTP 401 with a `Bearer` challenge; in scope-policy mode an authenticated token lacking the read scope is HTTP 403 without a challenge; and `/health` stays anonymous.
 
+### Offline log-prefix inclusion root
+
+`GET /v1/audit/proofs/root` returns a read-only summary of the **current log prefix** under a stable SHA-256 prefix tree, so an external party can later prove that a single record belongs to that prefix. It takes no query parameters. A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly four fields in this order:
+
+```json
+{"algorithm":"sha256","treeSize":N,"root":"<64 lowercase hex chars>","auditHead":"<64 lowercase hex chars>"}
+```
+
+- `algorithm`: the hash algorithm, always `"sha256"`.
+- `treeSize`: the current log length — the number of records in the summarized prefix.
+- `root`: the prefix-tree root over every accepted record in global commit order (see the tree rules below). For an empty log it is `SHA256` of the empty byte string.
+- `auditHead`: the global audit-chain tail (`head`) over exactly the same prefix — the value `GET /v1/audit/log/chain` reports for that prefix, or 64 `0` characters for an empty log.
+
+The prefix-tree rules are fixed so a third party recomputes every value offline from a record's canonical bytes (the same record encoding the per-key audit digest and global audit chain use):
+
+- **Leaf**: `leafDigest = SHA256(0x00 || recordBytes)` — a one-byte `0x00` domain prefix followed by the record's canonical bytes, encoded as 64 lowercase hex characters.
+- **Internal node**: `nodeDigest = SHA256(0x01 || left32 || right32)` — a one-byte `0x01` domain prefix followed by the two children's raw 32-byte digests in left-to-right order.
+- **Odd promotion**: levels pair nodes left-to-right; a lone node on an odd-length level is promoted to the next level unchanged (it is not rehashed and contributes no sibling).
+
+The summary is computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoints, so `treeSize`, `root`, and `auditHead` always describe a single commit. Appending to the log never changes an older (smaller) prefix's `root` or its proofs — those cover only the prefix records. The request is strictly read-only and creates no temporary file. Any query parameter — including a repeated, blank-named, or blank-valued one — returns HTTP 400 with `{"error":"invalid_request"}`. A missing or extra path segment (for example `/v1/audit/proofs`, `/v1/audit/proofs/root/extra`, or a trailing slash) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query check. With `--data-file` the log rebuilds identically during recovery, so the same history yields the same `treeSize`, `root`, and `auditHead` after a restart; the endpoint authenticates like every other non-`/health` route.
+
+### Per-operation offline inclusion proof
+
+`GET /v1/replicas/{replicaId}/operations/{operationId}/proof?treeSize=N&root=H` returns one record's **offline inclusion proof** for a log prefix. Both path segments are percent-decoded like every other route, and the two query parameters are required, each appearing exactly once:
+
+- `treeSize`: a non-negative ASCII decimal integer selecting the prefix — the first `treeSize` records of the shared accepted log, from `0` through the current log length. Signs, decimals, whitespace, and non-ASCII numerals are rejected; a `treeSize` past the current log length returns HTTP 400 with `{"error":"invalid_request"}`.
+- `root`: exactly 64 lowercase hexadecimal characters — the prefix-tree root the caller expects for that `treeSize` (normally obtained from `GET /v1/audit/proofs/root` or a previously pinned prefix). Uppercase, non-hex, blank, or wrong-length values are rejected.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly seven fields in this order:
+
+```json
+{"record":{"replicaId":R,"operation":{...}},"sequence":S,"treeSize":N,"root":"<64 hex>","auditHead":"<64 hex>","leafDigest":"<64 hex>","proof":[{"side":"left","digest":"<64 hex>","position":P}]}
+```
+
+- `record`: the existing per-operation archive record — `{"replicaId","operation"}` with the operation's exactly four committed fields (`operationId`, `key`, `value`, `clock`).
+- `sequence`: the record's global 1-based position in the log.
+- `treeSize`, `root`, `auditHead`: the prefix length actually used and that prefix's tree root and audit-chain tail, identical to the summary endpoint computed at `treeSize`.
+- `leafDigest`: the record's tree-leaf digest, `SHA256(0x00 || recordBytes)`.
+- `proof`: the inclusion items running **leaf-to-root**, one item per level where the tracked node has a sibling (odd-promotion levels contribute none). Each item has exactly `side` (`"left"` when the sibling is the running node's left neighbour — combine as `SHA256(0x01 || sibling32 || running32)`; `"right"` for the reverse order), `digest` (the sibling's 64-character lowercase hex digest), and `position` (the sibling node's 0-based index from the left within that level). Sides and positions are uniquely determined by the leaf index and prefix size, so an offline verifier need not trust them.
+
+A verifier recomputes the root entirely offline: take `SHA256(0x00 || canonicalRecordBytes)` and confirm it equals `leafDigest`, then for each proof item combine the running digest with `digest` in the stated order using `SHA256(0x01 || left32 || right32)`; the final running digest must equal `root`, and `auditHead` pins the same prefix on the existing audit chain. All seven fields come from one snapshot under the commit lock, so they never mix two batches.
+
+Status codes: a missing, repeated, unknown, blank, or malformed parameter (a non-decimal or out-of-range `treeSize`, or a non-64-lowercase-hex `root`) returns HTTP 400 with `{"error":"invalid_request"}`. An identity that was never first-accepted, or whose record lies outside the requested prefix (`sequence > treeSize`), returns HTTP 404 with `{"error":"not_found"}` (decided before the root comparison). When the record is in the prefix but the recomputed prefix root does not equal the supplied `root`, the endpoint returns HTTP 409 with `{"error":"proof_conflict"}`. A missing, empty, or extra path segment (for example `/v1/replicas//operations/{operationId}/proof`, `/v1/replicas/{replicaId}/operations/{operationId}/proof/extra`, or a trailing slash) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query check. The request is strictly read-only and creates no temporary file. With `--data-file` the same log prefix yields the same `sequence`, `treeSize`, `root`, `auditHead`, `leafDigest`, and `proof` after a restart; the endpoint authenticates like every other non-`/health` route.
+
 ### Per-operation archive query
 
 `GET /v1/replicas/{replicaId}/operations/{operationId}` locates one **first-accepted operation** by its `(replicaId, operationId)` identity. Both path segments are percent-decoded like every other route and must be non-empty after decoding.
