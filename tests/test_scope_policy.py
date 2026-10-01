@@ -625,6 +625,7 @@ class ScopePolicyPersistenceTests(unittest.TestCase):
                 "acks",
                 "repairExecutions",
                 "policyEvents",
+                "compensations",
             },
         )
         for configured_token in POLICY:

@@ -476,6 +476,7 @@ class AuthPersistenceTests(unittest.TestCase):
                 "acks",
                 "repairExecutions",
                 "policyEvents",
+                "compensations",
             },
         )
         self.assertNotIn(TOKEN, json.dumps(document))
