@@ -459,6 +459,114 @@ SYNC_BATCH_MAX = 100
 SYNC_DEFAULT_LIMIT = 100
 
 
+COMPENSATION_MIN_OPERATIONS = 1
+COMPENSATION_MAX_OPERATIONS = 100
+
+
+def _parse_compensation_entries(entries_raw: Any) -> list[dict[str, Any]]:
+    """Validate the compensation-operation entries of a compensate body.
+
+    Each entry must contain exactly ``key``, ``replicaId``,
+    ``operationId``, ``value``, and ``clock`` — the five fields the
+    read-only compensation plan names for each compensating write, with
+    no candidate set — following the live write constraints. No two
+    entries may name the same key or the same
+    ``(replicaId, operationId)`` identity. The normalized entries keep
+    request order; raises ValueError on any violation.
+    """
+    if not isinstance(entries_raw, list) or not (
+        COMPENSATION_MIN_OPERATIONS <= len(entries_raw) <= COMPENSATION_MAX_OPERATIONS
+    ):
+        raise ValueError("operations must be a list of 1-100 entries")
+
+    entries: list[dict[str, Any]] = []
+    keys: set[str] = set()
+    identities: set[tuple[str, str]] = set()
+    for entry in entries_raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {
+            "key",
+            "replicaId",
+            "operationId",
+            "value",
+            "clock",
+        }:
+            raise ValueError(
+                "each operation must have only key, replicaId, operationId, value, clock"
+            )
+        key = entry["key"]
+        if not isinstance(key, str) or key == "":
+            raise ValueError("key must be a non-empty string")
+        replica_id = entry["replicaId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise ValueError("replicaId must be a non-empty string")
+        operation_id = entry["operationId"]
+        if not isinstance(operation_id, str) or operation_id == "":
+            raise ValueError("operationId must be a non-empty string")
+        value = entry["value"]
+        if not isinstance(value, str) or value == "":
+            raise ValueError("value must be a non-empty string")
+        clock = _validate_clock(entry.get("clock"), replica_id)
+
+        if key in keys:
+            raise ValueError(f"duplicate key {key!r} in compensation")
+        identity = (replica_id, operation_id)
+        if identity in identities:
+            raise ValueError(f"duplicate identity {identity!r} in compensation")
+        keys.add(key)
+        identities.add(identity)
+        entries.append(
+            {
+                "key": key,
+                "replicaId": replica_id,
+                "operationId": operation_id,
+                "value": value,
+                "clock": clock,
+            }
+        )
+    return entries
+
+
+def parse_compensate_payload(raw: bytes | str | dict[str, Any]) -> tuple[str, str, list[dict[str, Any]]]:
+    """Parse and validate a transaction-compensation commit body.
+
+    The body must be a JSON object with exactly ``compensationId`` (a
+    non-empty string), ``expectedPlanDigest`` (exactly 64 lowercase
+    hexadecimal characters — the digest of the plan the operations were
+    copied from), and ``operations`` (1-100 entries, see
+    :func:`_parse_compensation_entries`). Returns the compensation id,
+    the expected plan digest, and the normalized entries in request
+    order. Raises ValueError on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            document: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        document = raw
+    if not isinstance(document, dict) or set(document.keys()) != {
+        "compensationId",
+        "expectedPlanDigest",
+        "operations",
+    }:
+        raise ValueError(
+            "body must be an object with only compensationId, expectedPlanDigest, operations"
+        )
+    compensation_id = document["compensationId"]
+    if not isinstance(compensation_id, str) or compensation_id == "":
+        raise ValueError("compensationId must be a non-empty string")
+    expected_digest = document["expectedPlanDigest"]
+    if not _is_sha256_hex64(expected_digest):
+        raise ValueError("expectedPlanDigest must be 64 lowercase hex characters")
+    entries = _parse_compensation_entries(document["operations"])
+    return compensation_id, expected_digest, entries
+
+
 def parse_sync_batch(raw: bytes | str | dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """Parse and validate a sync-import batch.
 
@@ -2320,6 +2428,168 @@ def _transactions_digest_input(
         parts.append("}")
     parts.append("]")
     return "".join(parts).encode("utf-8")
+
+
+def _compensation_candidate_json(candidate: dict[str, Any]) -> str:
+    """Serialize one candidate of a compensation plan key item.
+
+    The candidate carries exactly ``value``, ``clock``, ``replicaId``,
+    and ``operationId`` with the clock's components sorted
+    lexicographically. The field order matches
+    :func:`_verification_digest_input`.
+    """
+    clock = ",".join(
+        f"{_escape_digest_string(name)}:{tick}"
+        for name, tick in sorted(candidate["clock"].items())
+    )
+    return (
+        "{"
+        f'"value":{_escape_digest_string(candidate["value"])},'
+        f'"clock":{{{clock}}},'
+        f'"replicaId":{_escape_digest_string(candidate["replicaId"])},'
+        f'"operationId":{_escape_digest_string(candidate["operationId"])}'
+        "}"
+    )
+
+
+def _compensation_candidates_json(candidates: list[dict[str, Any]]) -> str:
+    """Serialize one candidate list of a compensation plan key item.
+
+    The list keeps the plan's (identity-sorted) order; each candidate
+    carries exactly ``value``, ``clock``, ``replicaId``, and
+    ``operationId`` with the clock's components sorted
+    lexicographically. The field order matches
+    :func:`_verification_digest_input`.
+    """
+    return "[" + ",".join(_compensation_candidate_json(c) for c in candidates) + "]"
+
+
+def _compensation_operation_json(entry: dict[str, Any] | None) -> str:
+    """Serialize one planned compensation operation to the digest input.
+
+    The operation carries exactly ``key``, ``replicaId``,
+    ``operationId``, ``value``, and ``clock`` (clock components sorted
+    lexicographically) — the five fields the client copies into the
+    commit body — so the expected digest binds every committed field.
+    A key with no unique before-transaction candidate has no
+    deterministically restorable value, so its slot serializes to
+    ``null`` and the plan is blocked.
+    """
+    if entry is None:
+        return "null"
+    clock = ",".join(
+        f"{_escape_digest_string(name)}:{tick}"
+        for name, tick in sorted(entry["clock"].items())
+    )
+    return (
+        "{"
+        f'"key":{_escape_digest_string(entry["key"])},'
+        f'"replicaId":{_escape_digest_string(entry["replicaId"])},'
+        f'"operationId":{_escape_digest_string(entry["operationId"])},'
+        f'"value":{_escape_digest_string(entry["value"])},'
+        f'"clock":{{{clock}}}'
+        "}"
+    )
+
+
+def _compensation_descendants_json(descendants: list[dict[str, Any]]) -> str:
+    """Serialize the blocking-descendant list to the digest input.
+
+    Each descendant carries exactly ``key``, ``replicaId``,
+    ``operationId``, and ``clock`` (clock components sorted), keeping
+    the shared log's global commit order.
+    """
+    parts: list[str] = ["["]
+    for index, descendant in enumerate(descendants):
+        if index:
+            parts.append(",")
+        clock = ",".join(
+            f"{_escape_digest_string(name)}:{tick}"
+            for name, tick in sorted(descendant["clock"].items())
+        )
+        parts.append(
+            "{"
+            f'"key":{_escape_digest_string(descendant["key"])},'
+            f'"replicaId":{_escape_digest_string(descendant["replicaId"])},'
+            f'"operationId":{_escape_digest_string(descendant["operationId"])},'
+            f'"clock":{{{clock}}}'
+            "}"
+        )
+    parts.append("]")
+    return "".join(parts)
+
+
+def _compensation_plan_digest_input(
+    transaction_id: str,
+    key_items: list[dict[str, Any]],
+    descendants: list[dict[str, Any]],
+) -> bytes:
+    """Serialize a compensation plan to its canonical digest input.
+
+    The result is a compact UTF-8 JSON object with its fields in the
+    fixed order ``transactionId``, ``keys`` (one entry per
+    transaction-affected key in transaction operation order), and
+    ``descendants``. Each key entry carries ``key``,
+    ``beforeCandidates`` (the candidates the key held just before the
+    transaction's own operation record), ``currentCandidates`` (the
+    candidates it holds now), and ``operation`` (the compensation
+    operation that would restore the unique before-transaction value,
+    or null when no such unique candidate exists). Candidate and
+    operation clocks are normalized lexicographically. The derived
+    ``conclusion`` string is deliberately excluded (it follows
+    deterministically from the evidence), but the blocking
+    ``descendants`` are covered, so the digest changes exactly when the
+    evidence or a causal successor does: a client presenting an older
+    digest after a descendant appeared is rejected as a stale plan.
+    An unaffected plan (an unknown transaction) never reaches this
+    function.
+    """
+    parts: list[str] = [
+        '{"transactionId":',
+        _escape_digest_string(transaction_id),
+        ',"keys":[',
+    ]
+    for index, item in enumerate(key_items):
+        if index:
+            parts.append(",")
+        parts.append(
+            "{"
+            f'"key":{_escape_digest_string(item["key"])},'
+            f'"beforeCandidates":{_compensation_candidates_json(item["beforeCandidates"])},'
+            f'"currentCandidates":{_compensation_candidates_json(item["currentCandidates"])},'
+            f'"operation":{_compensation_operation_json(item["operation"])}'
+            "}"
+        )
+    parts.append('],"descendants":')
+    parts.append(_compensation_descendants_json(descendants))
+    parts.append("}")
+    return "".join(parts).encode("utf-8")
+
+
+def _compensation_clock(
+    before_clock: dict[str, int], tx_entry: dict[str, Any]
+) -> dict[str, int]:
+    """Build the compensation operation clock for one key.
+
+    The clock is the componentwise maximum of the unique
+    before-transaction candidate clock and the transaction operation
+    clock, with the transaction operation's own replica component
+    advanced one tick past the transaction clock. Because the
+    transaction clock dominates the before clock at commit time, the
+    max initially equals the transaction clock; the advance then makes
+    the compensation clock strictly dominate the transaction operation
+    clock on that replica's component (with every other component
+    equal), satisfying the domination requirement without depending on
+    clocks the key never saw.
+    """
+    tx_clock = tx_entry["clock"]
+    tx_replica = tx_entry["replicaId"]
+    clock: dict[str, int] = {
+        component: max(before_clock.get(component, 0), tx_clock.get(component, 0))
+        for component in set(before_clock) | set(tx_clock)
+    }
+    clock[tx_replica] = tx_clock.get(tx_replica, 0) + 1
+    return clock
 
 
 def _is_well_formed_transaction_record(
@@ -4740,6 +5010,89 @@ def _validate_stored_policy_events(document: Any) -> list[dict[str, Any]]:
     return events
 
 
+def _validate_stored_compensations(
+    document: Any,
+    identities: set[tuple[str, str]],
+    transactions: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    """Validate the optional ``compensations`` section of a data file.
+
+    Returns a clean ``{compensationId: binding}`` mapping. The section
+    is optional (a version:1 file written before compensations existed
+    simply has none); when present it must be a list of
+    ``{"compensationId", "transactionId", "expectedPlanDigest",
+    "operations", "status"}`` records with a non-empty distinct
+    compensation id each, the transaction id naming a committed
+    transaction, the expected plan digest being 64 lowercase
+    hexadecimal characters, the entries satisfying the live
+    compensation constraints with every entry identity naming an
+    accepted operation (a compensation binding is committed atomically
+    together with its operations), and the status being
+    ``"committed"``.
+    """
+    if "compensations" not in document:
+        return {}
+    raw = document["compensations"]
+    if not isinstance(raw, list):
+        raise PersistenceError("data file compensations must be a list")
+    compensations: dict[str, dict[str, Any]] = {}
+    for record in raw:
+        if not isinstance(record, dict) or set(record.keys()) != {
+            "compensationId",
+            "transactionId",
+            "expectedPlanDigest",
+            "operations",
+            "status",
+        }:
+            raise PersistenceError(
+                "each compensation record must be an object with compensationId, "
+                "transactionId, expectedPlanDigest, operations, status"
+            )
+        compensation_id = record["compensationId"]
+        transaction_id = record["transactionId"]
+        if not isinstance(compensation_id, str) or compensation_id == "":
+            raise PersistenceError("compensation id must be a non-empty string")
+        if compensation_id in compensations:
+            raise PersistenceError(
+                f"duplicate compensation {compensation_id!r} in data file"
+            )
+        if not isinstance(transaction_id, str) or transaction_id == "":
+            raise PersistenceError("compensation transactionId must be a non-empty string")
+        if transaction_id not in transactions:
+            raise PersistenceError(
+                f"compensation {compensation_id!r} names no committed transaction "
+                f"{transaction_id!r}"
+            )
+        expected_digest = record["expectedPlanDigest"]
+        if not _is_sha256_hex64(expected_digest):
+            raise PersistenceError(
+                "compensation expectedPlanDigest must be 64 lowercase hex characters"
+            )
+        try:
+            entries = _parse_compensation_entries(record["operations"])
+        except ValueError as exc:
+            raise PersistenceError(
+                f"stored compensation violates input constraints: {exc}"
+            ) from exc
+        for entry in entries:
+            identity = (entry["replicaId"], entry["operationId"])
+            if identity not in identities:
+                raise PersistenceError(
+                    f"compensation {compensation_id!r} names no accepted operation "
+                    f"for identity {identity!r}"
+                )
+        status = record["status"]
+        if status != "committed":
+            raise PersistenceError(f"unknown compensation status {status!r}")
+        compensations[compensation_id] = {
+            "transactionId": transaction_id,
+            "expectedPlanDigest": expected_digest,
+            "operations": entries,
+            "status": status,
+        }
+    return compensations
+
+
 def _load_data_file_complete(
     path: str,
 ) -> tuple[
@@ -4750,6 +5103,7 @@ def _load_data_file_complete(
     dict[tuple[str, str], dict[str, Any]],
     dict[tuple[str, str], dict[str, Any]],
     list[dict[str, Any]],
+    dict[str, dict[str, Any]],
 ]:
     """Read and strictly validate a data file, returning every section.
 
@@ -4759,13 +5113,14 @@ def _load_data_file_complete(
     bindings, the persisted ``{transactionId: entries}`` transaction
     bindings, the persisted ``{(peerId, ackId): receipt}`` consumption
     receipts, the persisted ``{(peerId, ackId): repair-binding}``
-    conditional replication-repair executions, and the persisted
-    scope-policy change events (each empty for a version:1 file written
-    before that section existed). Raises PersistenceError when the file
-    is missing-readable, not UTF-8 JSON, has an unexpected structure, or
-    contains records, checkpoints, policy bindings, transaction
-    bindings, receipts, repair executions, or policy events violating the
-    live constraints.
+    conditional replication-repair executions, the persisted
+    scope-policy change events, and the persisted
+    ``{compensationId: binding}`` transaction compensations (each empty
+    for a version:1 file written before that section existed). Raises
+    PersistenceError when the file is missing-readable, not UTF-8 JSON,
+    has an unexpected structure, or contains records, checkpoints,
+    policy bindings, transaction bindings, receipts, repair executions,
+    policy events, or compensations violating the live constraints.
     """
     try:
         with open(path, "rb") as handle:
@@ -4788,11 +5143,12 @@ def _load_data_file_complete(
         "acks",
         "repairExecutions",
         "policyEvents",
+        "compensations",
     } or "version" not in document or "operations" not in document:
         raise PersistenceError(
             "data file root must be an object with version and operations "
             "and optionally checkpoints, policies, transactions, acks, "
-            "repairExecutions, and policyEvents"
+            "repairExecutions, policyEvents, and compensations"
         )
     version = document["version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != DATA_FORMAT_VERSION:
@@ -4816,7 +5172,17 @@ def _load_data_file_complete(
     acks = _validate_stored_acks(document, checkpoints, records)
     repairs = _validate_stored_repairs(document, checkpoints, records)
     policy_events = _validate_stored_policy_events(document)
-    return records, checkpoints, policies, transactions, acks, repairs, policy_events
+    compensations = _validate_stored_compensations(document, identities, transactions)
+    return (
+        records,
+        checkpoints,
+        policies,
+        transactions,
+        acks,
+        repairs,
+        policy_events,
+        compensations,
+    )
 
 
 def load_data_file_full(
@@ -4834,7 +5200,7 @@ def load_data_file_full(
     UTF-8 JSON, has an unexpected structure, or contains records,
     checkpoints, or policy bindings violating the live constraints.
     """
-    records, checkpoints, policies, _, _, _, _ = _load_data_file_complete(path)
+    records, checkpoints, policies, _, _, _, _, _ = _load_data_file_complete(path)
     return records, checkpoints, policies
 
 
@@ -4845,7 +5211,7 @@ def load_data_file_transactions(path: str) -> dict[str, list[dict[str, Any]]]:
     only need the persisted ``{transactionId: entries}`` bindings; every
     other section is validated the same way but not returned.
     """
-    _, _, _, transactions, _, _, _ = _load_data_file_complete(path)
+    _, _, _, transactions, _, _, _, _ = _load_data_file_complete(path)
     return transactions
 
 
@@ -4857,7 +5223,7 @@ def load_data_file_acks(path: str) -> dict[tuple[str, str], dict[str, Any]]:
     receipts; every other section is validated the same way but not
     returned.
     """
-    _, _, _, _, acks, _, _ = _load_data_file_complete(path)
+    _, _, _, _, acks, _, _, _ = _load_data_file_complete(path)
     return acks
 
 
@@ -4879,8 +5245,20 @@ def load_data_file_policy_events(path: str) -> list[dict[str, Any]]:
     only need the persisted scope-policy change history; every other
     section is validated the same way but not returned.
     """
-    _, _, _, _, _, _, policy_events = _load_data_file_complete(path)
+    _, _, _, _, _, _, policy_events, _ = _load_data_file_complete(path)
     return policy_events
+
+
+def load_data_file_compensations(path: str) -> dict[str, dict[str, Any]]:
+    """Read and strictly validate a data file, returning its compensations.
+
+    Thin wrapper over :func:`_load_data_file_complete` for callers that
+    only need the persisted ``{compensationId: binding}`` transaction
+    compensations; every other section is validated the same way but not
+    returned.
+    """
+    _, _, _, _, _, _, _, compensations = _load_data_file_complete(path)
+    return compensations
 
 
 def ensure_data_file(
@@ -4893,13 +5271,15 @@ def ensure_data_file(
     dict[tuple[str, str], dict[str, Any]],
     dict[tuple[str, str], dict[str, Any]],
     list[dict[str, Any]],
+    dict[str, dict[str, Any]],
 ]:
     """Validate the data-file location and return its committed state.
 
     A missing target file is accepted (its parent directory must exist and
     be writable); an existing target must be a regular, parseable data
     file. Returns ``(records, checkpoints, policies, transactions, acks,
-    repairs, policy_events)``. Anything else raises PersistenceError.
+    repairs, policy_events, compensations)``. Anything else raises
+    PersistenceError.
     """
     parent = os.path.dirname(os.path.abspath(path))
     if not os.path.isdir(parent):
@@ -4914,7 +5294,7 @@ def ensure_data_file(
         if not stat.S_ISREG(mode):
             raise PersistenceError(f"data file path is not a regular file: {path!r}")
         return _load_data_file_complete(path)
-    return [], {}, {}, {}, {}, {}, []
+    return [], {}, {}, {}, {}, {}, [], {}
 
 
 def _fsync_directory(directory: str) -> None:
@@ -5147,6 +5527,15 @@ class StateStore:
         # but is otherwise unrelated to business state; a file written
         # before this section existed recovers with an empty history.
         self._policy_events: list[dict[str, Any]] = []
+        # Verifiable transaction-compensation bindings, keyed by the
+        # compensation id. Each binding records the compensated
+        # transaction id, the expectedPlanDigest the client committed
+        # against, the normalized compensation operations (the new
+        # accepted-log operations), and the bound status. A compensation
+        # is committed atomically with its operations, exactly like a
+        # transaction: the binding is local to this replica and is
+        # never exported by sync.
+        self._compensations: dict[str, dict[str, Any]] = {}
         self._data_file: str | None = None
         if data_file is not None:
             path = os.path.abspath(data_file)
@@ -5162,6 +5551,7 @@ class StateStore:
                 acks,
                 repairs,
                 policy_events,
+                compensations,
             ) = ensure_data_file(path)
             with self._lock:
                 for replica_id, operation in records:
@@ -5172,6 +5562,7 @@ class StateStore:
                 self._acks = dict(acks)
                 self._repairs = dict(repairs)
                 self._policy_events = [dict(event) for event in policy_events]
+                self._compensations = dict(compensations)
                 self._data_file = path
                 if not records and not os.path.exists(path):
                     # The target is missing and the preflight proved the
@@ -5280,6 +5671,22 @@ class StateStore:
             # reloads committed, so every successful hot reload and its
             # event become durable in one atomic commit together.
             "policyEvents": [dict(event) for event in self._policy_events],
+            # Compensation bindings ride along in the same atomic commit
+            # as their compensation operations. Like transaction
+            # bindings, a compensation is local: it is never part of the
+            # accepted log or exported by sync; the binding only records
+            # what compensation the id is bound to, so an identical
+            # replay appends nothing.
+            "compensations": [
+                {
+                    "compensationId": compensation_id,
+                    "transactionId": binding["transactionId"],
+                    "expectedPlanDigest": binding["expectedPlanDigest"],
+                    "operations": binding["operations"],
+                    "status": binding["status"],
+                }
+                for compensation_id, binding in self._compensations.items()
+            ],
         }
         data = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
         directory = os.path.dirname(self._data_file)
@@ -6037,6 +6444,378 @@ class StateStore:
             "transactionsCount": total,
             "verification": verification,
         }
+
+    @staticmethod
+    def _compensation_candidate_view(candidate: dict[str, Any]) -> dict[str, Any]:
+        """Render one stored candidate in the compensation-plan shape."""
+        return {
+            "value": candidate["value"],
+            "clock": dict(candidate["clock"]),
+            "replicaId": candidate["replicaId"],
+            "operationId": candidate["operationId"],
+        }
+
+    def _compensation_plan_locked(
+        self, transaction_id: str, tx_entries: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Build one compensation plan from a committed snapshot.
+
+        Runs under the commit lock. For every transaction-affected key
+        the plan reports the before-transaction candidates (the exact
+        expected candidate identities the transaction entry committed
+        against, resolved to their immutable operations), the current
+        candidates, and the compensation operation that would restore
+        the unique before-transaction value (or null when the key held
+        no unique such value). ``descendants`` lists every accepted
+        record committed after the transaction whose clock dominates
+        any transaction operation clock, in shared-log order,
+        de-duplicated by identity. The conclusion is
+        ``"reversible"`` only when every key held exactly one
+        before-transaction candidate, the transaction operation is
+        still the key's sole current candidate, no descendant exists,
+        and every planned compensation identity is still unused;
+        otherwise it is ``"blocked"``.
+        """
+        tx_identity_to_entry: dict[tuple[str, str], dict[str, Any]] = {
+            (entry["replicaId"], entry["operationId"]): entry for entry in tx_entries
+        }
+        positions: dict[str, int] = {}
+        for index, (replica_id, operation) in enumerate(self._accepted):
+            entry = tx_identity_to_entry.get((replica_id, operation["operationId"]))
+            if entry is not None:
+                positions[entry["key"]] = index
+        last_position = max(positions.values())
+        tx_clocks = [entry["clock"] for entry in tx_entries]
+
+        descendants: list[dict[str, Any]] = []
+        seen_descendants: set[tuple[str, str]] = set()
+        for accepted_replica, accepted_operation in self._accepted[last_position + 1 :]:
+            if not any(
+                clock_dominates(accepted_operation["clock"], tx_clock)
+                for tx_clock in tx_clocks
+            ):
+                continue
+            descendant_identity = (
+                accepted_replica,
+                accepted_operation["operationId"],
+            )
+            if descendant_identity in seen_descendants:
+                continue
+            seen_descendants.add(descendant_identity)
+            descendants.append(
+                {
+                    "key": accepted_operation["key"],
+                    "replicaId": accepted_replica,
+                    "operationId": accepted_operation["operationId"],
+                    "clock": dict(accepted_operation["clock"]),
+                }
+            )
+
+        key_items: list[dict[str, Any]] = []
+        reversible = not descendants
+        for entry in tx_entries:
+            key = entry["key"]
+            tx_identity = (entry["replicaId"], entry["operationId"])
+            before_candidates: list[dict[str, Any]] = []
+            for candidate_identity in sorted(
+                entry["candidates"],
+                key=lambda c: (c["replicaId"], c["operationId"]),
+            ):
+                known = self._operations.get(
+                    (candidate_identity["replicaId"], candidate_identity["operationId"])
+                )
+                # A committed transaction's expected identities always
+                # name accepted operations; a missing identity can only
+                # come from a damaged file, which startup rejects.
+                before_candidates.append(
+                    self._compensation_candidate_view(
+                        {
+                            "value": known["value"],
+                            "clock": known["clock"],
+                            "replicaId": candidate_identity["replicaId"],
+                            "operationId": candidate_identity["operationId"],
+                        }
+                    )
+                )
+            current_candidates = [
+                self._compensation_candidate_view(candidate)
+                for candidate in sorted(
+                    self._candidates.get(key, []),
+                    key=lambda c: (c["replicaId"], c["operationId"]),
+                )
+            ]
+            operation: dict[str, Any] | None = None
+            key_reversible = len(before_candidates) == 1 and (
+                len(current_candidates) == 1
+                and (
+                    current_candidates[0]["replicaId"],
+                    current_candidates[0]["operationId"],
+                )
+                == tx_identity
+            )
+            if len(before_candidates) == 1:
+                before = before_candidates[0]
+                replica_id = entry["replicaId"]
+                operation_id = (
+                    f"compensation:{transaction_id}:{replica_id}:{entry['operationId']}"
+                )
+                operation = {
+                    "key": key,
+                    "replicaId": replica_id,
+                    "operationId": operation_id,
+                    "value": before["value"],
+                    "clock": _compensation_clock(before["clock"], entry),
+                }
+                if (replica_id, operation_id) in self._operations:
+                    # The compensation identity is already taken (a
+                    # compensation already committed or a colliding
+                    # write): the plan cannot be executed as shown.
+                    key_reversible = False
+            if not key_reversible:
+                reversible = False
+            key_items.append(
+                {
+                    "key": key,
+                    "beforeCandidates": before_candidates,
+                    "currentCandidates": current_candidates,
+                    "operation": operation,
+                }
+            )
+
+        digest_input = _compensation_plan_digest_input(
+            transaction_id, key_items, descendants
+        )
+        return {
+            "transactionId": transaction_id,
+            "conclusion": "reversible" if reversible else "blocked",
+            "keys": key_items,
+            "descendants": descendants,
+            "algorithm": "sha256",
+            "expectedPlanDigest": hashlib.sha256(digest_input).hexdigest(),
+        }
+
+    def get_transaction_compensation(
+        self, transaction_id: str
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Read-only plan for compensating one committed transaction.
+
+        Returns ``(404, {"error": "not_found"})`` when the transaction
+        id names no committed transaction. Otherwise returns
+        ``(200, plan)`` — strictly read-only, writing no candidate, log
+        entry, audit record, binding, or data file. With
+        ``--data-file`` the transaction bindings and accepted log are
+        rebuilt identically during recovery, so the same committed
+        history yields the same plan and ``expectedPlanDigest`` before
+        and after a restart.
+        """
+        with self._lock:
+            tx_entries = self._transactions.get(transaction_id)
+            if tx_entries is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            plan = self._compensation_plan_locked(transaction_id, tx_entries)
+        return HTTPStatus.OK, plan
+
+    def apply_compensation(
+        self,
+        transaction_id: str,
+        compensation_id: str,
+        expected_digest: str,
+        entries: list[dict[str, Any]],
+    ) -> tuple[HTTPStatus, dict[str, Any], str | None]:
+        """Atomically commit one transaction compensation.
+
+        The compensation id is bound to the exact transaction id,
+        expected plan digest, and normalized operation list: an
+        identical replay (same id and content) is answered 200 without
+        appending anything, while the same id with different content is
+        a 409 ``operation_conflict``. A new id is accepted only when
+        the transaction exists (404 ``not_found`` otherwise), the
+        freshly recomputed plan still hashes to ``expected_digest`` and
+        is still ``reversible`` (otherwise 409 ``compensation_conflict``
+        — the plan went stale or a causal descendant appeared), and the
+        request operations equal the plan's compensation operations
+        field by field in plan order.
+
+        Every compensation operation is a first-accepted ordinary
+        operation whose clock dominates the corresponding transaction
+        operation clock, so the existing candidate semantics
+        atomically replace each transaction value with the
+        before-transaction value. All operations and the compensation
+        binding commit together in one atomic commit; they flow through
+        sync export, audits, metrics, and the verification digest like
+        any other accepted operation, while the binding itself is local
+        and never exported. Raises PersistenceError when the durable
+        commit fails, leaving memory, indexes, bindings, and the file
+        unchanged.
+        """
+        with self._lock:
+            tx_entries = self._transactions.get(transaction_id)
+            if tx_entries is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}, "not_found"
+
+            bound = self._compensations.get(compensation_id)
+            if bound is not None:
+                same_content = (
+                    bound["transactionId"] == transaction_id
+                    and bound["expectedPlanDigest"] == expected_digest
+                    and bound["operations"] == entries
+                )
+                if not same_content:
+                    return HTTPStatus.CONFLICT, {}, "operation_conflict"
+                # An identical replay is answered from the binding without
+                # inspecting the current candidate state, so the response
+                # is stable even if the keys moved on afterwards.
+                bound_operations = bound["operations"]
+                summary = [
+                    {
+                        "key": operation["key"],
+                        "value": operation["value"],
+                        "clock": dict(operation["clock"]),
+                        "replicaId": operation["replicaId"],
+                        "operationId": operation["operationId"],
+                    }
+                    for operation in bound_operations
+                ]
+                return (
+                    HTTPStatus.OK,
+                    {
+                        "status": "ok",
+                        "compensationId": compensation_id,
+                        "transactionId": transaction_id,
+                        "operations": [
+                            {
+                                "key": operation["key"],
+                                "replicaId": operation["replicaId"],
+                                "operationId": operation["operationId"],
+                                "value": operation["value"],
+                            }
+                            for operation in bound_operations
+                        ],
+                        "finalState": summary,
+                    },
+                    None,
+                )
+
+            plan = self._compensation_plan_locked(transaction_id, tx_entries)
+            if plan["conclusion"] != "reversible" or plan["expectedPlanDigest"] != expected_digest:
+                return HTTPStatus.CONFLICT, {}, "compensation_conflict"
+            planned_operations = [item["operation"] for item in plan["keys"]]
+            if entries != planned_operations:
+                # A field, identity, clock, or ordering mismatch against
+                # the plan is a malformed request, not a state conflict.
+                raise ValueError("compensation operations do not match the plan")
+
+            # Stage the whole batch off the visible state, exactly like
+            # an atomic transaction: each key currently holds only the
+            # transaction operation, and the dominating compensation
+            # clock replaces it with the before-transaction value.
+            staged_candidates = {
+                key: list(candidates)
+                for key, candidates in self._candidates.items()
+            }
+            new_records: list[tuple[str, dict[str, Any]]] = []
+            for entry, operation in zip(tx_entries, entries):
+                replica_id = operation["replicaId"]
+                if not clock_dominates(operation["clock"], entry["clock"]):
+                    raise ValueError("compensation clock does not dominate the transaction clock")
+                identity = (replica_id, operation["operationId"])
+                if identity in self._operations:
+                    raise ValueError("compensation operation identity already exists")
+                current = staged_candidates.get(operation["key"], [])
+                staged_candidates[operation["key"]] = self._next_candidates(
+                    current, replica_id, operation
+                )
+                new_records.append(
+                    (
+                        replica_id,
+                        {
+                            "operationId": operation["operationId"],
+                            "key": operation["key"],
+                            "value": operation["value"],
+                            "clock": operation["clock"],
+                        },
+                    )
+                )
+
+            binding = {
+                "transactionId": transaction_id,
+                "expectedPlanDigest": expected_digest,
+                "operations": [dict(operation) for operation in entries],
+                "status": "committed",
+            }
+            if self._data_file is not None:
+                previous_length = len(self._accepted)
+                self._accepted.extend(new_records)
+                self._compensations[compensation_id] = binding
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    del self._accepted[previous_length:]
+                    del self._compensations[compensation_id]
+                    raise
+            else:
+                self._accepted.extend(new_records)
+                self._compensations[compensation_id] = binding
+            for replica_id, operation in new_records:
+                self._operations[(replica_id, operation["operationId"])] = operation
+                op_key = operation["key"]
+                self._candidates[op_key] = self._next_candidates(
+                    self._candidates.get(op_key, []), replica_id, operation
+                )
+            summary = self._compensation_final_state_locked(tx_entries)
+            return (
+                HTTPStatus.CREATED,
+                {
+                    "status": "created",
+                    "compensationId": compensation_id,
+                    "transactionId": transaction_id,
+                    "operations": [
+                        {
+                            "key": operation["key"],
+                            "replicaId": operation["replicaId"],
+                            "operationId": operation["operationId"],
+                            "value": operation["value"],
+                        }
+                        for operation in entries
+                    ],
+                    "finalState": summary,
+                },
+                None,
+            )
+
+    def _compensation_final_state_locked(
+        self, tx_entries: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Render the post-compensation candidate of each affected key."""
+        summary: list[dict[str, Any]] = []
+        for entry in tx_entries:
+            key = entry["key"]
+            candidates = sorted(
+                self._candidates.get(key, []),
+                key=lambda c: (c["replicaId"], c["operationId"]),
+            )
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                summary.append(
+                    {
+                        "key": key,
+                        "value": candidate["value"],
+                        "clock": dict(candidate["clock"]),
+                        "replicaId": candidate["replicaId"],
+                        "operationId": candidate["operationId"],
+                    }
+                )
+            else:
+                summary.append(
+                    {
+                        "key": key,
+                        "candidates": [
+                            self._compensation_candidate_view(candidate)
+                            for candidate in candidates
+                        ],
+                    }
+                )
+        return summary
 
     def get_sync_operations(
         self, after: int, limit: int
@@ -10713,6 +11492,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         if (
             len(segments) == 4
             and segments[0] == "v1"
+            and segments[1] == "transactions"
+            and segments[3] == "compensation"
+        ):
+            self._handle_transaction_compensation_get(segments[2])
+            return
+        if (
+            len(segments) == 4
+            and segments[0] == "v1"
             and segments[1] == "audit"
             and segments[2] == "log"
             and segments[3] == "chain"
@@ -11784,6 +12571,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json_ordered_newline(status, payload)
 
+    def _handle_transaction_compensation_get(self, transaction_id: str) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there), so a
+        # query parameter is rejected here without any state being read
+        # or changed. The plan is strictly read-only: it writes no
+        # candidate, log entry, audit record, binding, or data file.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._store.get_transaction_compensation(transaction_id)
+        self._json_ordered_newline(status, payload)
+
     def _handle_audit_digest_get(self, key: str) -> None:
         if not parse_metrics_query(urlsplit(self.path).query):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
@@ -12205,6 +13004,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_transaction_compensate_post(self, transaction_id: str) -> None:
+        # The route-shape check in do_POST already ran (missing or extra
+        # segments — including a trailing slash — are 404 there), so a
+        # query parameter is rejected here without any state being read
+        # or changed. The response follows the transaction contract:
+        # compact JSON, one trailing newline.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            compensation_id, expected_digest, entries = parse_compensate_payload(raw)
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status, payload, error = self._store.apply_compensation(
+                transaction_id, compensation_id, expected_digest, entries
+            )
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        except PersistenceError:
+            self._json_newline(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            return
+        if status in (HTTPStatus.CONFLICT, HTTPStatus.NOT_FOUND):
+            self._json_newline(status, {"error": error})
+            return
+        self._json_newline(status, payload)
+
     def _handle_scope_policy_reload_post(self) -> None:
         # The declared-length check (400/413), authentication, the admin
         # scope, and the scope-mode gate (404) all ran in do_POST, none of
@@ -12352,6 +13183,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "transactions"
             and segments[2] == "apply"
         )
+        is_transaction_compensate_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "transactions"
+            and segments[3] == "compensate"
+        )
         is_scope_policy_reload_post = (
             len(segments) == 4
             and segments[0] == "v1"
@@ -12420,6 +13257,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_auto_resolve_batch_post
             or is_auto_resolve_plan_post
             or is_transaction_apply_post
+            or is_transaction_compensate_post
             or is_scope_policy_reload_post
             or is_causal_at_post
             or is_replication_compare_post
@@ -12549,6 +13387,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_transaction_apply_post:
             self._handle_transaction_apply_post()
+            return
+        if is_transaction_compensate_post:
+            self._handle_transaction_compensate_post(segments[2])
             return
         if is_scope_policy_reload_post:
             self._handle_scope_policy_reload_post()
