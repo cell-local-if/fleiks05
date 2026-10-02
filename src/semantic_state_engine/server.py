@@ -19,6 +19,33 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 DATA_FORMAT_VERSION = 1
 
+# Optional admission bound on vector-clock width, configured through the
+# --max-clock-components command-line flag. None (the default) keeps the
+# historical behaviour: any non-empty clock with well-formed components is
+# accepted. When set, every clock taking part in causal decisions — write
+# and sync-import operation clocks, manual and automatic resolution
+# clocks, transaction and compensation entry clocks, remote-snapshot
+# candidate clocks, and causal boundary clocks — may name at most this
+# many components, both at request time and during startup recovery.
+_MAX_CLOCK_COMPONENTS: int | None = None
+
+
+def set_max_clock_components(limit: int | None) -> None:
+    """Configure the process-wide vector-clock component limit.
+
+    ``None`` disables the bound (the default); otherwise every validated
+    vector clock may contain at most ``limit`` components. The limit only
+    constrains the component count — tick ranges, domination and
+    concurrency semantics, and every other constraint are unaffected.
+    """
+    global _MAX_CLOCK_COMPONENTS
+    _MAX_CLOCK_COMPONENTS = limit
+
+
+def max_clock_components() -> int | None:
+    """Return the configured vector-clock component limit, or None."""
+    return _MAX_CLOCK_COMPONENTS
+
 
 def health_payload() -> dict[str, str]:
     return {"service": "semantic-state-engine", "status": "ok"}
@@ -61,9 +88,16 @@ def clock_direction(clock_a: dict[str, int], clock_b: dict[str, int]) -> str:
 
 
 def _validate_clock(clock: Any, replica_id: str) -> dict[str, int]:
-    """Validate a vector clock for ``replica_id`` and return a clean copy."""
+    """Validate a vector clock for ``replica_id`` and return a clean copy.
+
+    When a component limit is configured (see
+    :func:`set_max_clock_components`), a clock naming more components than
+    the limit is rejected like any other malformed clock.
+    """
     if not isinstance(clock, dict) or not clock:
         raise ValueError("clock must be a non-empty object")
+    if _MAX_CLOCK_COMPONENTS is not None and len(clock) > _MAX_CLOCK_COMPONENTS:
+        raise ValueError("clock has too many components")
     for component, tick in clock.items():
         if not isinstance(component, str) or component == "":
             raise ValueError("clock components must be non-empty strings")
@@ -1297,10 +1331,15 @@ def _validate_boundary_clock(clock: Any) -> dict[str, int]:
     origin). When non-empty, every component name must be a non-empty
     string and every value a non-boolean, non-negative JSON integer;
     booleans, floats (including ``1.0`` and ``-0.0``), and non-finite
-    values are rejected. Raises ValueError on any violation.
+    values are rejected. When a component limit is configured (see
+    :func:`set_max_clock_components`), a boundary naming more components
+    than the limit is rejected like any other malformed clock. Raises
+    ValueError on any violation.
     """
     if not isinstance(clock, dict):
         raise ValueError("clock must be a JSON object")
+    if _MAX_CLOCK_COMPONENTS is not None and len(clock) > _MAX_CLOCK_COMPONENTS:
+        raise ValueError("clock has too many components")
     for component, tick in clock.items():
         if not isinstance(component, str) or component == "":
             raise ValueError("clock components must be non-empty strings")
@@ -13651,6 +13690,32 @@ class RequestHandler(BaseHTTPRequestHandler):
         return
 
 
+def _max_clock_components_arg(token: str) -> int:
+    """argparse type for --max-clock-components: a decimal integer 1-1024.
+
+    Only a non-empty run of ASCII decimal digits is accepted, which rejects
+    blanks, signs, decimals, whitespace, and non-ASCII numerals; the value
+    must then lie in the inclusive range 1 to 1024. Anything else raises
+    argparse.ArgumentTypeError, so the command line fails with exit code 2
+    before any file is read or any port is bound.
+    """
+    if not token or any(ch < "0" or ch > "9" for ch in token):
+        raise argparse.ArgumentTypeError(
+            "must be a decimal integer from 1 to 1024"
+        )
+    try:
+        value = int(token)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "must be a decimal integer from 1 to 1024"
+        )
+    if not 1 <= value <= 1024:
+        raise argparse.ArgumentTypeError(
+            "must be a decimal integer from 1 to 1024"
+        )
+    return value
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the Semantic State Engine HTTP service")
     parser.add_argument("--host", default="127.0.0.1")
@@ -13683,7 +13748,29 @@ def main(argv: list[str] | None = None) -> None:
             "--auth-token-file"
         ),
     )
+    parser.add_argument(
+        "--max-clock-components",
+        type=_max_clock_components_arg,
+        default=None,
+        metavar="N",
+        help=(
+            "optional admission bound on vector-clock width: every clock "
+            "taking part in causal decisions (write and sync-import "
+            "operation clocks, manual and automatic resolution clocks, "
+            "transaction and compensation entry clocks, remote-snapshot "
+            "candidate clocks, and causal boundary clocks) may name at "
+            "most N components, a decimal integer from 1 to 1024; wider "
+            "clocks are rejected with HTTP 400, and a persisted record "
+            "with a wider clock fails startup recovery; without it clock "
+            "width is unbounded"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    # The width bound is process-wide and must be in place before startup
+    # recovery validates any persisted clock; None keeps the historical
+    # unbounded behaviour.
+    set_max_clock_components(args.max_clock_components)
 
     if args.auth_token_file is not None and args.scope_policy_file is not None:
         # The two authentication configurations are mutually exclusive;
