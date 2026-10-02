@@ -182,7 +182,38 @@ def parse_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
     }
 
 
-AUTO_RESOLVE_POLICIES = ("lowest_identity", "highest_identity")
+AUTO_RESOLVE_POLICIES = (
+    "lowest_identity",
+    "highest_identity",
+    "causal_dominant",
+)
+
+
+def _select_resolution_candidate(
+    candidates: list[dict[str, Any]], policy: str
+) -> dict[str, Any] | None:
+    """Select the current candidate supplying an automatic resolution value.
+
+    ``lowest_identity`` / ``highest_identity`` return the candidate with the
+    smallest / largest ``(replicaId, operationId)``. ``causal_dominant``
+    returns the unique candidate whose vector clock strictly dominates every
+    other candidate's clock (``clock_dominates``: component-wise greater or
+    equal and strictly greater on at least one); when no candidate strictly
+    dominates all the others (they are concurrent, or several tie) there is
+    no unique strict dominator and ``None`` is returned.
+    """
+    if policy == "highest_identity":
+        return max(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
+    if policy == "lowest_identity":
+        return min(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
+    for index, candidate in enumerate(candidates):
+        if all(
+            clock_dominates(candidate["clock"], other["clock"])
+            for other_index, other in enumerate(candidates)
+            if other_index != index
+        ):
+            return candidate
+    return None
 
 
 def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
@@ -193,9 +224,10 @@ def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, A
     live resolution constraints (the key and the chosen value come from the
     server: the value is taken from a current candidate selected by
     ``policy``); ``policy`` must be one of ``"lowest_identity"`` (candidate
-    with the smallest ``(replicaId, operationId)``) or ``"highest_identity"``
-    (candidate with the largest). Returns a normalized request dict. Raises
-    ValueError on any violation.
+    with the smallest ``(replicaId, operationId)``), ``"highest_identity"``
+    (candidate with the largest), or ``"causal_dominant"`` (the unique
+    candidate whose clock strictly dominates every other candidate). Returns
+    a normalized request dict. Raises ValueError on any violation.
     """
     if isinstance(raw, (bytes, bytearray)):
         try:
@@ -228,7 +260,9 @@ def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, A
     clock = _validate_clock(payload.get("clock"), replica_id)
     policy = payload["policy"]
     if policy not in AUTO_RESOLVE_POLICIES:
-        raise ValueError("policy must be 'lowest_identity' or 'highest_identity'")
+        raise ValueError(
+            "policy must be 'lowest_identity', 'highest_identity', or 'causal_dominant'"
+        )
 
     return {
         "replicaId": replica_id,
@@ -301,7 +335,9 @@ def parse_auto_resolve_batch(raw: bytes | str | dict[str, Any]) -> list[dict[str
         clock = _validate_clock(entry.get("clock"), replica_id)
         policy = entry["policy"]
         if policy not in AUTO_RESOLVE_POLICIES:
-            raise ValueError("policy must be 'lowest_identity' or 'highest_identity'")
+            raise ValueError(
+                "policy must be 'lowest_identity', 'highest_identity', or 'causal_dominant'"
+            )
         if key in keys:
             raise ValueError(f"duplicate key {key!r} in batch")
         identity = (replica_id, operation_id)
@@ -5828,12 +5864,20 @@ class StateStore:
         with at least two distinct values, and the resolution value is taken
         deterministically from a current candidate selected by the request
         policy — the smallest ``(replicaId, operationId)`` for
-        ``lowest_identity``, the largest for ``highest_identity``. The
-        request clock must dominate every current candidate. The resolution
-        then commits exactly like a manual resolution — one ordinary
-        operation in the shared commit order, so it flows through sync
-        export/import, the audit streams, the metrics, and the data file
-        identically.
+        ``lowest_identity``, the largest for ``highest_identity``, or the
+        unique candidate whose clock strictly dominates every other
+        candidate for ``causal_dominant``. The request clock must dominate
+        every current candidate. The resolution then commits exactly like a
+        manual resolution — one ordinary operation in the shared commit
+        order, so it flows through sync export/import, the audit streams, the
+        metrics, and the data file identically.
+
+        For ``causal_dominant`` a key whose different-valued candidates have
+        no unique strict dominator (they are concurrent, or several tie) is
+        a ``"causal_ambiguity"`` conflict; a legal request clock that does
+        not dominate every current candidate is a ``"resolution_conflict"``.
+        (For the identity policies the latter stays a ValueError mapped to
+        HTTP 400, as before.)
 
         The identity is bound to the key, the clock, and the policy: a
         replay with the same binding is answered from the committed
@@ -5843,12 +5887,15 @@ class StateStore:
 
         Returns ``(status, operation, error)``: 201/200 carry the committed
         (or previously seen) operation and ``error=None``, or 409 carries
-        ``"operation_conflict"`` (known identity, different binding) or
-        ``"resolution_conflict"`` (an unseen identity for a missing key or a
-        key not currently in value conflict). Raises ValueError when the
-        clock does not dominate every candidate; raises PersistenceError when
-        the durable commit fails, in which case memory, the identity index,
-        the policy bindings, and the file are unchanged.
+        ``"operation_conflict"`` (known identity, different binding),
+        ``"causal_ambiguity"`` (causal policy with no unique strict
+        dominator), or ``"resolution_conflict"`` (an unseen identity for a
+        missing key, a key not currently in value conflict, or — under the
+        causal policy — a legal clock that does not dominate every
+        candidate). Raises ValueError when an identity-policy clock does not
+        dominate every candidate; raises PersistenceError when the durable
+        commit fails, in which case memory, the identity index, the policy
+        bindings, and the file are unchanged.
         """
         replica_id = request["replicaId"]
         operation = {
@@ -5885,16 +5932,31 @@ class StateStore:
             if not current or all(c["value"] == current[0]["value"] for c in current):
                 return HTTPStatus.CONFLICT, None, "resolution_conflict"
 
-            # Deterministic policy: the candidate with the smallest or
-            # largest (replicaId, operationId) supplies the resolution value.
-            if request["policy"] == "highest_identity":
-                chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
+            if request["policy"] == "causal_dominant":
+                # A legal request clock that does not dominate every current
+                # candidate is a failed resolution precondition (409), not a
+                # malformed request as it is for the identity policies;
+                # structurally invalid clocks were rejected by the parser.
+                if not all(
+                    clock_dominates(operation["clock"], c["clock"]) for c in current
+                ):
+                    return HTTPStatus.CONFLICT, None, "resolution_conflict"
+                # The policy applies only when exactly one candidate's clock
+                # strictly dominates all the others; different-valued
+                # concurrent candidates have no such winner.
+                chosen = _select_resolution_candidate(current, "causal_dominant")
+                if chosen is None:
+                    return HTTPStatus.CONFLICT, None, "causal_ambiguity"
             else:
-                chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+                # Deterministic identity policy: the candidate with the
+                # smallest or largest (replicaId, operationId) supplies the
+                # resolution value.
+                chosen = _select_resolution_candidate(current, request["policy"])
+                if not all(
+                    clock_dominates(operation["clock"], c["clock"]) for c in current
+                ):
+                    raise ValueError("clock does not dominate every candidate")
             operation["value"] = chosen["value"]
-
-            if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
-                raise ValueError("clock does not dominate every candidate")
 
             next_candidates = self._next_candidates(current, replica_id, operation)
             if self._data_file is not None:
@@ -5939,6 +6001,10 @@ class StateStore:
           conflict (a structurally *illegal* clock is rejected earlier by
           the parser as an invalid request, distinct from a legal clock
           that simply fails to dominate the live candidates);
+        - a ``causal_dominant`` entry whose different-valued candidates have
+          no unique strict dominator (they are concurrent, or several tie)
+          is a causal-ambiguity conflict, checked after the request clock is
+          known to dominate every current candidate;
 
         The whole batch is validated (dry-run) before anything is persisted
         or made visible: any conflict or invalid clock rejects the entire
@@ -5951,10 +6017,10 @@ class StateStore:
         replay, with ``results`` in request order (each carrying ``key``,
         ``replicaId``, ``operationId``, the selected ``value``, and
         ``policy``); or 409 with ``"operation_conflict"`` /
-        ``"resolution_conflict"`` and an unchanged store. Raises
-        PersistenceError when the durable commit fails, in which case
-        memory, the identity index, the policy bindings, and the file are
-        unchanged.
+        ``"resolution_conflict"`` / ``"causal_ambiguity"`` and an unchanged
+        store. Raises PersistenceError when the durable commit fails, in
+        which case memory, the identity index, the policy bindings, and the
+        file are unchanged.
         """
         with self._lock:
             # Staged copies keep the whole dry run off the visible state:
@@ -6007,18 +6073,21 @@ class StateStore:
                 if not current or all(c["value"] == current[0]["value"] for c in current):
                     return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
 
-                if entry["policy"] == "highest_identity":
-                    chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
-                else:
-                    chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
-                operation["value"] = chosen["value"]
-
                 # A legal clock that nevertheless fails to dominate the live
                 # candidates is a failed resolution precondition (409), not
                 # a malformed request: structurally invalid clocks were
                 # rejected by the parser before the store was ever reached.
-                if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
+                # It is checked before the policy runs, so a stale view is a
+                # resolution conflict rather than a causal ambiguity.
+                if not all(clock_dominates(entry["clock"], c["clock"]) for c in current):
                     return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
+
+                chosen = _select_resolution_candidate(current, entry["policy"])
+                if entry["policy"] == "causal_dominant" and chosen is None:
+                    # No candidate's clock strictly dominates all the
+                    # others: the causal policy cannot pick a value.
+                    return HTTPStatus.CONFLICT, [], 0, 0, "causal_ambiguity"
+                operation["value"] = chosen["value"]
 
                 staged_candidates[key] = self._next_candidates(
                     current, replica_id, operation
@@ -6084,7 +6153,10 @@ class StateStore:
           conflict;
         - an unseen identity for a missing key, a key not currently in value
           conflict, or a request clock that does not dominate every current
-          candidate is a resolution conflict.
+          candidate is a resolution conflict;
+        - a ``causal_dominant`` entry whose different-valued candidates have
+          no unique strict dominator (they are concurrent, or several tie)
+          is a causal-ambiguity conflict.
 
         Nothing is written: no candidates, accepted log, policy bindings,
         checkpoints, audit state, or data file change, and no temporary file
@@ -6100,7 +6172,8 @@ class StateStore:
         ``operationId``, the selected ``value``, and ``policy``), with
         ``accepted`` counting entries that a commit would newly create and
         ``replayed`` the same-binding entries; or 409 with
-        ``"operation_conflict"`` / ``"resolution_conflict"`` and no results.
+        ``"operation_conflict"`` / ``"resolution_conflict"`` /
+        ``"causal_ambiguity"`` and no results.
         """
         with self._lock:
             # Staged copies keep the entire preview off the visible state;
@@ -6152,18 +6225,21 @@ class StateStore:
                 if not current or all(c["value"] == current[0]["value"] for c in current):
                     return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
 
-                if entry["policy"] == "highest_identity":
-                    chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
-                else:
-                    chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
-                operation["value"] = chosen["value"]
-
                 # A legal clock that nevertheless fails to dominate the live
                 # candidates is a failed resolution precondition (409), as
                 # in the committing batch; structurally invalid clocks were
-                # rejected by the parser before the store was reached.
-                if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
+                # rejected by the parser before the store was reached. It is
+                # checked before the policy runs, so a stale view is a
+                # resolution conflict rather than a causal ambiguity.
+                if not all(clock_dominates(entry["clock"], c["clock"]) for c in current):
                     return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
+
+                chosen = _select_resolution_candidate(current, entry["policy"])
+                if entry["policy"] == "causal_dominant" and chosen is None:
+                    # No candidate's clock strictly dominates all the
+                    # others: the causal policy cannot pick a value.
+                    return HTTPStatus.CONFLICT, [], 0, 0, "causal_ambiguity"
+                operation["value"] = chosen["value"]
 
                 staged_candidates[key] = self._next_candidates(
                     current, replica_id, operation
