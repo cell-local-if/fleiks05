@@ -1350,6 +1350,85 @@ def parse_causal_at_payload(raw: bytes | str | dict[str, Any]) -> dict[str, int]
     return _validate_boundary_clock(payload.get("clock"))
 
 
+CAUSAL_SNAPSHOT_MIN_KEYS = 1
+CAUSAL_SNAPSHOT_MAX_KEYS = 100
+
+
+def _validate_causal_snapshot_keys(keys_raw: Any) -> list[str]:
+    """Validate the ``keys`` list of a cross-key causal snapshot.
+
+    It must be a list of 1 to 100 distinct, non-empty strings in request
+    order; booleans, numbers, other types, the empty string, an empty
+    list, or a list over the cap raise ValueError. Returns the keys in
+    request order.
+    """
+    if not isinstance(keys_raw, list) or not (
+        CAUSAL_SNAPSHOT_MIN_KEYS <= len(keys_raw) <= CAUSAL_SNAPSHOT_MAX_KEYS
+    ):
+        raise ValueError("keys must be a list of 1-100 non-empty strings")
+    keys: list[str] = []
+    seen: set[str] = set()
+    for name in keys_raw:
+        if not isinstance(name, str) or name == "":
+            raise ValueError("keys must be non-empty strings")
+        if name in seen:
+            raise ValueError(f"duplicate key {name!r} in snapshot")
+        seen.add(name)
+        keys.append(name)
+    return keys
+
+
+def parse_causal_snapshot_payload(
+    raw: bytes | str | dict[str, Any],
+) -> tuple[dict[str, int], list[str]]:
+    """Parse and validate a cross-key causal-snapshot body.
+
+    The body must be a complete JSON object whose only keys are ``clock``
+    and ``keys``; unknown fields, a non-object document, or a duplicated
+    key anywhere in the document raise ValueError. ``clock`` follows the
+    single-key boundary rules (see :func:`parse_causal_at_payload`): it
+    may be empty (the causal origin), and otherwise maps replica ids to
+    non-boolean non-negative integers. ``keys`` is a list of 1 to 100
+    distinct, non-empty strings whose order is the caller's response
+    order. Returns ``(boundary, keys)`` with the keys in request order.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        # Already-decoded mappings come from store-level callers, which
+        # bypass JSON and therefore the duplicate-key hook.
+        if not isinstance(raw, dict) or set(raw.keys()) != {"clock", "keys"}:
+            raise ValueError("body must be an object with only clock and keys")
+        return (
+            _validate_boundary_clock(raw.get("clock")),
+            _validate_causal_snapshot_keys(raw.get("keys")),
+        )
+
+    def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+        document: dict[Any, Any] = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError("duplicate field in body")
+            document[key] = value
+        return document
+
+    try:
+        payload: Any = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError("body must be valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload.keys()) != {"clock", "keys"}:
+        raise ValueError("body must be an object with only clock and keys")
+    return (
+        _validate_boundary_clock(payload.get("clock")),
+        _validate_causal_snapshot_keys(payload.get("keys")),
+    )
+
+
 def _parse_remote_snapshot(snapshot_raw: Any) -> dict[str, list[dict[str, Any]]]:
     """Validate a remote replica's complete candidate snapshot.
 
@@ -11023,6 +11102,83 @@ class StateStore:
             "candidates": present,
         }
 
+    def get_states_causal_at(
+        self, boundary: dict[str, int], keys: list[str]
+    ) -> dict[str, Any]:
+        """Replay the accepted log once for several keys at one boundary.
+
+        The cross-key counterpart of :meth:`get_state_causal_at`: starting
+        from the empty state, the first-accepted records whose clock is
+        componentwise no greater than ``boundary`` are replayed in global
+        commit order through the same candidate add/delete semantics, but a
+        single pass maintains one candidate list per requested key, so the
+        whole report — every key's candidates and status — describes one
+        committed snapshot. A concurrent commit can therefore only move the
+        whole batch from one complete result to another; it can never make
+        one key see the old log and another the new.
+
+        Keys with no candidate inside the boundary do not fail the batch:
+        they report ``"absent"`` with an empty candidate array, while keys
+        with candidates report ``"resolved"`` or ``"conflict"`` exactly as
+        the single-key query would. Results come back in the requested key
+        order; each candidate is sorted by ``(replicaId, operationId)``
+        ascending and carries exactly ``value``, ``clock``,
+        ``replicaId``, and ``operationId``. Like the single-key replay the
+        read takes the commit lock and mutates neither memory, the data
+        file, logs, nor checkpoints and creates no files.
+        """
+        with self._lock:
+            candidates_by_key: dict[str, list[dict[str, Any]]] = {
+                key: [] for key in keys
+            }
+            requested = set(keys)
+            for replica_id, operation in self._accepted:
+                key = operation["key"]
+                if key not in requested:
+                    continue
+                clock = operation["clock"]
+                if any(tick > boundary.get(component, 0) for component, tick in clock.items()):
+                    continue
+                candidates_by_key[key] = self._next_candidates(
+                    candidates_by_key[key], replica_id, operation
+                )
+            results: list[dict[str, Any]] = []
+            found = 0
+            for key in keys:
+                ordered = sorted(
+                    candidates_by_key[key],
+                    key=lambda c: (c["replicaId"], c["operationId"]),
+                )
+                present = [
+                    {
+                        "value": c["value"],
+                        "clock": dict(c["clock"]),
+                        "replicaId": c["replicaId"],
+                        "operationId": c["operationId"],
+                    }
+                    for c in ordered
+                ]
+                if not present:
+                    results.append(
+                        {"key": key, "status": "absent", "candidates": []}
+                    )
+                    continue
+                found += 1
+                status = (
+                    "resolved"
+                    if all(c["value"] == present[0]["value"] for c in present)
+                    else "conflict"
+                )
+                results.append(
+                    {"key": key, "status": status, "candidates": present}
+                )
+        return {
+            "clock": dict(boundary),
+            "results": results,
+            "found": found,
+            "missing": len(keys) - found,
+        }
+
 
 class SemanticStateServer(ThreadingHTTPServer):
     """Threading HTTP server carrying its own StateStore."""
@@ -11921,6 +12077,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         status, payload = self._store.get_state_causal_at(key, boundary)
         self._json_newline(status, payload)
+
+    def _handle_states_causal_at_post(self) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those. The route
+        # accepts no query parameters, and that check precedes the body
+        # check. The whole batch is one read-only replay against one
+        # committed snapshot, and the report keeps the payload's
+        # contracted field order — clock, results, found, missing — with
+        # compact UTF-8 JSON, one trailing newline, and numbers only as
+        # JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            boundary, keys = parse_causal_snapshot_payload(raw)
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        payload = self._store.get_states_causal_at(boundary, keys)
+        self._json_ordered_newline(HTTPStatus.OK, payload)
 
     def _handle_state_why_get(self, key: str) -> None:
         # The route-shape check in do_GET already ran, so a query parameter
@@ -13202,6 +13383,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "states"
             and segments[3] == "causal-at"
         )
+        is_states_causal_at_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "states"
+            and segments[2] == "causal-at"
+            # An empty middle segment (/v1/states//causal-at) is filtered
+            # out of ``segments`` but must not collapse into this route:
+            # require the raw path to hold exactly four parts, which also
+            # excludes a trailing slash.
+            and len(urlsplit(self.path).path.split("/")) == 4
+        )
         is_replication_compare_post = (
             len(segments) == 3
             and segments[0] == "v1"
@@ -13260,6 +13452,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_transaction_compensate_post
             or is_scope_policy_reload_post
             or is_causal_at_post
+            or is_states_causal_at_post
             or is_replication_compare_post
             or is_replication_plan_post
             or is_replication_apply_post
@@ -13293,9 +13486,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # endpoints: a read or admin scope suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
-            elif is_causal_at_post:
-                # The causal slice is strictly read-only, so it is gated
-                # like every other read: a read or admin scope suffices.
+            elif is_causal_at_post or is_states_causal_at_post:
+                # Both causal slices — the single-key query and the
+                # cross-key snapshot — are strictly read-only, so they
+                # are gated like every other read: a read or admin scope
+                # suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
             elif is_replication_compare_post:
@@ -13396,6 +13591,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_causal_at_post:
             self._handle_state_causal_at_post(segments[2])
+            return
+        if is_states_causal_at_post:
+            self._handle_states_causal_at_post()
             return
         if is_replication_compare_post:
             self._handle_replication_compare_post()

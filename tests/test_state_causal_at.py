@@ -591,7 +591,6 @@ class HttpStateCausalAtTests(unittest.TestCase):
             "/v1/states/k/causal-at/extra",
             "/v1/states/k/causal-at/extra/more",
             "/v1/states/k/causal-at/",
-            "/v1/states/causal-at",
             "/v1/causal-at",
             "/v2/states/k/causal-at",
             "/v1/states//causal-at",
@@ -599,6 +598,14 @@ class HttpStateCausalAtTests(unittest.TestCase):
             status, payload, _, _ = self.request("POST", path, {"clock": {"r1": 1}})
             self.assertEqual(status, 404, path)
             self.assertEqual(payload, {"error": "not_found"}, path)
+        # The three-segment /v1/states/causal-at path is the separate
+        # cross-key snapshot route, so the single-key body is a shape
+        # mismatch there and answers 400 rather than 404.
+        status, payload, _, _ = self.request(
+            "POST", "/v1/states/causal-at", {"clock": {"r1": 1}}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
 
     def test_route_shape_error_beats_query_and_body_errors(self) -> None:
         self.post_operation("r1", operation("o1", "k", "v", {"r1": 1}))
