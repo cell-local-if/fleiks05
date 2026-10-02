@@ -1309,6 +1309,15 @@ def _validate_boundary_clock(clock: Any) -> dict[str, int]:
     return dict(clock)
 
 
+def _reject_duplicate_key_pairs(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+    document: dict[Any, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError("duplicate field in body")
+        document[key] = value
+    return document
+
+
 def parse_causal_at_payload(raw: bytes | str | dict[str, Any]) -> dict[str, int]:
     """Parse and validate a causal-slice boundary body.
 
@@ -1333,21 +1342,80 @@ def parse_causal_at_payload(raw: bytes | str | dict[str, Any]) -> dict[str, int]
             raise ValueError("body must be an object with only clock")
         return _validate_boundary_clock(raw.get("clock"))
 
-    def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
-        document: dict[Any, Any] = {}
-        for key, value in pairs:
-            if key in document:
-                raise ValueError("duplicate field in body")
-            document[key] = value
-        return document
-
     try:
-        payload: Any = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+        payload: Any = json.loads(text, object_pairs_hook=_reject_duplicate_key_pairs)
     except json.JSONDecodeError as exc:
         raise ValueError("body must be valid JSON") from exc
     if not isinstance(payload, dict) or set(payload.keys()) != {"clock"}:
         raise ValueError("body must be an object with only clock")
     return _validate_boundary_clock(payload.get("clock"))
+
+
+CAUSAL_AT_BATCH_MAX_KEYS = 100
+
+
+def _validate_causal_at_batch_keys(keys: Any) -> list[str]:
+    """Validate the ``keys`` array of a multi-key causal-slice body.
+
+    The array must hold between 1 and 100 distinct non-empty string keys;
+    the caller-specified order is preserved. Raises ValueError on any
+    violation.
+    """
+    if not isinstance(keys, list) or not (1 <= len(keys) <= CAUSAL_AT_BATCH_MAX_KEYS):
+        raise ValueError("keys must be a list of 1-100 entries")
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for key in keys:
+        if not isinstance(key, str) or key == "":
+            raise ValueError("keys must be non-empty strings")
+        if key in seen:
+            raise ValueError("duplicate key in keys")
+        seen.add(key)
+        normalized.append(key)
+    return normalized
+
+
+def parse_causal_at_batch_payload(
+    raw: bytes | str | dict[str, Any],
+) -> tuple[dict[str, int], list[str]]:
+    """Parse and validate a multi-key causal-slice boundary body.
+
+    The body must be a complete JSON object whose only keys are ``clock``
+    and ``keys``; unknown fields, a non-object document, or a duplicated
+    key anywhere in the document raise ValueError. ``clock`` is a boundary
+    vector clock (see :func:`_validate_boundary_clock`): it may be empty
+    (the causal origin), and otherwise maps replica ids to non-boolean
+    non-negative integers. ``keys`` is an array of 1 to 100 distinct
+    non-empty string keys in caller-specified order. Returns the
+    normalized clock and the key list.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        # Already-decoded mappings come from store-level callers, which
+        # bypass JSON and therefore the duplicate-key hook.
+        if not isinstance(raw, dict) or set(raw.keys()) != {"clock", "keys"}:
+            raise ValueError("body must be an object with only clock and keys")
+        return (
+            _validate_boundary_clock(raw.get("clock")),
+            _validate_causal_at_batch_keys(raw.get("keys")),
+        )
+
+    try:
+        payload: Any = json.loads(text, object_pairs_hook=_reject_duplicate_key_pairs)
+    except json.JSONDecodeError as exc:
+        raise ValueError("body must be valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload.keys()) != {"clock", "keys"}:
+        raise ValueError("body must be an object with only clock and keys")
+    return (
+        _validate_boundary_clock(payload.get("clock")),
+        _validate_causal_at_batch_keys(payload.get("keys")),
+    )
 
 
 def _parse_remote_snapshot(snapshot_raw: Any) -> dict[str, list[dict[str, Any]]]:
@@ -11023,6 +11091,79 @@ class StateStore:
             "candidates": present,
         }
 
+    def get_states_causal_at(
+        self, boundary: dict[str, int], keys: list[str]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Replay the accepted log up to a vector-clock boundary for many keys.
+
+        The slice is selected exactly as in :meth:`get_state_causal_at` —
+        starting from the empty state, only first-accepted records whose
+        clock is componentwise no greater than ``boundary`` (missing
+        components count as 0) are replayed in global commit order — but
+        one replay answers every requested key, so all keys are read from
+        the same committed snapshot under the commit lock: a concurrent
+        commit is either fully below or fully above the answered slice for
+        the whole batch. The read mutates neither memory, the data file,
+        logs, nor checkpoints and creates no files.
+
+        Always returns ``(200, report)`` — a key with no candidate inside
+        the boundary is reported in place and never fails the batch. The
+        report carries exactly four fields: ``clock`` (the requested
+        boundary, echoed back), ``results`` (one entry per requested key,
+        in request order, each with exactly ``key``, ``status``, and
+        ``candidates``), ``found`` (the number of keys with at least one
+        candidate inside the boundary), and ``missing`` (the number with
+        none). A found key's ``status`` is ``"resolved"`` when every
+        replayed candidate agrees on the value and ``"conflict"``
+        otherwise — the same classification as :meth:`get_state_causal_at`
+        — and its ``candidates`` are sorted by ``(replicaId, operationId)``
+        ascending, each carrying exactly ``value``, ``clock``,
+        ``replicaId``, and ``operationId``. A missing key's ``status`` is
+        ``"absent"`` with an empty ``candidates`` array.
+        """
+        with self._lock:
+            wanted = set(keys)
+            per_key: dict[str, list[dict[str, Any]]] = {key: [] for key in keys}
+            for replica_id, operation in self._accepted:
+                key = operation["key"]
+                if key not in wanted:
+                    continue
+                clock = operation["clock"]
+                if any(tick > boundary.get(component, 0) for component, tick in clock.items()):
+                    continue
+                per_key[key] = self._next_candidates(per_key[key], replica_id, operation)
+            results: list[dict[str, Any]] = []
+            found = 0
+            for key in keys:
+                ordered = sorted(
+                    per_key[key], key=lambda c: (c["replicaId"], c["operationId"])
+                )
+                present = [
+                    {
+                        "value": c["value"],
+                        "clock": dict(c["clock"]),
+                        "replicaId": c["replicaId"],
+                        "operationId": c["operationId"],
+                    }
+                    for c in ordered
+                ]
+                if not present:
+                    results.append({"key": key, "status": "absent", "candidates": []})
+                    continue
+                status = (
+                    "resolved"
+                    if all(c["value"] == present[0]["value"] for c in present)
+                    else "conflict"
+                )
+                results.append({"key": key, "status": status, "candidates": present})
+                found += 1
+        return HTTPStatus.OK, {
+            "clock": dict(boundary),
+            "results": results,
+            "found": found,
+            "missing": len(keys) - found,
+        }
+
 
 class SemanticStateServer(ThreadingHTTPServer):
     """Threading HTTP server carrying its own StateStore."""
@@ -11920,6 +12061,29 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         status, payload = self._store.get_state_causal_at(key, boundary)
+        self._json_newline(status, payload)
+
+    def _handle_states_causal_at_post(self) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those. The route
+        # accepts no query parameters, and that check precedes the body
+        # check. The report follows the compact-single-line contract:
+        # compact UTF-8 JSON, one trailing newline, numbers only as JSON
+        # integers, and the query is strictly read-only.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            boundary, keys = parse_causal_at_batch_payload(raw)
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._store.get_states_causal_at(boundary, keys)
         self._json_newline(status, payload)
 
     def _handle_state_why_get(self, key: str) -> None:
@@ -13202,6 +13366,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "states"
             and segments[3] == "causal-at"
         )
+        is_causal_at_batch_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "states"
+            and segments[2] == "causal-at"
+        )
         is_replication_compare_post = (
             len(segments) == 3
             and segments[0] == "v1"
@@ -13260,6 +13430,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_transaction_compensate_post
             or is_scope_policy_reload_post
             or is_causal_at_post
+            or is_causal_at_batch_post
             or is_replication_compare_post
             or is_replication_plan_post
             or is_replication_apply_post
@@ -13293,7 +13464,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # endpoints: a read or admin scope suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
-            elif is_causal_at_post:
+            elif is_causal_at_post or is_causal_at_batch_post:
                 # The causal slice is strictly read-only, so it is gated
                 # like every other read: a read or admin scope suffices.
                 if not self._require_scope(SCOPE_READ):
@@ -13396,6 +13567,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_causal_at_post:
             self._handle_state_causal_at_post(segments[2])
+            return
+        if is_causal_at_batch_post:
+            self._handle_states_causal_at_post()
             return
         if is_replication_compare_post:
             self._handle_replication_compare_post()

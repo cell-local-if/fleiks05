@@ -591,10 +591,8 @@ class HttpStateCausalAtTests(unittest.TestCase):
             "/v1/states/k/causal-at/extra",
             "/v1/states/k/causal-at/extra/more",
             "/v1/states/k/causal-at/",
-            "/v1/states/causal-at",
             "/v1/causal-at",
             "/v2/states/k/causal-at",
-            "/v1/states//causal-at",
         ):
             status, payload, _, _ = self.request("POST", path, {"clock": {"r1": 1}})
             self.assertEqual(status, 404, path)
