@@ -5729,15 +5729,20 @@ class StateStore:
             self._candidates.get(key, []), replica_id, operation
         )
 
-    def _persist_locked(self) -> None:
-        """Atomically write the full accepted-operation log.
+    def _export_document_locked(self) -> dict[str, Any]:
+        """Assemble the version-1 recovery document from committed state.
 
-        The temp file is fsynced before an atomic rename, and the directory
-        is fsynced afterwards, so a crash mid-write leaves either the
-        previous complete file or the new complete file, never a mix.
+        The document carries ``version`` plus the eight sections —
+        ``operations`` in shared commit order, ``checkpoints``,
+        ``policies``, ``transactions``, ``acks``, ``repairExecutions``,
+        ``policyEvents`` in hot-reload commit order, and
+        ``compensations`` — with exactly the per-record fields the data
+        file persists, no internal fields, and no extra metadata. It is
+        the shape :meth:`_persist_locked` writes atomically and
+        :meth:`get_store_export` returns, so an export of a recovered
+        state is byte-identical to the export before the restart.
         """
-        assert self._data_file is not None
-        document: dict[str, Any] = {
+        return {
             "version": DATA_FORMAT_VERSION,
             "operations": [
                 {"replicaId": replica_id, "operation": operation}
@@ -5816,6 +5821,31 @@ class StateStore:
                 for compensation_id, binding in self._compensations.items()
             ],
         }
+
+    def get_store_export(self) -> dict[str, Any]:
+        """Return the full store export from one committed snapshot.
+
+        The document is exactly the version-1 recovery format assembled
+        by :meth:`_export_document_locked`; the whole assembly runs under
+        the commit lock, so concurrent commits appear either entirely
+        before or entirely after the export — never as a mix of old and
+        new sections or half a batch. The read is strictly read-only: it
+        never opens, reads, or rewrites the data file, creates no
+        temporary file, appends no log, advances no cursor, and changes
+        neither memory nor idempotence state.
+        """
+        with self._lock:
+            return self._export_document_locked()
+
+    def _persist_locked(self) -> None:
+        """Atomically write the full accepted-operation log.
+
+        The temp file is fsynced before an atomic rename, and the directory
+        is fsynced afterwards, so a crash mid-write leaves either the
+        previous complete file or the new complete file, never a mix.
+        """
+        assert self._data_file is not None
+        document = self._export_document_locked()
         data = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
         directory = os.path.dirname(self._data_file)
         try:
@@ -11746,6 +11776,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 self._handle_scope_policy_audit_get()
             return
+        is_store_export_get = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "store"
+            and segments[3] == "export"
+        )
+        if is_store_export_get:
+            # The full-store export is published in every mode and gated
+            # by the admin scope: authentication and the scope decision
+            # run before query parsing and any state access, so an
+            # unauthorized request never observes the snapshot. The
+            # legacy single token and anonymous mode pass, exactly like
+            # on every other route. Path-shape mismatches never reach
+            # here, so they still fall through to the generic 404 below.
+            if not self._require_scope(SCOPE_ADMIN):
+                return
+            self._handle_store_export_get()
+            return
         # Every other route — known or unknown — authenticates and checks
         # the read scope before route matching, query parsing, or any state
         # access; the admin scope covers reads as well.
@@ -13617,6 +13666,29 @@ class RequestHandler(BaseHTTPRequestHandler):
         # verification (status then the four anomaly lists), terminated by
         # one newline.
         self._json_ordered_newline(status, payload)
+
+    def _handle_store_export_get(self) -> None:
+        # Authentication and the admin scope decision ran in do_GET;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 there, before any query check,
+        # so a wrong path shape with an illegal query is still 404. The
+        # endpoint accepts no request parameters — an unknown, repeated,
+        # blank, or otherwise present parameter is 400 invalid_request
+        # without reading or changing any state. The success body is the
+        # version-1 recovery document — version plus the operations,
+        # checkpoints, policies, transactions, acks, repairExecutions,
+        # policyEvents, and compensations sections, empty sections as
+        # empty arrays or objects — as compact UTF-8 JSON with one
+        # trailing newline, assembled from one committed snapshot under
+        # the commit lock, so concurrent commits surface as the full
+        # state before or after the export, never mixed. The query is
+        # strictly read-only: it never reads or rewrites the data file,
+        # creates no temporary file, appends no log, advances no cursor,
+        # and changes neither memory nor idempotence state.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json_newline(HTTPStatus.OK, self._store.get_store_export())
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
