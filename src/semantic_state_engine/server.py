@@ -5729,15 +5729,20 @@ class StateStore:
             self._candidates.get(key, []), replica_id, operation
         )
 
-    def _persist_locked(self) -> None:
-        """Atomically write the full accepted-operation log.
+    def _export_document_locked(self) -> dict[str, Any]:
+        """Build the version-1 full-store document from the committed state.
 
-        The temp file is fsynced before an atomic rename, and the directory
-        is fsynced afterwards, so a crash mid-write leaves either the
-        previous complete file or the new complete file, never a mix.
+        Must be called with the commit lock held. The document is exactly
+        what :meth:`_persist_locked` writes to the data file: ``version``
+        plus the eight sections — the accepted operations in the shared
+        commit order, the checkpoints, the policy bindings of accepted
+        automatic resolutions, the local transaction bindings, the
+        consumption receipts, the conditional repair executions, the
+        scope-policy change events in their reload commit order, and the
+        local compensation bindings. Empty sections are emitted as empty
+        arrays or objects; no internal field or extra metadata is added.
         """
-        assert self._data_file is not None
-        document: dict[str, Any] = {
+        return {
             "version": DATA_FORMAT_VERSION,
             "operations": [
                 {"replicaId": replica_id, "operation": operation}
@@ -5816,7 +5821,18 @@ class StateStore:
                 for compensation_id, binding in self._compensations.items()
             ],
         }
-        data = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+    def _persist_locked(self) -> None:
+        """Atomically write the full accepted-operation log.
+
+        The temp file is fsynced before an atomic rename, and the directory
+        is fsynced afterwards, so a crash mid-write leaves either the
+        previous complete file or the new complete file, never a mix.
+        """
+        assert self._data_file is not None
+        data = json.dumps(
+            self._export_document_locked(), separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
         directory = os.path.dirname(self._data_file)
         try:
             fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".sestate-", suffix=".tmp")
@@ -7231,6 +7247,37 @@ class StateStore:
                 "maxCandidatesInKey": max_candidates,
                 "maxDistinctValuesInKey": max_distinct_values,
             }
+
+    def get_store_export(self) -> dict[str, Any]:
+        """Return the complete committed store as one version-1 document.
+
+        The document is built and detached under the same commit lock used
+        by local writes, sync imports, transactions, repairs, checkpoint
+        commits, and policy-reload records, so the export always describes
+        a single commit: a concurrent commit is observed only as the whole
+        state before it or the whole state after it, never a mix of
+        sections from different commits. The query is strictly read-only —
+        it reads no file, creates no temporary file, appends to no log,
+        advances no cursor, and changes neither memory, the data file, nor
+        any idempotency judgment.
+
+        The result is exactly the document :meth:`_persist_locked` would
+        write to the data file for this committed state: ``version`` (1)
+        plus the eight sections ``operations`` (the accepted log in the
+        shared commit order), ``checkpoints``, ``policies``,
+        ``transactions``, ``acks``, ``repairExecutions``, ``policyEvents``
+        (in the reload commit order), and ``compensations``, with empty
+        sections as empty arrays or objects and no internal fields. The
+        local bindings (transactions, compensations, receipts, and repair
+        executions) are exported as the local audit data they are; they
+        never enter the incremental sync operation stream. Without
+        ``--data-file`` the same in-memory document is exported; with it,
+        the export of the current committed state is byte-identical to the
+        data file's content, so the same recovered state exports identical
+        content before and after a restart.
+        """
+        with self._lock:
+            return copy.deepcopy(self._export_document_locked())
 
     def get_verification_digest(self) -> dict[str, Any]:
         """Return the read-only replica-convergence digest from one snapshot.
@@ -11712,6 +11759,27 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, health_payload())
             return
         segments = self._path_segments()
+        is_store_export_get = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "store"
+            and segments[3] == "export"
+        )
+        if is_store_export_get:
+            # The full-store export is admin-gated in every mode, like the
+            # reload endpoint: authentication and the admin scope run here,
+            # before query parsing and any state access, so a missing or
+            # bad credential is 401 with the Bearer challenge, and in
+            # scope-policy mode a valid token without the admin scope is
+            # 403 without a challenge — an unauthorized request never
+            # observes a snapshot. Path-shape mismatches (missing/extra
+            # segments, a trailing slash) never reach here and fall
+            # through to the generic 404.
+            if not self._require_scope(SCOPE_ADMIN):
+                return
+            self._handle_store_export_get()
+            return
         is_scope_policy_audit_verify_get = (
             len(segments) == 5
             and segments[0] == "v1"
@@ -13617,6 +13685,26 @@ class RequestHandler(BaseHTTPRequestHandler):
         # verification (status then the four anomaly lists), terminated by
         # one newline.
         self._json_ordered_newline(status, payload)
+
+    def _handle_store_export_get(self) -> None:
+        # Authentication and the admin scope ran in do_GET before any state
+        # access; route-shape mismatches — missing, extra, or a trailing
+        # slash — fall through to the generic 404 before this handler runs.
+        # The endpoint accepts no request parameters — an unknown, repeated,
+        # blank, or otherwise present parameter is 400 invalid_request
+        # without reading or changing any state. The whole store is exported
+        # from one committed snapshot under the commit lock as the version-1
+        # document (version plus the eight sections, empty sections as empty
+        # arrays or objects, no internal fields), following the
+        # compact-single-line contract: compact UTF-8 JSON and one trailing
+        # newline. The query is strictly read-only: it reads no file,
+        # creates no temporary file, appends to no log, advances no cursor,
+        # and changes neither memory, the data file, nor any idempotency
+        # judgment.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json_newline(HTTPStatus.OK, self._store.get_store_export())
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
