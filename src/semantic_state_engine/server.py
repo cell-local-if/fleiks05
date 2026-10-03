@@ -7171,6 +7171,67 @@ class StateStore:
                 "replicas": len(replicas),
             }
 
+    def get_conflict_metrics(self) -> dict[str, int]:
+        """Return the read-only conflict-pressure overview from one snapshot.
+
+        All six counters are computed together under the same commit lock
+        used by local writes, sync imports, and resolutions, so they always
+        describe one commit: a read can never observe half an import batch
+        or a partially applied repair. The snapshot mutates neither memory
+        nor the data file.
+
+        ``keys`` counts keys that currently hold at least one candidate and
+        ``conflictKeys`` those whose candidates do not all agree on the
+        value — the same classification :meth:`get_metrics` reports. Within
+        each key the candidates are enumerated in ascending
+        ``(replicaId, operationId)`` order and every unordered pair is
+        counted once in ``candidatePairs``; a pair additionally counts in
+        ``conflictPairs`` only when the two candidates disagree on the
+        value, so same-value pairs never count as conflicts even when their
+        clocks are concurrent. ``maxCandidatesInKey`` is the largest
+        candidate count of any key and ``maxDistinctValuesInKey`` the
+        largest number of distinct values within one key. An empty store
+        reports six zeroes and a single-candidate key contributes only to
+        ``keys`` (and the two maxima). With ``--data-file`` the candidate
+        state is rebuilt identically during recovery, so the counters match
+        the pre-restart values.
+        """
+        with self._lock:
+            keys = 0
+            conflict_keys = 0
+            candidate_pairs = 0
+            conflict_pairs = 0
+            max_candidates = 0
+            max_distinct_values = 0
+            for candidates in self._candidates.values():
+                keys += 1
+                ordered = sorted(
+                    candidates,
+                    key=lambda c: (c["replicaId"], c["operationId"]),
+                )
+                count = len(ordered)
+                distinct_values = {c["value"] for c in ordered}
+                if len(distinct_values) > 1:
+                    conflict_keys += 1
+                if count > max_candidates:
+                    max_candidates = count
+                if len(distinct_values) > max_distinct_values:
+                    max_distinct_values = len(distinct_values)
+                for first in range(count):
+                    first_value = ordered[first]["value"]
+                    for second in range(first + 1, count):
+                        candidate_pairs += 1
+                        if ordered[second]["value"] != first_value:
+                            conflict_pairs += 1
+            return {
+                "keys": keys,
+                "conflictKeys": conflict_keys,
+                "candidatePairs": candidate_pairs,
+                "conflictPairs": conflict_pairs,
+                "maxCandidatesInKey": max_candidates,
+                "maxDistinctValuesInKey": max_distinct_values,
+            }
+
     def get_verification_digest(self) -> dict[str, Any]:
         """Return the read-only replica-convergence digest from one snapshot.
 
@@ -11696,6 +11757,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         if (
             len(segments) == 3
             and segments[0] == "v1"
+            and segments[1] == "metrics"
+            and segments[2] == "conflicts"
+        ):
+            self._handle_metrics_conflicts_get()
+            return
+        if (
+            len(segments) == 3
+            and segments[0] == "v1"
             and segments[1] == "integrity"
             and segments[2] == "verify"
         ):
@@ -12152,6 +12221,21 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         self._json(HTTPStatus.OK, self._store.get_metrics())
+
+    def _handle_metrics_conflicts_get(self) -> None:
+        # The route-shape check in do_GET already ran: a missing or extra
+        # segment, a trailing slash, or a non-GET method is 404 there,
+        # before any query check, so a wrong path shape with an illegal
+        # query is still 404. The endpoint accepts no request parameters —
+        # an unknown, repeated, blank, or otherwise present parameter is
+        # 400 invalid_request without reading or changing any state. The
+        # six counters are computed from one committed snapshot under the
+        # commit lock and the read is strictly read-only: it changes
+        # neither memory, the data file, logs, nor audits.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        self._json(HTTPStatus.OK, self._store.get_conflict_metrics())
 
     def _handle_integrity_verify_get(self) -> None:
         # The route-shape check in do_GET already ran: a missing or extra

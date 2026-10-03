@@ -352,6 +352,25 @@ All six counters are computed from one snapshot under the same commit lock used 
 
 With `--data-file`, the counters are rebuilt from the recovered log on startup, so after a restart they are identical to those reported just before the restart.
 
+### Read-only conflict-pressure metrics
+
+`GET /v1/metrics/conflicts` returns HTTP 200 with a UTF-8 JSON object containing exactly six non-negative integer counters:
+
+```json
+{"keys":2,"conflictKeys":1,"candidatePairs":4,"conflictPairs":3,"maxCandidatesInKey":3,"maxDistinctValuesInKey":2}
+```
+
+- `keys`: the number of keys that currently hold at least one candidate — the same count reported by `GET /v1/metrics`.
+- `conflictKeys`: keys whose candidates do not all agree on a value — the same classification as `GET /v1/metrics`.
+- `candidatePairs`: the total number of unordered candidate pairs, counted once per pair within each key (candidates enumerated in ascending `(replicaId, operationId)` order).
+- `conflictPairs`: the subset of those pairs whose two candidates disagree on the value; same-value pairs never count as conflicts, even when their clocks are concurrent.
+- `maxCandidatesInKey`: the largest candidate count of any single key.
+- `maxDistinctValuesInKey`: the largest number of distinct values within any single key.
+
+An empty store reports six zeroes; a single-candidate key contributes only to `keys` (and the two maxima). The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}`. A missing or extra path segment or a trailing slash (for example `/v1/metrics/conflicts/`) returns HTTP 404 with `{"error":"not_found"}`, as does any non-GET method.
+
+All six counters are computed from one snapshot under the same commit lock used by local writes, sync-import batches, and repairs, so they always describe a single commit. The request is strictly read-only — it modifies neither memory, the data file, logs, nor audits. With `--data-file`, the recovered candidate state yields the same counters after a restart as just before it.
+
 ### Replica-convergence verification digest
 
 `GET /v1/verification/digest` returns HTTP 200 with a UTF-8 JSON object containing exactly four fields:
