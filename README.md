@@ -914,6 +914,25 @@ Status codes: a missing, repeated, unknown, blank, or malformed parameter (a non
 
 With `--data-file`, the identity index is rebuilt from the recovered log on startup, so successful results, the 404 boundary, and error statuses are identical before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
 
+### Per-operation provenance
+
+`GET /v1/replicas/{replicaId}/operations/{operationId}/provenance` explains an accepted operation's **immediate semantic impact** on its target key and, for a local automatic repair, the policy it came from. Both path segments are percent-decoded like every other route. Every first-accepted record is queryable — ordinary writes, stale writes that added no candidate, manual and automatic resolutions, and sync-imported records alike — while an identity that was never first-accepted returns HTTP 404 with `{"error":"not_found"}`.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with exactly seven fields in this order:
+
+```json
+{"replicaId":R,"operationId":O,"operation":{...},"origin":"other","policy":null,"before":{"status":"absent","candidates":[]},"after":{"status":"resolved","candidates":[...]}}
+```
+
+- `replicaId`, `operationId`: the queried identity.
+- `operation`: the per-operation archive operation object, exactly `operationId`, `key`, `value`, and `clock` with their committed values.
+- `origin`: `"automatic_resolution"` when this replica holds a local automatic-resolution policy binding for the identity, and `"other"` for every other record — a plain write, a manual resolution, or a sync-imported operation with no local binding. A data file written before the `policies` section existed recovers with an empty binding, so all of its records are `"other"`.
+- `policy`: one of the four published automatic policies (`"lowest_identity"`, `"highest_identity"`, `"lowest_value"`, `"highest_value"`) when `origin` is `"automatic_resolution"`, otherwise `null`.
+- `before`, `after`: the target key's candidate snapshots immediately before and immediately after the target record, replayed from the shared accepted log in global commit order through the same vector-clock domination semantics as every other replay. Each snapshot is `{"status","candidates"}`: candidates are sorted by `(replicaId, operationId)` ascending and each carries exactly `value`, `clock`, `replicaId`, and `operationId`; an empty list is `"absent"`, agreeing values make it `"resolved"`, and differing values make it `"conflict"`. A stale write whose clock is already dominated adds no candidate, so `before` and `after` are identical. Records committed after the target never enter either snapshot, so a later overwrite of the key leaves the response unchanged.
+- An automatic resolution necessarily starts from a value conflict (its request was rejected unless the key held at least two distinct values) and its target clock dominates the prior candidates, so `before` for such a record is always a `"conflict"` snapshot whose chosen value matches the policy, and `after` is the snapshot after that dominating clock removed the conflicting candidates.
+
+The whole explanation is computed from one snapshot under the same commit lock used by local writes, sync imports, repairs, and checkpoints, so it always describes one commit. The query is strictly read-only — it writes no state and no files, changes no candidates, metrics, audit streams, or checkpoints, and appends no log. It takes no query parameters: any parameter — repeated, blank-named, or blank-valued — returns HTTP 400 with `{"error":"invalid_request"}`. A wrong path shape (for example `/v1/replicas//operations/{operationId}/provenance`, `/v1/replicas/{replicaId}/operations/{operationId}/provenance/extra`, or a trailing slash) or a non-GET method returns HTTP 404 with `{"error":"not_found"}`; the path-shape check takes precedence over the query check. With `--data-file` the log and policy bindings rebuild identically during recovery, so the same accepted log yields the same provenance before and after a restart. Authentication follows every other non-`/health` read-only GET: a missing or bad credential is HTTP 401 with `WWW-Authenticate: Bearer`; in scope-policy mode an authenticated token missing both the read and admin scopes is HTTP 403 with no challenge header.
+
 ### Per-operation causal ancestor chain
 
 `GET /v1/causal/{replicaId}/{operationId}?after=N&limit=N` returns a read-only page of one operation's **strict causal predecessors**. Both path segments are percent-decoded like every other route and must be non-empty after decoding; an identity that was never first-accepted returns HTTP 404 with `{"error":"not_found"}`, and the route-shape check takes precedence over every other check.
