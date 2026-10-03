@@ -6477,6 +6477,138 @@ class StateStore:
                 )
             return status, results, accepted, replayed, None
 
+    def plan_transaction(
+        self, transaction_id: str, entries: list[dict[str, Any]]
+    ) -> tuple[HTTPStatus, list[dict[str, Any]], int, int, str | None]:
+        """Preview a validated atomic multi-key transaction without committing.
+
+        Read-only dry run of :meth:`apply_transaction` against one complete
+        committed snapshot. The parser already guarantees 1-100 entries with
+        distinct keys, distinct identities, and per-entry candidate sets of
+        distinct identities. The transaction id and the entries are judged
+        by exactly the rules of the committing endpoint:
+
+        - a transaction id already bound to the identical entry list is a
+          whole-transaction replay, answered from the committed operations
+          without re-checking the current candidate state; the same id with
+          different entries is an operation conflict;
+        - a known ``(replicaId, operationId)`` with identical operation
+          content is a replay answered from the committed operation; a
+          known identity with different content is an operation conflict;
+        - a new identity is counted as accepted only when its expected
+          candidate set exactly matches the key's current candidate
+          identities and its clock strictly dominates every one of those
+          candidates.
+
+        Nothing is written: no operation, binding, candidate, accepted-log
+        record, audit entry, or metric is created, the data file keeps its
+        exact bytes, and no temporary file is made. Because the dry run runs
+        entirely under the commit lock on staged copies, a concurrent commit
+        can only move the whole store from one complete snapshot to another
+        — a returned plan is fixed by the snapshot observed.
+
+        Returns ``(status, results, accepted, replayed, error)`` shaped like
+        :meth:`apply_transaction`, except success always carries HTTP 200
+        (the caller adds the ``"planned"`` status string): ``results`` in
+        request order (each carrying ``key``, ``replicaId``, ``operationId``,
+        and the value a commit would report), with ``accepted`` counting
+        entries a commit would newly create and ``replayed`` the identical
+        replays; or 409 with ``"operation_conflict"`` /
+        ``"transaction_conflict"`` and no results. Raises ValueError when an
+        entry clock does not dominate its expected candidates, exactly like
+        the committing endpoint (a malformed request, not a state conflict).
+        """
+        with self._lock:
+            binding = self._transactions.get(transaction_id)
+            if binding is not None:
+                if binding == entries:
+                    # Identical replay: answer from the committed operations
+                    # without inspecting the current candidate state.
+                    replay_results = []
+                    for entry in entries:
+                        seen = self._operations[
+                            (entry["replicaId"], entry["operationId"])
+                        ]
+                        replay_results.append(
+                            {
+                                "key": entry["key"],
+                                "replicaId": entry["replicaId"],
+                                "operationId": entry["operationId"],
+                                "value": seen["value"],
+                            }
+                        )
+                    return HTTPStatus.OK, replay_results, 0, len(entries), None
+                return HTTPStatus.CONFLICT, [], 0, 0, "operation_conflict"
+
+            # Staged copies keep the entire preview off the visible state;
+            # the same discipline as the committing transaction, but nothing
+            # from the staging is ever written back or persisted.
+            staged_operations = dict(self._operations)
+            staged_candidates = {
+                key: list(candidates) for key, candidates in self._candidates.items()
+            }
+            results: list[dict[str, Any]] = []
+            accepted = 0
+            replayed = 0
+
+            for entry in entries:
+                replica_id = entry["replicaId"]
+                key = entry["key"]
+                identity = (replica_id, entry["operationId"])
+                operation = {
+                    "operationId": entry["operationId"],
+                    "key": key,
+                    "value": entry["value"],
+                    "clock": entry["clock"],
+                }
+                seen = staged_operations.get(identity)
+                if seen is not None:
+                    if seen == operation:
+                        replayed += 1
+                        results.append(
+                            {
+                                "key": key,
+                                "replicaId": replica_id,
+                                "operationId": entry["operationId"],
+                                "value": seen["value"],
+                            }
+                        )
+                        continue
+                    return HTTPStatus.CONFLICT, [], 0, 0, "operation_conflict"
+
+                current = staged_candidates.get(key, [])
+                current_identities = {
+                    (c["replicaId"], c["operationId"]) for c in current
+                }
+                expected_identities = {
+                    (c["replicaId"], c["operationId"]) for c in entry["candidates"]
+                }
+                if current_identities != expected_identities:
+                    return HTTPStatus.CONFLICT, [], 0, 0, "transaction_conflict"
+                # A legal clock that fails to dominate the expected
+                # candidates is a malformed transaction (400), not a state
+                # conflict — the same classification as the commit.
+                if not all(
+                    clock_dominates(operation["clock"], c["clock"]) for c in current
+                ):
+                    raise ValueError("clock does not dominate every expected candidate")
+
+                staged_candidates[key] = self._next_candidates(
+                    current, replica_id, operation
+                )
+                staged_operations[identity] = operation
+                accepted += 1
+                results.append(
+                    {
+                        "key": key,
+                        "replicaId": replica_id,
+                        "operationId": entry["operationId"],
+                        "value": operation["value"],
+                    }
+                )
+
+            return HTTPStatus.OK, results, accepted, replayed, None
+
     def get_transactions_verify(
         self,
         after: int,
@@ -13188,6 +13320,50 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_transaction_plan_post(self) -> None:
+        # Read-only preview of the committing transaction: the response
+        # shows, per entry, the value a commit would report against the
+        # snapshot observed now, without changing any business state. The
+        # route-shape check in do_POST already ran (missing or extra
+        # segments — including a trailing slash — are 404 there), so a
+        # query parameter is rejected here without any state being read.
+        # The response follows the batch contract: compact JSON, one
+        # trailing newline, counts only as JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            transaction_id, entries = parse_transaction_apply(raw)
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # The preview cannot persist anything, so it has no durable-failure
+        # path: success carries the planned results, a conflict carries the
+        # same error body as the committing transaction.
+        try:
+            status, results, accepted, replayed, error = self._store.plan_transaction(
+                transaction_id, entries
+            )
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json_newline(status, {"error": error})
+            return
+        self._json_newline(
+            status,
+            {
+                "status": "planned",
+                "transactionId": transaction_id,
+                "operations": results,
+                "accepted": accepted,
+                "replayed": replayed,
+            },
+        )
+
     def _handle_transaction_apply_post(self) -> None:
         # The route-shape check in do_POST already ran (missing or extra
         # segments — including a trailing slash — are 404 there), so a
@@ -13408,6 +13584,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "transactions"
             and segments[2] == "apply"
         )
+        is_transaction_plan_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "transactions"
+            and segments[2] == "plan"
+        )
         is_transaction_compensate_post = (
             len(segments) == 4
             and segments[0] == "v1"
@@ -13493,6 +13675,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_auto_resolve_batch_post
             or is_auto_resolve_plan_post
             or is_transaction_apply_post
+            or is_transaction_plan_post
             or is_transaction_compensate_post
             or is_scope_policy_reload_post
             or is_causal_at_post
@@ -13528,6 +13711,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif is_auto_resolve_plan_post:
                 # The preview changes no state, so it is gated like the read
                 # endpoints: a read or admin scope suffices.
+                if not self._require_scope(SCOPE_READ):
+                    return
+            elif is_transaction_plan_post:
+                # The transaction preview only replays the staged judgement
+                # against one committed snapshot and commits nothing, so it
+                # is gated like the other read-only POSTs: a read or admin
+                # scope suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
             elif is_causal_at_post or is_states_causal_at_post:
@@ -13626,6 +13816,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_transaction_apply_post:
             self._handle_transaction_apply_post()
+            return
+        if is_transaction_plan_post:
+            self._handle_transaction_plan_post()
             return
         if is_transaction_compensate_post:
             self._handle_transaction_compensate_post(segments[2])
