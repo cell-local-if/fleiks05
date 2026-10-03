@@ -1337,6 +1337,56 @@ def parse_empty_object_payload(raw: bytes | str | dict[str, Any]) -> None:
         raise ValueError("body must be an empty JSON object")
 
 
+def parse_scope_policy_reload_payload(raw: bytes | str | dict[str, Any]) -> str | None:
+    """Parse and validate a scope-policy reload body.
+
+    The body must be a complete JSON object of exactly one of two shapes:
+    the empty object ``{}`` — an unconditional reload, returning None — or
+    ``{"expectedPolicyDigest": "<64 lowercase hex>"}`` — a conditional
+    reload, returning the expected digest. Malformed JSON, a non-object
+    document, a duplicated key anywhere in the document, any other field
+    (known or unknown), and an ``expectedPolicyDigest`` value that is not
+    exactly 64 lowercase hexadecimal characters raise ValueError.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+
+        def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+            document: dict[Any, Any] = {}
+            for key, value in pairs:
+                if key in document:
+                    raise ValueError("duplicate field in body")
+                document[key] = value
+            return document
+
+        try:
+            payload: Any = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict):
+        raise ValueError("body must be a JSON object")
+    if not payload:
+        return None
+    if set(payload.keys()) != {"expectedPolicyDigest"}:
+        raise ValueError("body must be empty or carry only expectedPolicyDigest")
+    expected = payload["expectedPolicyDigest"]
+    if (
+        not isinstance(expected, str)
+        or len(expected) != 64
+        or any(char not in "0123456789abcdef" for char in expected)
+    ):
+        raise ValueError(
+            "expectedPolicyDigest must be 64 lowercase hexadecimal characters"
+        )
+    return expected
+
+
 def _validate_boundary_clock(clock: Any) -> dict[str, int]:
     """Validate a causal-at boundary clock and return a clean copy.
 
@@ -4457,9 +4507,12 @@ class ScopePolicyReloadError(Exception):
     means the configured file is missing, unreadable, not a regular file, or
     could not be read (HTTP 503 ``policy_unavailable``); ``"conflict"``
     means the file was readable but its content failed the same UTF-8 JSON
-    and token/scope validation as startup (HTTP 409 ``policy_conflict``).
-    Either way the live policy stays in force and the error never echoes the
-    file's tokens or contents.
+    and token/scope validation as startup (HTTP 409 ``policy_conflict``);
+    ``"state_conflict"`` means a conditional reload's expected digest did
+    not match the live policy's digest at comparison time (HTTP 409
+    ``policy_state_conflict``) — the file is never read, the policy is not
+    swapped, and no event is recorded. Either way the live policy stays in
+    force and the error never echoes the file's tokens or contents.
     """
 
     def __init__(self, kind: str, message: str) -> None:
@@ -4562,14 +4615,15 @@ def load_scope_policy(path: str) -> dict[str, frozenset[str]]:
 class ScopePolicyManager:
     """Thread-safe holder of the live token-to-scopes policy.
 
-    The manager owns the immutable policy mapping and the path of the file
-    given at startup. Authentication takes a snapshot of the mapping under
-    the manager's lock; a reload re-reads and validates that same configured
+    The manager owns the immutable policy mapping, the digest of the
+    policy revision currently in force, and the path of the file given at
+    startup. Authentication takes a snapshot of the mapping under the
+    manager's lock; a reload re-reads and validates that same configured
     file and only then swaps the mapping, so the replacement is one atomic
     commit: concurrent reloads run strictly one after another as complete
-    read-validate-swap units, and every request authenticates against
-    either the whole old policy or the whole new one, never a partial
-    state. A failed reload leaves the live mapping untouched.
+    compare-read-validate-swap units, and every request authenticates
+    against either the whole old policy or the whole new one, never a
+    partial state. A failed reload leaves the live mapping untouched.
     """
 
     def __init__(
@@ -4582,6 +4636,22 @@ class ScopePolicyManager:
         self._path = os.path.abspath(path) if path is not None else None
         self._lock = threading.Lock()
         self._policy = dict(policy)
+        # The digest of the policy revision in force: the 64-character
+        # lowercase hexadecimal SHA-256 of the raw UTF-8 bytes of the file
+        # the initial mapping was parsed from. It is established once here,
+        # at startup — the status query never re-reads the file — and
+        # advanced by every successful reload under the same lock as the
+        # swap. It stays None only when no policy file was configured or
+        # its bytes could not be read back, in which case the status query
+        # reports the policy as unavailable.
+        self._digest: str | None = None
+        if self._path is not None:
+            try:
+                self._digest = hashlib.sha256(
+                    read_scope_policy_bytes(self._path)
+                ).hexdigest()
+            except ScopePolicyError:
+                self._digest = None
 
     @property
     def path(self) -> str | None:
@@ -4592,24 +4662,49 @@ class ScopePolicyManager:
         with self._lock:
             return dict(self._policy)
 
+    def status(self) -> tuple[str, int]:
+        """Return the live policy's ``(policy_digest, tokens)`` pair.
+
+        Purely a read of the manager's tracked state under the same lock
+        that serializes reloads: the configured file is never re-read and
+        neither memory nor the data file is written. ``policy_digest`` is
+        the 64-character lowercase hexadecimal SHA-256 of the raw UTF-8
+        bytes of the policy revision currently in force and ``tokens`` its
+        number of token entries. Raises ScopePolicyReloadError(
+        kind="unavailable") when no digest is tracked because no policy
+        file was configured at startup.
+        """
+        with self._lock:
+            if self._digest is None:
+                raise ScopePolicyReloadError(
+                    "unavailable", "no scope policy file was configured at startup"
+                )
+            return self._digest, len(self._policy)
+
     def reload(
         self,
         recorder: "Callable[[str, int], Any] | None" = None,
+        expected: str | None = None,
     ) -> tuple[str, int]:
         """Atomically reload the policy from the startup-configured file.
 
         Re-reads the same file the service started with (the request may
         not name another path), validates it under exactly the startup
         constraints, and swaps the live mapping in one commit serialized
-        against concurrent reloads and authentication snapshots. On
-        success returns ``(policy_digest, tokens)`` where
-        ``policy_digest`` is the 64-character lowercase hexadecimal
-        SHA-256 of the file's raw UTF-8 bytes and ``tokens`` is the
-        non-negative number of token entries. A missing, unreadable,
-        non-regular, or otherwise unreadable file raises
-        ScopePolicyReloadError(kind="unavailable"); readable-but-invalid
-        content raises ScopePolicyReloadError(kind="conflict") and leaves
-        the live policy complete and in force. No temporary file is
+        against concurrent reloads and authentication snapshots. When
+        ``expected`` is given — the 64-character lowercase hexadecimal
+        digest the caller believes the live policy carries — the reload is
+        conditional: the expectation is compared against the live digest
+        inside the same serialization as the swap, and a mismatch raises
+        ScopePolicyReloadError(kind="state_conflict") without reading the
+        file, swapping the policy, or recording an event. On success
+        returns ``(policy_digest, tokens)`` where ``policy_digest`` is the
+        64-character lowercase hexadecimal SHA-256 of the file's raw UTF-8
+        bytes and ``tokens`` is the non-negative number of token entries.
+        A missing, unreadable, non-regular, or otherwise unreadable file
+        raises ScopePolicyReloadError(kind="unavailable"); readable-but-
+        invalid content raises ScopePolicyReloadError(kind="conflict") and
+        leaves the live policy complete and in force. No temporary file is
         created.
 
         When ``recorder`` is given it is called with
@@ -4625,13 +4720,22 @@ class ScopePolicyManager:
             raise ScopePolicyReloadError(
                 "unavailable", "no scope policy file was configured at startup"
             )
-        # Hold the lock across read, validation, the durable audit record,
-        # and the swap, so each reload is one complete commit serialized
-        # against other reloads and against authentication snapshots:
-        # while a reload is reading, validating, or recording, every
-        # request still sees the old policy, and once it releases every
-        # request sees the new one.
+        # Hold the lock across the expectation comparison, read, validation,
+        # the durable audit record, and the swap, so each reload is one
+        # complete commit serialized against other reloads and against
+        # authentication snapshots: while a reload is comparing, reading,
+        # validating, or recording, every request still sees the old policy,
+        # and once it releases every request sees the new one.
         with self._lock:
+            if expected is not None and expected != self._digest:
+                # Conditional reload with a stale expectation: the
+                # comparison is complete before any file access, and the
+                # conflict reads nothing, swaps nothing, and records no
+                # event.
+                raise ScopePolicyReloadError(
+                    "state_conflict",
+                    "expected policy digest does not match the live policy",
+                )
             try:
                 raw = read_scope_policy_bytes(path)
             except ScopePolicyError as exc:
@@ -4644,10 +4748,11 @@ class ScopePolicyManager:
             entries = len(policy)
             if recorder is not None:
                 # Durably commit the change event before swapping the live
-                # boundary: if this raises, the line below never runs, so
+                # boundary: if this raises, the lines below never run, so
                 # the old policy and the old history both survive.
                 recorder(digest, entries)
             self._policy = policy
+            self._digest = digest
         return digest, entries
 
 
@@ -11757,15 +11862,27 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "scope-policy"
             and segments[3] == "audit"
         )
-        if is_scope_policy_audit_verify_get or is_scope_policy_audit_get:
-            # Both change-audit entries are admin-gated, like the reload
-            # endpoint, and exist only in scope-policy mode. Authentication
-            # still runs before the mode gate, so a missing or bad
-            # credential is 401 in every mode, a valid token without the
-            # admin scope is 403 without a challenge, and single-token plus
-            # anonymous modes answer 404 exactly like an unpublished route.
-            # Path-shape mismatches never reach here, so they still fall
-            # through to the generic 404 below.
+        is_scope_policy_status_get = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "scope-policy"
+            and segments[3] == "status"
+        )
+        if (
+            is_scope_policy_audit_verify_get
+            or is_scope_policy_audit_get
+            or is_scope_policy_status_get
+        ):
+            # The change-audit entries and the policy-status query are
+            # admin-gated, like the reload endpoint, and exist only in
+            # scope-policy mode. Authentication still runs before the mode
+            # gate, so a missing or bad credential is 401 in every mode, a
+            # valid token without the admin scope is 403 without a
+            # challenge, and single-token plus anonymous modes answer 404
+            # exactly like an unpublished route. Path-shape mismatches
+            # never reach here, so they still fall through to the generic
+            # 404 below.
             if not self._require_scope(SCOPE_ADMIN):
                 return
             if getattr(self.server, "scope_policy", None) is None:
@@ -11773,8 +11890,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if is_scope_policy_audit_verify_get:
                 self._handle_scope_policy_audit_verify_get()
-            else:
+            elif is_scope_policy_audit_get:
                 self._handle_scope_policy_audit_get()
+            else:
+                self._handle_scope_policy_status_get()
             return
         is_store_export_get = (
             len(segments) == 4
@@ -13583,7 +13702,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if raw is None:
             return
         try:
-            parse_empty_object_payload(raw)
+            expected = parse_scope_policy_reload_payload(raw)
         except ValueError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
@@ -13596,15 +13715,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         # The recorder durably commits the change event before the manager
         # swaps the live policy, so a durable failure aborts the whole
         # reload: the old policy stays in force and the failed reload
-        # leaves no event behind.
+        # leaves no event behind. A conditional reload compares its
+        # expectation against the live digest inside the same serialized
+        # commit, before the file is read.
         recorder = self._store.record_policy_reload
         try:
-            digest, tokens = manager.reload(recorder)
+            digest, tokens = manager.reload(recorder, expected)
         except ScopePolicyReloadError as exc:
             if exc.kind == "unavailable":
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE, {"error": "policy_unavailable"}
                 )
+            elif exc.kind == "state_conflict":
+                self._json(HTTPStatus.CONFLICT, {"error": "policy_state_conflict"})
             else:
                 self._json(HTTPStatus.CONFLICT, {"error": "policy_conflict"})
             return
@@ -13615,6 +13738,35 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._json_ordered(
             HTTPStatus.OK,
             {"status": "reloaded", "policyDigest": digest, "tokens": tokens},
+        )
+
+    def _handle_scope_policy_status_get(self) -> None:
+        # Authentication, the admin scope, and the scope-mode gate all ran
+        # in do_GET; route-shape mismatches — missing, extra, or a trailing
+        # slash — fall through to the generic 404 before this handler runs.
+        # The route accepts no query parameters.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        manager = getattr(self.server, "scope_policy", None)
+        if manager is None:
+            # Defensive: the mode gate already ran in do_GET. This keeps a
+            # missing manager a not-found rather than a server error.
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        try:
+            digest, tokens = manager.status()
+        except ScopePolicyReloadError:
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE, {"error": "policy_unavailable"}
+            )
+            return
+        # The query is strictly read-only: it never re-reads the configured
+        # file and writes neither memory nor the data file. Field order is
+        # part of the contract: status, policyDigest, tokens.
+        self._json_ordered(
+            HTTPStatus.OK,
+            {"status": "active", "policyDigest": digest, "tokens": tokens},
         )
 
     def _handle_scope_policy_audit_get(self) -> None:
