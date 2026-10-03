@@ -126,6 +126,75 @@ def parse_operation_payload(raw: bytes | str | dict[str, Any], replica_id: str) 
     }
 
 
+def parse_conditional_operation_payload(
+    raw: bytes | str | dict[str, Any], replica_id: str
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Parse and validate a conditional-write payload for ``replica_id``.
+
+    The body must be a JSON object with exactly ``operationId``, ``key``,
+    ``value``, ``clock``, and ``expectedCandidates``. The first four follow
+    the ordinary write constraints (see :func:`parse_operation_payload`);
+    ``expectedCandidates`` is the candidate identity set the caller expects
+    the key to currently hold — a list of distinct
+    ``{"replicaId", "operationId"}`` identities, possibly empty (the key is
+    expected to hold no candidates). Returns the normalized operation dict
+    — the same shape an ordinary write commits, so identity replays match
+    across both entry points — and the expected identities in request
+    order. Raises ValueError on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            payload: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or set(payload.keys()) != {
+        "operationId",
+        "key",
+        "value",
+        "clock",
+        "expectedCandidates",
+    }:
+        raise ValueError(
+            "payload must be an object with only operationId, key, value, "
+            "clock, expectedCandidates"
+        )
+
+    operation = parse_operation_payload(payload, replica_id)
+
+    expected_raw = payload["expectedCandidates"]
+    if not isinstance(expected_raw, list):
+        raise ValueError("expectedCandidates must be a list")
+    expected: list[dict[str, str]] = []
+    identities: set[tuple[str, str]] = set()
+    for entry in expected_raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {"replicaId", "operationId"}:
+            raise ValueError(
+                "each expected candidate must have only replicaId and operationId"
+            )
+        candidate_replica = entry["replicaId"]
+        candidate_operation = entry["operationId"]
+        if not isinstance(candidate_replica, str) or candidate_replica == "":
+            raise ValueError("expected candidate replicaId must be a non-empty string")
+        if not isinstance(candidate_operation, str) or candidate_operation == "":
+            raise ValueError("expected candidate operationId must be a non-empty string")
+        identity = (candidate_replica, candidate_operation)
+        if identity in identities:
+            raise ValueError(f"duplicate expected candidate {identity!r}")
+        identities.add(identity)
+        expected.append(
+            {"replicaId": candidate_replica, "operationId": candidate_operation}
+        )
+
+    return operation, expected
+
+
 def parse_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
     """Parse and validate a conflict-resolution request body.
 
@@ -5986,6 +6055,66 @@ class StateStore:
             self._operations[identity] = operation
             self._candidates[operation["key"]] = next_candidates
             return HTTPStatus.CREATED
+
+    def apply_conditional_operation(
+        self,
+        replica_id: str,
+        operation: dict[str, Any],
+        expected_candidates: list[dict[str, str]],
+    ) -> tuple[HTTPStatus, str | None]:
+        """Apply a validated conditional write, returning status and error.
+
+        The expected candidate identity set constrains only the first
+        commit. Under the same commit lock the ordinary idempotence rules
+        run first: a known identity with identical content is a replay
+        (200) however the candidate set has moved since and whatever the
+        request expects, and a known identity with different content is an
+        operation conflict (409 ``"operation_conflict"``). Only an unseen
+        identity is checked against the key's current candidate identity
+        set; a mismatch is 409 ``"state_conflict"`` and commits nothing —
+        no operation, candidate, audit, receipt, checkpoint, or data-file
+        content changes. A match commits exactly like an ordinary write:
+        first-accepted operations are persisted (when configured) before
+        the in-memory commit becomes visible, and a durable failure leaves
+        memory, the identity index, and the file unchanged.
+
+        Returns ``(status, error)``: 201/200 with ``error=None`` on
+        commit/replay, or 409 with ``"operation_conflict"`` or
+        ``"state_conflict"``. Raises PersistenceError when the durable
+        commit fails.
+        """
+        with self._lock:
+            identity = (replica_id, operation["operationId"])
+            seen = self._operations.get(identity)
+            if seen is not None:
+                if seen == operation:
+                    return HTTPStatus.OK, None
+                return HTTPStatus.CONFLICT, "operation_conflict"
+
+            current = self._candidates.get(operation["key"], [])
+            current_identities = {(c["replicaId"], c["operationId"]) for c in current}
+            expected_identities = {
+                (c["replicaId"], c["operationId"]) for c in expected_candidates
+            }
+            if current_identities != expected_identities:
+                return HTTPStatus.CONFLICT, "state_conflict"
+
+            next_candidates = self._next_candidates(current, replica_id, operation)
+            if self._data_file is not None:
+                # Same commit discipline as ordinary writes: the atomic
+                # rename is the single commit point, and memory moves only
+                # after it.
+                self._accepted.append((replica_id, operation))
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    self._accepted.pop()
+                    raise
+            else:
+                self._accepted.append((replica_id, operation))
+            self._operations[identity] = operation
+            self._candidates[operation["key"]] = next_candidates
+            return HTTPStatus.CREATED, None
 
     def apply_resolution(self, key: str, resolution: dict[str, Any]) -> tuple[HTTPStatus, str | None]:
         """Apply a validated conflict resolution for ``key``.
@@ -13828,6 +13957,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "replicas"
             and segments[3] == "operations"
         )
+        is_conditional_operation_post = (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "replicas"
+            and segments[3] == "operations"
+            and segments[4] == "conditional"
+        )
         is_resolve_post = (
             len(segments) == 4
             and segments[0] == "v1"
@@ -13952,6 +14088,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             matched
             or matched_ack
             or is_operation_post
+            or is_conditional_operation_post
             or is_resolve_post
             or is_auto_resolve_post
             or is_sync_post
@@ -14075,6 +14212,36 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if status is HTTPStatus.CONFLICT:
                 self._json(status, {"error": "operation_conflict"})
+                return
+            payload = {
+                "status": "ok" if status is HTTPStatus.OK else "created",
+                "replicaId": replica_id,
+                "operationId": operation["operationId"],
+                "key": operation["key"],
+            }
+            self._json(status, payload)
+            return
+        if is_conditional_operation_post:
+            replica_id = segments[2]
+            raw = self._read_bounded_body()
+            if raw is None:
+                return
+            try:
+                operation, expected_candidates = parse_conditional_operation_payload(
+                    raw, replica_id
+                )
+            except ValueError:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            try:
+                status, error = self._store.apply_conditional_operation(
+                    replica_id, operation, expected_candidates
+                )
+            except PersistenceError:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+                return
+            if status is HTTPStatus.CONFLICT:
+                self._json(status, {"error": error})
                 return
             payload = {
                 "status": "ok" if status is HTTPStatus.OK else "created",
