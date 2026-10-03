@@ -184,8 +184,9 @@ class StateExplanationStoreTests(unittest.TestCase):
         )
 
     def test_suggestion_matches_both_identity_policies(self) -> None:
-        # The suggestion names exactly the candidates the two existing
-        # automatic-resolution policies commit for the same conflict.
+        # The suggestion keeps its two identity-policy keys and names
+        # exactly the candidates those two policies commit for the same
+        # conflict (the value policies add no keys to this response).
         for policy, expected in (
             ("lowest_identity", "v1"),
             ("highest_identity", "v2"),

@@ -197,7 +197,38 @@ def parse_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
     }
 
 
-AUTO_RESOLVE_POLICIES = ("lowest_identity", "highest_identity")
+AUTO_RESOLVE_POLICIES = (
+    "lowest_identity",
+    "highest_identity",
+    "lowest_value",
+    "highest_value",
+)
+AUTO_RESOLVE_POLICY_MESSAGE = (
+    "policy must be one of 'lowest_identity', 'highest_identity', "
+    "'lowest_value', or 'highest_value'"
+)
+
+
+def _select_auto_resolution_candidate(
+    candidates: list[dict[str, Any]], policy: str
+) -> dict[str, Any]:
+    """Select the current candidate supplying a resolution value.
+
+    The identity policies compare the ``(replicaId, operationId)`` tuple;
+    the value policies compare candidate string values by Unicode code
+    point (every candidate value is a non-empty string, so plain string
+    ordering is code-point ordering). Repeated extreme values change
+    nothing observable: every candidate carrying the extreme string
+    supplies that same value, so which tied record is read only affects
+    which identical string is copied.
+    """
+    if policy == "highest_identity":
+        return max(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
+    if policy == "lowest_identity":
+        return min(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
+    if policy == "highest_value":
+        return max(candidates, key=lambda c: c["value"])
+    return min(candidates, key=lambda c: c["value"])
 
 
 def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
@@ -207,10 +238,11 @@ def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, A
     ``operationId``, ``clock``, and ``policy``. The first three follow the
     live resolution constraints (the key and the chosen value come from the
     server: the value is taken from a current candidate selected by
-    ``policy``); ``policy`` must be one of ``"lowest_identity"`` (candidate
-    with the smallest ``(replicaId, operationId)``) or ``"highest_identity"``
-    (candidate with the largest). Returns a normalized request dict. Raises
-    ValueError on any violation.
+    ``policy``); ``policy`` selects which current candidate supplies the
+    resolution value — the smallest or largest ``(replicaId,
+    operationId)`` for the identity policies, or the smallest or largest
+    string value (Unicode code-point order) for the value policies.
+    Returns a normalized request dict. Raises ValueError on any violation.
     """
     if isinstance(raw, (bytes, bytearray)):
         try:
@@ -243,7 +275,7 @@ def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, A
     clock = _validate_clock(payload.get("clock"), replica_id)
     policy = payload["policy"]
     if policy not in AUTO_RESOLVE_POLICIES:
-        raise ValueError("policy must be 'lowest_identity' or 'highest_identity'")
+        raise ValueError(AUTO_RESOLVE_POLICY_MESSAGE)
 
     return {
         "replicaId": replica_id,
@@ -316,7 +348,7 @@ def parse_auto_resolve_batch(raw: bytes | str | dict[str, Any]) -> list[dict[str
         clock = _validate_clock(entry.get("clock"), replica_id)
         policy = entry["policy"]
         if policy not in AUTO_RESOLVE_POLICIES:
-            raise ValueError("policy must be 'lowest_identity' or 'highest_identity'")
+            raise ValueError(AUTO_RESOLVE_POLICY_MESSAGE)
         if key in keys:
             raise ValueError(f"duplicate key {key!r} in batch")
         identity = (replica_id, operation_id)
@@ -5923,13 +5955,15 @@ class StateStore:
         set come from the request: the key must currently hold candidates
         with at least two distinct values, and the resolution value is taken
         deterministically from a current candidate selected by the request
-        policy — the smallest ``(replicaId, operationId)`` for
-        ``lowest_identity``, the largest for ``highest_identity``. The
-        request clock must dominate every current candidate. The resolution
-        then commits exactly like a manual resolution — one ordinary
-        operation in the shared commit order, so it flows through sync
-        export/import, the audit streams, the metrics, and the data file
-        identically.
+        policy — the smallest or largest ``(replicaId, operationId)`` for
+        the identity policies, or the candidate carrying the smallest or
+        largest string value in Unicode code-point order for the value
+        policies (a repeated extreme value still resolves to that same
+        value). The request clock must dominate every current candidate.
+        The resolution then commits exactly like a manual resolution — one
+        ordinary operation in the shared commit order, so it flows through
+        sync export/import, the audit streams, the metrics, and the data
+        file identically.
 
         The identity is bound to the key, the clock, and the policy: a
         replay with the same binding is answered from the committed
@@ -5981,12 +6015,10 @@ class StateStore:
             if not current or all(c["value"] == current[0]["value"] for c in current):
                 return HTTPStatus.CONFLICT, None, "resolution_conflict"
 
-            # Deterministic policy: the candidate with the smallest or
-            # largest (replicaId, operationId) supplies the resolution value.
-            if request["policy"] == "highest_identity":
-                chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
-            else:
-                chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+            # Deterministic policy: the identity policies select by
+            # (replicaId, operationId), the value policies by the candidate
+            # string in Unicode code-point order.
+            chosen = _select_auto_resolution_candidate(current, request["policy"])
             operation["value"] = chosen["value"]
 
             if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
@@ -6103,10 +6135,7 @@ class StateStore:
                 if not current or all(c["value"] == current[0]["value"] for c in current):
                     return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
 
-                if entry["policy"] == "highest_identity":
-                    chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
-                else:
-                    chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+                chosen = _select_auto_resolution_candidate(current, entry["policy"])
                 operation["value"] = chosen["value"]
 
                 # A legal clock that nevertheless fails to dominate the live
@@ -6248,10 +6277,7 @@ class StateStore:
                 if not current or all(c["value"] == current[0]["value"] for c in current):
                     return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
 
-                if entry["policy"] == "highest_identity":
-                    chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
-                else:
-                    chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+                chosen = _select_auto_resolution_candidate(current, entry["policy"])
                 operation["value"] = chosen["value"]
 
                 # A legal clock that nevertheless fails to dominate the live
@@ -10792,10 +10818,11 @@ class StateStore:
           why the pair does not dominate each other. A key with a single
           candidate yields an empty list.
         - ``suggestion``: ``{"lowest_identity": C, "highest_identity": C}``
-          reporting which current candidate each of the two existing
+          reporting which current candidate each of the two identity-based
           automatic-resolution policies would select — the smallest and
           largest ``(replicaId, operationId)`` — in the same shape as the
-          ``candidates`` entries.
+          ``candidates`` entries. The value policies add no keys here; the
+          response shape is unchanged.
 
         With ``--data-file`` the candidate state is rebuilt identically
         during recovery, so the same state yields the same relations,
