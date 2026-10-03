@@ -197,7 +197,12 @@ def parse_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
     }
 
 
-AUTO_RESOLVE_POLICIES = ("lowest_identity", "highest_identity")
+AUTO_RESOLVE_POLICIES = (
+    "lowest_identity",
+    "highest_identity",
+    "lowest_value",
+    "highest_value",
+)
 
 
 def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
@@ -208,9 +213,10 @@ def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, A
     live resolution constraints (the key and the chosen value come from the
     server: the value is taken from a current candidate selected by
     ``policy``); ``policy`` must be one of ``"lowest_identity"`` (candidate
-    with the smallest ``(replicaId, operationId)``) or ``"highest_identity"``
-    (candidate with the largest). Returns a normalized request dict. Raises
-    ValueError on any violation.
+    with the smallest ``(replicaId, operationId)``), ``"highest_identity"``
+    (the largest), ``"lowest_value"`` (candidate with the smallest value by
+    Unicode code point order), or ``"highest_value"`` (the largest).
+    Returns a normalized request dict. Raises ValueError on any violation.
     """
     if isinstance(raw, (bytes, bytearray)):
         try:
@@ -243,7 +249,10 @@ def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, A
     clock = _validate_clock(payload.get("clock"), replica_id)
     policy = payload["policy"]
     if policy not in AUTO_RESOLVE_POLICIES:
-        raise ValueError("policy must be 'lowest_identity' or 'highest_identity'")
+        raise ValueError(
+            "policy must be 'lowest_identity', 'highest_identity', "
+            "'lowest_value', or 'highest_value'"
+        )
 
     return {
         "replicaId": replica_id,
@@ -316,7 +325,10 @@ def parse_auto_resolve_batch(raw: bytes | str | dict[str, Any]) -> list[dict[str
         clock = _validate_clock(entry.get("clock"), replica_id)
         policy = entry["policy"]
         if policy not in AUTO_RESOLVE_POLICIES:
-            raise ValueError("policy must be 'lowest_identity' or 'highest_identity'")
+            raise ValueError(
+                "policy must be 'lowest_identity', 'highest_identity', "
+                "'lowest_value', or 'highest_value'"
+            )
         if key in keys:
             raise ValueError(f"duplicate key {key!r} in batch")
         identity = (replica_id, operation_id)
@@ -5667,6 +5679,28 @@ class StateStore:
                     self._persist_locked()
 
     @staticmethod
+    def _select_auto_candidate(
+        candidates: list[dict[str, Any]], policy: str
+    ) -> dict[str, Any]:
+        """Pick the current candidate an automatic-resolution policy selects.
+
+        ``lowest_identity``/``highest_identity`` choose by the
+        ``(replicaId, operationId)`` pair; ``lowest_value``/``highest_value``
+        choose by the candidate value compared in Unicode code point order
+        (plain string comparison). Ties on the extreme value are broken by
+        candidate order, which only decides *which* candidate reports the
+        shared extreme — the selected value, and therefore the committed
+        operation, is the same either way.
+        """
+        if policy == "highest_identity":
+            return max(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
+        if policy == "lowest_value":
+            return min(candidates, key=lambda c: c["value"])
+        if policy == "highest_value":
+            return max(candidates, key=lambda c: c["value"])
+        return min(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
+
+    @staticmethod
     def _next_candidates(
         candidates: list[dict[str, Any]], replica_id: str, operation: dict[str, Any]
     ) -> list[dict[str, Any]]:
@@ -5924,7 +5958,9 @@ class StateStore:
         with at least two distinct values, and the resolution value is taken
         deterministically from a current candidate selected by the request
         policy — the smallest ``(replicaId, operationId)`` for
-        ``lowest_identity``, the largest for ``highest_identity``. The
+        ``lowest_identity``, the largest for ``highest_identity``, the
+        smallest value in Unicode code point order for ``lowest_value``,
+        the largest for ``highest_value``. The
         request clock must dominate every current candidate. The resolution
         then commits exactly like a manual resolution — one ordinary
         operation in the shared commit order, so it flows through sync
@@ -5981,12 +6017,9 @@ class StateStore:
             if not current or all(c["value"] == current[0]["value"] for c in current):
                 return HTTPStatus.CONFLICT, None, "resolution_conflict"
 
-            # Deterministic policy: the candidate with the smallest or
-            # largest (replicaId, operationId) supplies the resolution value.
-            if request["policy"] == "highest_identity":
-                chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
-            else:
-                chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+            # Deterministic policy: the selected current candidate supplies
+            # the resolution value (by identity or by value, per policy).
+            chosen = self._select_auto_candidate(current, request["policy"])
             operation["value"] = chosen["value"]
 
             if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
@@ -6103,10 +6136,7 @@ class StateStore:
                 if not current or all(c["value"] == current[0]["value"] for c in current):
                     return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
 
-                if entry["policy"] == "highest_identity":
-                    chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
-                else:
-                    chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+                chosen = self._select_auto_candidate(current, entry["policy"])
                 operation["value"] = chosen["value"]
 
                 # A legal clock that nevertheless fails to dominate the live
@@ -6248,10 +6278,7 @@ class StateStore:
                 if not current or all(c["value"] == current[0]["value"] for c in current):
                     return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
 
-                if entry["policy"] == "highest_identity":
-                    chosen = max(current, key=lambda c: (c["replicaId"], c["operationId"]))
-                else:
-                    chosen = min(current, key=lambda c: (c["replicaId"], c["operationId"]))
+                chosen = self._select_auto_candidate(current, entry["policy"])
                 operation["value"] = chosen["value"]
 
                 # A legal clock that nevertheless fails to dominate the live
