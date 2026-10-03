@@ -22,7 +22,7 @@ Unknown routes return HTTP 404 with `{"error":"not_found"}`. Responses use UTF-8
 
 ### Request body limits
 
-All twenty POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/resolve/auto/plan`, `POST /v1/sync/peers/{peerId}/checkpoint`, `POST /v1/sync/peers/{peerId}/acknowledge`, `POST /v1/transactions/apply`, the read-only `POST /v1/transactions/plan`, `POST /v1/transactions/{transactionId}/compensate`, `POST /v1/replication/apply`, the read-only `POST /v1/states/{key}/causal-at`, the read-only cross-key `POST /v1/states/causal-at`, `POST /v1/replication/compare`, `POST /v1/replication/plan`, `POST /v1/replication/consensus`, `POST /v1/replication/repairs/plan`, and `POST /v1/replication/repairs/diagnosis`, and the committing `POST /v1/replication/repairs/apply`) share one body-size contract:
+All twenty-one POST endpoints (`POST /v1/replicas/{replicaId}/operations`, `POST /v1/replicas/{replicaId}/operations/conditional`, `POST /v1/sync/operations`, `POST /v1/states/{key}/resolve`, `POST /v1/states/{key}/resolve/auto`, `POST /v1/resolve/auto/batch`, `POST /v1/resolve/auto/plan`, `POST /v1/sync/peers/{peerId}/checkpoint`, `POST /v1/sync/peers/{peerId}/acknowledge`, `POST /v1/transactions/apply`, the read-only `POST /v1/transactions/plan`, `POST /v1/transactions/{transactionId}/compensate`, `POST /v1/replication/apply`, the read-only `POST /v1/states/{key}/causal-at`, the read-only cross-key `POST /v1/states/causal-at`, `POST /v1/replication/compare`, `POST /v1/replication/plan`, `POST /v1/replication/consensus`, `POST /v1/replication/repairs/plan`, and `POST /v1/replication/repairs/diagnosis`, and the committing `POST /v1/replication/repairs/apply`) share one body-size contract:
 
 - The request body is limited to **1,048,576 raw UTF-8 bytes** (1 MiB). A body whose declared length is exactly the limit is processed by the normal endpoint semantics.
 - `Content-Length` is required and validated before anything else. It must be a plain ASCII decimal integer: a missing header, an empty value, a sign, whitespace, a negative number, non-ASCII digits, or multiple headers declaring conflicting lengths all return HTTP 400 with `{"error":"invalid_request"}` — the request is never treated as having an empty body. (Multiple headers are accepted only when every occurrence declares the same length.)
@@ -213,6 +213,22 @@ Candidates are stored per key with vector-clock semantics (missing components co
 - New operation: HTTP 201.
 - Same `replicaId` + `operationId` + identical content replayed: HTTP 200, no new version.
 - Same `replicaId` + `operationId` with different content: HTTP 409 with `{"error":"operation_conflict"}`; state is unchanged.
+
+### Conditional writes
+
+`POST /v1/replicas/{replicaId}/operations/conditional` commits an ordinary write only when the key's current candidate set is exactly what the caller observed, closing the read-then-write gap: a caller that read the candidates of `GET /v1/states/{key}` can commit an update that is rejected when any other write has since added or removed a candidate on that key. The body is a JSON object with exactly five fields:
+
+- `operationId`, `key`, `value`, `clock`: identical to the plain write constraints (non-empty strings; a clock of non-negative integers containing the path's `replicaId`).
+- `expectedCandidates`: an array of candidate identities, each an object with exactly `replicaId` and `operationId` (both non-empty strings). Identities must not repeat. An empty array expects the key to hold no current candidates.
+
+Malformed JSON, a missing or unknown field, an `expectedCandidates` element with missing or extra fields, an empty identity field, or a repeated identity all return HTTP 400 with `{"error":"invalid_request"}`.
+
+Under the same commit lock as every other write, the endpoint first applies the ordinary idempotence rules — a replayed `(replicaId, operationId)` with identical content returns HTTP 200 with no new version **regardless of the `expectedCandidates` carried by the retry**, and the same identity with different content returns HTTP 409 with `{"error":"operation_conflict"}` — and only then, for an unseen identity, compares the key's current candidate identity set with `expectedCandidates`:
+
+- Exact match: the write commits exactly like a plain write (same candidate domination semantics, same sync/audit/metrics visibility) and returns HTTP 201.
+- Mismatch: HTTP 409 with `{"error":"state_conflict"}`; no operation, candidate, audit, receipt, checkpoint, or persistence content is added or changed, and the rejected identity remains unrecorded so the request can be corrected and retried.
+
+The identity binding is shared with the plain write endpoint in both directions: an operation first accepted by either endpoint replays as HTTP 200 (identical content) or conflicts as HTTP 409 `operation_conflict` (different content) on the other. The condition constrains only the first commit. With `--data-file`, a first accept is persisted atomically before the response; a durable failure returns HTTP 500 with `{"error":"internal_error"}` and leaves memory and the file unchanged. Conditional operations persist as ordinary operations, so old data files recover without migration and replays append nothing.
 
 ### Reading state
 
