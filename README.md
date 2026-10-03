@@ -352,6 +352,25 @@ All six counters are computed from one snapshot under the same commit lock used 
 
 With `--data-file`, the counters are rebuilt from the recovered log on startup, so after a restart they are identical to those reported just before the restart.
 
+### Read-only conflict-pressure metrics
+
+`GET /v1/metrics/conflicts` returns HTTP 200 with a UTF-8 JSON object containing exactly six non-negative integer counters:
+
+```json
+{"candidatePairs":3,"conflictKeys":1,"conflictPairs":2,"keys":2,"maxCandidatesInKey":3,"maxDistinctValuesInKey":2}
+```
+
+- `keys`: the number of keys that currently hold at least one candidate.
+- `conflictKeys`: keys whose candidates do not all agree on a value — the same classification reported by `GET /v1/metrics`.
+- `candidatePairs`: the total number of unordered candidate pairs across all keys, enumerating each key's candidates in `(replicaId, operationId)` ascending order and counting every pair once.
+- `conflictPairs`: of those pairs, the ones whose two candidates carry different values; a same-value pair is never a conflict pair, even when the two clocks are concurrent.
+- `maxCandidatesInKey`: the largest single-key candidate count.
+- `maxDistinctValuesInKey`: the largest single-key distinct-value count.
+
+An empty store reports six zeroes, and a single-candidate key contributes only to `keys`. The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}` without reading any state. Missing or extra path segments and a trailing slash (for example `/v1/metrics/conflicts/`) return HTTP 404 with `{"error":"not_found"}`.
+
+All six counters are computed from one snapshot under the same commit lock used by local writes, sync-import batches, and repairs, so they always describe a single commit: a read can never observe half a batch or counters that disagree with each other. The request is strictly read-only — it modifies neither memory nor the data file or sync log — and its response uses the same explicit `Content-Length` contract as the other endpoints. With `--data-file`, the candidate state is rebuilt identically during recovery, so the counters match the pre-restart values. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route: a missing, duplicated, malformed, or mismatched credential is HTTP 401, and in scope-policy mode a token without the `read` or `admin` scope is HTTP 403.
+
 ### Replica-convergence verification digest
 
 `GET /v1/verification/digest` returns HTTP 200 with a UTF-8 JSON object containing exactly four fields:
