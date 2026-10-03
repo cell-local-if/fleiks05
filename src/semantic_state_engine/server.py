@@ -8793,6 +8793,121 @@ class StateStore:
         return HTTPStatus.OK, {"replicaId": replica_id, "operation": record}
 
     @staticmethod
+    def _candidate_snapshot_locked(
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Render one key's candidate list in the provenance snapshot shape.
+
+        The snapshot is ``{"status", "candidates"}``: candidates sorted by
+        ``(replicaId, operationId)`` ascending, each carrying exactly
+        ``value``, ``clock``, ``replicaId``, and ``operationId``; the
+        status is ``"absent"`` when no candidate remains, ``"resolved"``
+        when every candidate agrees on the value, and ``"conflict"``
+        otherwise.
+        """
+        ordered = sorted(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
+        present = [
+            {
+                "value": c["value"],
+                "clock": dict(c["clock"]),
+                "replicaId": c["replicaId"],
+                "operationId": c["operationId"],
+            }
+            for c in ordered
+        ]
+        if not present:
+            status = "absent"
+        elif all(c["value"] == present[0]["value"] for c in present):
+            status = "resolved"
+        else:
+            status = "conflict"
+        return {"status": status, "candidates": present}
+
+    def get_operation_provenance(
+        self, replica_id: str, operation_id: str
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Explain one accepted operation's immediate effect on its key.
+
+        The identity lookup, the replay, and the policy binding are all
+        read under the same commit lock used by local writes, sync
+        imports, repairs, and checkpoints, so the response describes a
+        single committed snapshot; the read mutates neither memory, the
+        data file, candidates, metrics, audits, checkpoints, nor logs and
+        creates no files.
+
+        Every first-accepted operation is addressable, exactly like the
+        per-operation archive. The target key's candidate state is
+        reconstructed by replaying the shared accepted log in commit
+        order: ``before`` is the snapshot just before the target record
+        commits, ``after`` the snapshot immediately after — records
+        committed later never enter the replay, so a target whose value
+        was since overwritten still reports its own immediate effect. An
+        accepted automatic resolution therefore always shows a
+        ``conflict`` before snapshot (the commit precondition), the
+        policy-selected value, and an after snapshot in which its clock
+        has dominated the previously conflicting candidates.
+
+        ``origin`` is ``"automatic_resolution"`` only when this replica
+        holds a local automatic-resolution policy binding for the
+        identity (``policy`` then names the bound policy); plain writes,
+        manual resolutions, and sync-imported records — and every
+        identity recovered from a data file written before the
+        ``policies`` section existed — carry no binding and report
+        ``"other"`` with a null ``policy``.
+
+        Returns ``(404, {"error": "not_found"})`` for an identity that
+        was never first-accepted. Otherwise returns ``(200, report)``
+        with the fields in the contracted order: ``replicaId``,
+        ``operationId``, ``operation`` (the archive record shape:
+        ``operationId``, ``key``, ``value``, ``clock``), ``origin``,
+        ``policy``, ``before``, and ``after``. With ``--data-file`` the
+        log and the bindings are recovered identically on restart, so the
+        same identity yields the same report before and after.
+        """
+        with self._lock:
+            operation = self._operations.get((replica_id, operation_id))
+            if operation is None:
+                return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            key = operation["key"]
+            record = {
+                "operationId": operation["operationId"],
+                "key": key,
+                "value": operation["value"],
+                "clock": dict(operation["clock"]),
+            }
+            policy = self._policies.get((replica_id, operation_id))
+            candidates: list[dict[str, Any]] = []
+            before: dict[str, Any] | None = None
+            after: dict[str, Any] | None = None
+            for accepted_replica, accepted_operation in self._accepted:
+                if (
+                    accepted_replica == replica_id
+                    and accepted_operation["operationId"] == operation_id
+                ):
+                    before = self._candidate_snapshot_locked(candidates)
+                    candidates = self._next_candidates(
+                        candidates, accepted_replica, accepted_operation
+                    )
+                    after = self._candidate_snapshot_locked(candidates)
+                    break
+                if accepted_operation["key"] == key:
+                    candidates = self._next_candidates(
+                        candidates, accepted_replica, accepted_operation
+                    )
+            # The identity index and the accepted log commit together, so
+            # a found identity always finds its record in the log.
+            assert before is not None and after is not None
+        return HTTPStatus.OK, {
+            "replicaId": replica_id,
+            "operationId": operation_id,
+            "operation": record,
+            "origin": "automatic_resolution" if policy is not None else "other",
+            "policy": policy,
+            "before": before,
+            "after": after,
+        }
+
+    @staticmethod
     def _strict_predecessors_locked(
         accepted: list[tuple[str, dict[str, Any]]],
         source_replica_id: str,
@@ -12238,6 +12353,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_operation_proof_get(segments[2], segments[4])
             return
         if (
+            len(segments) == 6
+            and segments[0] == "v1"
+            and segments[1] == "replicas"
+            and segments[3] == "operations"
+            and segments[5] == "provenance"
+        ):
+            self._handle_operation_provenance_get(segments[2], segments[4])
+            return
+        if (
             len(segments) == 3
             and segments[0] == "v1"
             and segments[1] == "causal"
@@ -13319,6 +13443,30 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         status, payload = self._store.get_operation(replica_id, operation_id)
         self._json(status, payload)
+
+    def _handle_operation_provenance_get(
+        self, replica_id: str, operation_id: str
+    ) -> None:
+        # The route-shape check in do_GET already ran (missing, empty, or
+        # extra segments — including a trailing slash — are 404 there,
+        # before any query check), so a malformed query is rejected here
+        # without any state being read or changed. The endpoint accepts no
+        # query parameters: any parameter — repeated, blank-named, or
+        # blank-valued — is 400 invalid_request. The success body fixes the
+        # field order (replicaId, operationId, operation, origin, policy,
+        # before, after) and follows the compact-single-line contract:
+        # ordered UTF-8 JSON, one trailing newline. The report is computed
+        # from one committed snapshot and is strictly read-only: it creates
+        # no temporary file and changes neither memory nor the data file.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        status, payload = self._store.get_operation_provenance(
+            replica_id, operation_id
+        )
+        self._json_ordered_newline(status, payload)
 
     def _handle_audit_proofs_root_get(self) -> None:
         # The route-shape check in do_GET already ran (missing, empty, or

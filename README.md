@@ -914,6 +914,26 @@ Status codes: a missing, repeated, unknown, blank, or malformed parameter (a non
 
 With `--data-file`, the identity index is rebuilt from the recovered log on startup, so successful results, the 404 boundary, and error statuses are identical before and after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` route (and `/health` stays anonymous).
 
+### Per-operation provenance query
+
+`GET /v1/replicas/{replicaId}/operations/{operationId}/provenance` explains one first-accepted operation's **immediate semantic effect** on its target key. Both path segments are percent-decoded like every other route and must be non-empty after decoding; an identity that was never first-accepted returns HTTP 404 with `{"error":"not_found"}`.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object terminated by a single newline, with the fields in this fixed order:
+
+```json
+{"replicaId":"r3","operationId":"auto","operation":{"operationId":"auto","key":"color","value":"blue","clock":{"r3":1,"r1":1,"r2":1}},"origin":"automatic_resolution","policy":"lowest_identity","before":{"status":"conflict","candidates":[{"value":"blue","clock":{"r1":1},"replicaId":"r1","operationId":"o1"},{"value":"red","clock":{"r2":1},"replicaId":"r2","operationId":"o2"}]},"after":{"status":"resolved","candidates":[{"value":"blue","clock":{"r3":1,"r1":1,"r2":1},"replicaId":"r3","operationId":"auto"}]}}
+```
+
+- `replicaId`, `operationId`: the queried identity.
+- `operation`: the record in the per-operation archive shape — exactly `operationId`, `key`, `value`, and `clock` with their committed values.
+- `origin`: `"automatic_resolution"` when this replica holds a local automatic-resolution policy binding for the identity, `"other"` otherwise (plain writes, manual resolutions, and sync-imported records carry no binding; a data file written before the `policies` section existed recovers with an empty binding table, so every identity in it reports `"other"`).
+- `policy`: the bound automatic-resolution policy (`lowest_identity`, `highest_identity`, `lowest_value`, or `highest_value`), or `null` when `origin` is `"other"`.
+- `before`, `after`: the target key's candidate snapshots `{"status","candidates"}` reconstructed by replaying the shared accepted log in commit order up to just before and just after the target record. `candidates` is always an array, sorted by `(replicaId, operationId)` ascending, each entry carrying exactly `value`, `clock`, `replicaId`, and `operationId`; `status` is `"absent"` when no candidate remains, `"resolved"` when every candidate agrees on the value, and `"conflict"` otherwise.
+
+Because an automatic resolution only commits out of a live value conflict with a clock dominating every candidate, its report always shows a `conflict` before-snapshot, the policy-selected value, and an after-snapshot reduced to its own dominating candidate. Records committed later never enter the replay, so an operation whose value was since overwritten still reports its own immediate effect.
+
+The endpoint takes no query parameters: any parameter — including a repeated name (`x=1&x=2`) or a blank name/value (`x=`, `x`, `=1`) — returns HTTP 400 with `{"error":"invalid_request"}`. A missing, empty, or extra path segment (for example `/v1/replicas//operations/{operationId}/provenance`, `/v1/replicas/{replicaId}/operations/{operationId}/provenance/extra`, or a trailing slash) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query check. The whole report is computed from one committed snapshot under the commit lock and is strictly read-only — it changes no metrics, candidates, audit streams, checkpoints, logs, or the data file and creates no temporary file. With `--data-file` the log and the policy bindings are recovered identically on restart, so the same identity yields the same report before and after; the endpoint authenticates like every other non-`/health` route.
+
 ### Per-operation causal ancestor chain
 
 `GET /v1/causal/{replicaId}/{operationId}?after=N&limit=N` returns a read-only page of one operation's **strict causal predecessors**. Both path segments are percent-decoded like every other route and must be non-empty after decoding; an identity that was never first-accepted returns HTTP 404 with `{"error":"not_found"}`, and the route-shape check takes precedence over every other check.
