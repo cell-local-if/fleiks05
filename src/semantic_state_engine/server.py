@@ -1584,6 +1584,92 @@ def parse_causal_snapshot_payload(
     )
 
 
+CAUSAL_CLOSURE_MIN_OPERATIONS = 1
+CAUSAL_CLOSURE_MAX_OPERATIONS = 100
+
+
+def _validate_causal_closure_operations(operations_raw: Any) -> list[tuple[str, str]]:
+    """Validate the ``operations`` list of a causal-closure request.
+
+    It must be a list of 1 to 100 identity objects, each carrying exactly
+    ``replicaId`` and ``operationId`` as non-empty strings, with no
+    identity repeated; anything else — a non-list, an empty or over-long
+    list, a non-object entry, a missing or extra field, a non-string or
+    empty value, or a repeated identity — raises ValueError. Returns the
+    identities as ``(replicaId, operationId)`` pairs in request order.
+    """
+    if not isinstance(operations_raw, list) or not (
+        CAUSAL_CLOSURE_MIN_OPERATIONS
+        <= len(operations_raw)
+        <= CAUSAL_CLOSURE_MAX_OPERATIONS
+    ):
+        raise ValueError("operations must be a list of 1-100 identities")
+    identities: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in operations_raw:
+        if not isinstance(entry, dict) or set(entry.keys()) != {
+            "replicaId",
+            "operationId",
+        }:
+            raise ValueError(
+                "each operation must have only replicaId and operationId"
+            )
+        replica_id = entry["replicaId"]
+        operation_id = entry["operationId"]
+        if not isinstance(replica_id, str) or replica_id == "":
+            raise ValueError("replicaId must be a non-empty string")
+        if not isinstance(operation_id, str) or operation_id == "":
+            raise ValueError("operationId must be a non-empty string")
+        identity = (replica_id, operation_id)
+        if identity in seen:
+            raise ValueError(f"duplicate operation identity {identity!r}")
+        seen.add(identity)
+        identities.append(identity)
+    return identities
+
+
+def parse_causal_closure_payload(raw: bytes | str | dict[str, Any]) -> list[tuple[str, str]]:
+    """Parse and validate a causal-closure request body.
+
+    The body must be a complete JSON object whose only key is
+    ``operations``; unknown fields, a non-object document, or a
+    duplicated key anywhere in the document raise ValueError.
+    ``operations`` follows :func:`_validate_causal_closure_operations`:
+    1 to 100 distinct identity objects, each with exactly a non-empty
+    string ``replicaId`` and ``operationId``. Returns the identities in
+    request order.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        # Already-decoded mappings come from store-level callers, which
+        # bypass JSON and therefore the duplicate-key hook.
+        if not isinstance(raw, dict) or set(raw.keys()) != {"operations"}:
+            raise ValueError("body must be an object with only operations")
+        return _validate_causal_closure_operations(raw.get("operations"))
+
+    def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+        document: dict[Any, Any] = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError("duplicate field in body")
+            document[key] = value
+        return document
+
+    try:
+        payload: Any = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError("body must be valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload.keys()) != {"operations"}:
+        raise ValueError("body must be an object with only operations")
+    return _validate_causal_closure_operations(payload.get("operations"))
+
+
 def _parse_remote_snapshot(snapshot_raw: Any) -> dict[str, list[dict[str, Any]]]:
     """Validate a remote replica's complete candidate snapshot.
 
@@ -9512,6 +9598,139 @@ class StateStore:
             "frontierCount": total,
         }
 
+    def get_causal_closure(
+        self, identities: list[tuple[str, str]]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return the minimal common causal closure of several operations.
+
+        The roots, the closure membership, the cover edges, and the
+        summary counts are all computed under the same commit lock used by
+        local writes, sync imports, repairs, and checkpoint commits, so
+        the response always describes a single commit: a read can never
+        observe half an import batch or a partially applied repair, and a
+        concurrent commit surfaces only as the complete old or the
+        complete new result. The snapshot mutates neither memory, the data
+        file, candidates, metrics, audits, checkpoints, nor logs and
+        creates no files.
+
+        The closure contains every requested root plus each first-accepted
+        record that at least one root strictly precedes in the causal
+        sense: the record was committed **before** that root in the shared
+        accepted log and the root's clock strictly dominates the record's
+        clock (missing components count as 0, and domination already
+        requires the clocks to differ) — exactly the per-root strict
+        predecessor rule of :meth:`get_causal_ancestors`, unioned across
+        the roots so a shared predecessor appears only once.
+
+        Returns ``(404, {"error": "not_found"})`` when any identity was
+        never first-accepted. Otherwise returns ``(200, report)`` with
+        exactly four fields: ``roots`` (the requested identities as
+        ``{"replicaId", "operationId"}`` pairs in request order),
+        ``operations`` (the whole closure in the shared log's global
+        commit order, each record in the per-operation archive shape
+        ``{"replicaId", "operation"}``), ``edges`` (the direct cover edges
+        inside the closure — ``from`` strictly precedes ``to`` and no
+        third closure record's clock sits between them — each carrying
+        only the ``from`` and ``to`` identities and sorted by global
+        commit order), and ``summary`` (the non-negative integer counts
+        ``roots``, ``operations``, ``edges``, and ``sharedAncestors`` —
+        the last counting closure records that strictly precede at least
+        two distinct roots). A single root with no predecessors yields
+        that root, an empty edge list, and zero edge and shared-ancestor
+        counts. With ``--data-file`` the log is rebuilt identically
+        during recovery, so the same state yields the same closure, the
+        same edges, and the same counts before and after a restart.
+        """
+        with self._lock:
+            roots: list[tuple[str, dict[str, Any]]] = []
+            for replica_id, operation_id in identities:
+                operation = self._operations.get((replica_id, operation_id))
+                if operation is None:
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                roots.append((replica_id, operation))
+            member_identities = set(identities)
+            # How many distinct roots strictly precede each predecessor;
+            # a record committed before several roots is collected once
+            # per root but enters the closure a single time.
+            predecessor_root_counts: dict[tuple[str, str], int] = {}
+            for root_replica, root_operation in roots:
+                for pred_replica, pred_operation in self._strict_predecessors_locked(
+                    self._accepted,
+                    root_replica,
+                    root_operation["operationId"],
+                    root_operation["clock"],
+                ):
+                    identity = (pred_replica, pred_operation["operationId"])
+                    member_identities.add(identity)
+                    predecessor_root_counts[identity] = (
+                        predecessor_root_counts.get(identity, 0) + 1
+                    )
+            shared_ancestors = sum(
+                1 for count in predecessor_root_counts.values() if count >= 2
+            )
+            # The accepted log is already in global commit order, so the
+            # filtered scan is the closure in response order.
+            closure = [
+                (accepted_replica, accepted_operation)
+                for accepted_replica, accepted_operation in self._accepted
+                if (accepted_replica, accepted_operation["operationId"])
+                in member_identities
+            ]
+            # Direct cover edges of the closure's causal order: ``to``
+            # strictly dominates ``from`` and no third closure record is
+            # strictly between them. Walking the commit-ordered closure
+            # for both endpoints keeps the edges in global commit order.
+            edges: list[dict[str, Any]] = []
+            for from_replica, from_operation in closure:
+                successors = [
+                    (to_replica, to_operation)
+                    for to_replica, to_operation in closure
+                    if clock_dominates(to_operation["clock"], from_operation["clock"])
+                ]
+                for to_replica, to_operation in successors:
+                    covered = any(
+                        mid_operation is not to_operation
+                        and clock_dominates(
+                            to_operation["clock"], mid_operation["clock"]
+                        )
+                        for _, mid_operation in successors
+                    )
+                    if covered:
+                        continue
+                    edges.append(
+                        {
+                            "from": {
+                                "replicaId": from_replica,
+                                "operationId": from_operation["operationId"],
+                            },
+                            "to": {
+                                "replicaId": to_replica,
+                                "operationId": to_operation["operationId"],
+                            },
+                        }
+                    )
+            report = {
+                "roots": [
+                    {
+                        "replicaId": root_replica,
+                        "operationId": root_operation["operationId"],
+                    }
+                    for root_replica, root_operation in roots
+                ],
+                "operations": [
+                    self._source_record_locked(closure_replica, closure_operation)
+                    for closure_replica, closure_operation in closure
+                ],
+                "edges": edges,
+                "summary": {
+                    "roots": len(roots),
+                    "operations": len(closure),
+                    "edges": len(edges),
+                    "sharedAncestors": shared_ancestors,
+                },
+            }
+        return HTTPStatus.OK, report
+
     def get_checkpoint(self, peer_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Return the registered checkpoint, or 404 when ``peer_id`` is unknown.
 
@@ -12759,6 +12978,31 @@ class RequestHandler(BaseHTTPRequestHandler):
         payload = self._store.get_states_causal_at(boundary, keys)
         self._json_ordered_newline(HTTPStatus.OK, payload)
 
+    def _handle_causal_closure_post(self) -> None:
+        # The declared-length check (400/413) and the read-scope check ran
+        # in do_POST before this handler, neither reading the body;
+        # route-shape mismatches — missing, extra, or a trailing slash —
+        # fall through to the generic 404 before any of those, so the path
+        # judgment always precedes the body judgment. The route accepts no
+        # query parameters, and that check precedes the body check. The
+        # whole closure is one read-only computation against one committed
+        # snapshot, and the report keeps the payload's contracted field
+        # order — roots, operations, edges, summary — with compact UTF-8
+        # JSON, one trailing newline, and numbers only as JSON integers.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            identities = parse_causal_closure_payload(raw)
+        except ValueError:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._store.get_causal_closure(identities)
+        self._json_ordered_newline(status, payload)
+
     def _handle_state_why_get(self, key: str) -> None:
         # The route-shape check in do_GET already ran, so a query parameter
         # is rejected here without any state being read or changed. The
@@ -14227,6 +14471,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "repairs"
             and segments[3] == "diagnosis"
         )
+        is_causal_closure_post = (
+            len(segments) == 3
+            and segments[0] == "v1"
+            and segments[1] == "causal"
+            and segments[2] == "closure"
+            # An empty middle segment (/v1/causal//closure) is filtered
+            # out of ``segments`` but must not collapse into this route:
+            # require the raw path to hold exactly four parts, which also
+            # excludes a trailing slash.
+            and len(urlsplit(self.path).path.split("/")) == 4
+        )
         if (
             matched
             or matched_ack
@@ -14250,6 +14505,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_replication_repairs_plan_post
             or is_replication_repairs_apply_post
             or is_replication_repairs_diagnosis_post
+            or is_causal_closure_post
         ):
             # On the POST endpoints the Content-Length contract keeps its
             # priority: a 400/413 is answered before authentication. The
@@ -14321,6 +14577,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # preflight, execution, and audit evidence from one
                 # snapshot and commits nothing, so it is gated like the
                 # other read-only POSTs: a read or admin scope suffices.
+                if not self._require_scope(SCOPE_READ):
+                    return
+            elif is_causal_closure_post:
+                # The multi-operation common causal closure is strictly
+                # read-only, so it is gated like every other read: a read
+                # or admin scope suffices.
                 if not self._require_scope(SCOPE_READ):
                     return
             elif not self._require_scope(SCOPE_WRITE):
@@ -14444,6 +14706,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_replication_repairs_diagnosis_post:
             self._handle_replication_repairs_diagnosis_post()
+            return
+        if is_causal_closure_post:
+            self._handle_causal_closure_post()
             return
         self._handle_sync_post()
 
