@@ -5441,6 +5441,227 @@ def _validate_stored_compensations(
     return compensations
 
 
+# The validated sections of a version-1 recovery document: the accepted
+# operations in commit order plus the checkpoints, policy, transaction,
+# receipt, repair-execution, policy-event, and compensation bindings.
+RecoverySections = tuple[
+    list[tuple[str, dict[str, Any]]],
+    dict[str, int],
+    dict[tuple[str, str], str],
+    dict[str, list[dict[str, Any]]],
+    dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+]
+
+
+def _validate_recovery_sections(document: dict[str, Any]) -> RecoverySections:
+    """Validate every section of a version-1 recovery document.
+
+    Shared by the data-file loader and the store-import endpoint, so both
+    apply exactly the same per-record constraints, duplicate-identity
+    rejections, and cross-section references. Sections absent from the
+    document recover as empty (a data file written before they existed);
+    the import endpoint requires every section and never reaches here
+    with one missing. Returns ``(records, checkpoints, policies,
+    transactions, acks, repairs, policy_events, compensations)``. Raises
+    PersistenceError on any violation.
+    """
+    records_raw = document["operations"]
+    if not isinstance(records_raw, list):
+        raise PersistenceError("data file operations must be a list")
+
+    records: list[tuple[str, dict[str, Any]]] = []
+    identities: set[tuple[str, str]] = set()
+    for entry in records_raw:
+        replica_id, operation = _validate_stored_operation(entry)
+        identity = (replica_id, operation["operationId"])
+        if identity in identities:
+            raise PersistenceError(f"duplicate accepted operation {identity!r} in data file")
+        identities.add(identity)
+        records.append((replica_id, operation))
+    checkpoints = _validate_stored_checkpoints(document, len(records))
+    policies = _validate_stored_policies(document, identities)
+    transactions = _validate_stored_transactions(document, identities)
+    acks = _validate_stored_acks(document, checkpoints, records)
+    repairs = _validate_stored_repairs(document, checkpoints, records)
+    policy_events = _validate_stored_policy_events(document)
+    compensations = _validate_stored_compensations(document, identities, transactions)
+    return (
+        records,
+        checkpoints,
+        policies,
+        transactions,
+        acks,
+        repairs,
+        policy_events,
+        compensations,
+    )
+
+
+def _recovery_document_from_sections(sections: RecoverySections) -> dict[str, Any]:
+    """Assemble the version-1 recovery document from committed sections.
+
+    The single assembly shared by the data-file persistence, the
+    full-store export, and the store-import idempotence comparison, so
+    all three always agree on the exact document shape: ``version`` plus
+    the eight sections — ``operations`` in shared commit order,
+    ``checkpoints``, ``policies`` riding with their same-identity
+    operations in commit order, ``transactions``, ``acks``,
+    ``repairExecutions``, ``policyEvents`` in hot-reload commit order,
+    and ``compensations`` — with exactly the per-record fields the data
+    file persists, no internal fields, and no extra metadata.
+    """
+    (
+        records,
+        checkpoints,
+        policies,
+        transactions,
+        acks,
+        repairs,
+        policy_events,
+        compensations,
+    ) = sections
+    return {
+        "version": DATA_FORMAT_VERSION,
+        "operations": [
+            {"replicaId": replica_id, "operation": operation}
+            for replica_id, operation in records
+        ],
+        "checkpoints": dict(checkpoints),
+        # Policy bindings ride along in commit order, so each binding is
+        # durable in the same atomic commit as its operation.
+        "policies": [
+            {
+                "replicaId": replica_id,
+                "operationId": operation["operationId"],
+                "policy": policies[(replica_id, operation["operationId"])],
+            }
+            for replica_id, operation in records
+            if (replica_id, operation["operationId"]) in policies
+        ],
+        # Transaction bindings ride along in commit order, so each binding
+        # is durable in the same atomic commit as its operations. The
+        # binding itself is local: it is never part of the exported sync
+        # records.
+        "transactions": [
+            {"transactionId": transaction_id, "operations": entries}
+            for transaction_id, entries in transactions.items()
+        ],
+        # Consumption receipts ride along in commit order, so each binding
+        # is durable in the same atomic commit as the checkpoint advance it
+        # caused. A receipt is not an operation: it is never part of the
+        # accepted log or the exported sync records.
+        "acks": [
+            {
+                "peerId": peer_id,
+                "ackId": ack_id,
+                "cursor": receipt["cursor"],
+                "operations": receipt["operations"],
+            }
+            for (peer_id, ack_id), receipt in acks.items()
+        ],
+        # Conditional repair executions ride along in the same atomic
+        # commit as the checkpoint advance they caused. A repair is not an
+        # operation: it is never part of the accepted log or exported by
+        # sync; the binding only records what execution the
+        # ``(peerId, ackId)`` pair is bound to, so an identical replay
+        # appends nothing and advances nothing.
+        "repairExecutions": [
+            {
+                "peerId": peer_id,
+                "ackId": ack_id,
+                "expectedCheckpoint": binding["expectedCheckpoint"],
+                "expectedReceipts": binding["expectedReceipts"],
+                "suggestions": binding["suggestions"],
+                "results": binding["results"],
+                "cursor": binding["cursor"],
+            }
+            for (peer_id, ack_id), binding in repairs.items()
+        ],
+        # Scope-policy change events ride along in the order their reloads
+        # committed, so every successful hot reload and its event become
+        # durable in one atomic commit together.
+        "policyEvents": [dict(event) for event in policy_events],
+        # Compensation bindings ride along in the same atomic commit as
+        # their compensation operations. Like transaction bindings, a
+        # compensation is local: it is never part of the accepted log or
+        # exported by sync; the binding only records what compensation the
+        # id is bound to, so an identical replay appends nothing.
+        "compensations": [
+            {
+                "compensationId": compensation_id,
+                "transactionId": binding["transactionId"],
+                "expectedPlanDigest": binding["expectedPlanDigest"],
+                "operations": binding["operations"],
+                "status": binding["status"],
+            }
+            for compensation_id, binding in compensations.items()
+        ],
+    }
+
+
+# The store-import body must carry exactly these nine root fields: the
+# version-1 recovery document, no missing and no extra section.
+STORE_IMPORT_FIELDS = frozenset(
+    {
+        "version",
+        "operations",
+        "checkpoints",
+        "policies",
+        "transactions",
+        "acks",
+        "repairExecutions",
+        "policyEvents",
+        "compensations",
+    }
+)
+
+
+def parse_store_import_payload(raw: bytes) -> RecoverySections:
+    """Parse and validate a store-import request body.
+
+    The body must be a UTF-8 JSON object carrying exactly the nine
+    version-1 recovery fields — ``version`` (the integer
+    ``DATA_FORMAT_VERSION``), ``operations``, ``checkpoints``,
+    ``policies``, ``transactions``, ``acks``, ``repairExecutions``,
+    ``policyEvents``, and ``compensations``. A non-UTF-8 or malformed
+    body, a non-object document, a missing or extra root field, a wrong
+    version, a duplicate identity, an illegal field, an inconsistent
+    cross-section reference, an out-of-log cursor, or an over-wide vector
+    clock raises ValueError. The section validation is exactly the
+    data-file recovery validation, so a document the endpoint accepts is
+    a document startup recovery accepts, and vice versa. Returns the
+    validated sections.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("body must be UTF-8 JSON") from exc
+    try:
+        document: Any = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("body must be valid JSON") from exc
+    if not isinstance(document, dict) or set(document.keys()) != STORE_IMPORT_FIELDS:
+        raise ValueError(
+            "body must be an object with exactly version, operations, "
+            "checkpoints, policies, transactions, acks, repairExecutions, "
+            "policyEvents, and compensations"
+        )
+    version = document["version"]
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != DATA_FORMAT_VERSION
+    ):
+        raise ValueError(f"unsupported recovery version: {version!r}")
+    try:
+        return _validate_recovery_sections(document)
+    except PersistenceError as exc:
+        raise ValueError(f"body violates the recovery constraints: {exc}") from exc
+
+
 def _load_data_file_complete(
     path: str,
 ) -> tuple[
@@ -5501,36 +5722,7 @@ def _load_data_file_complete(
     version = document["version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != DATA_FORMAT_VERSION:
         raise PersistenceError(f"unsupported data file version: {version!r}")
-    records_raw = document["operations"]
-    if not isinstance(records_raw, list):
-        raise PersistenceError("data file operations must be a list")
-
-    records: list[tuple[str, dict[str, Any]]] = []
-    identities: set[tuple[str, str]] = set()
-    for entry in records_raw:
-        replica_id, operation = _validate_stored_operation(entry)
-        identity = (replica_id, operation["operationId"])
-        if identity in identities:
-            raise PersistenceError(f"duplicate accepted operation {identity!r} in data file")
-        identities.add(identity)
-        records.append((replica_id, operation))
-    checkpoints = _validate_stored_checkpoints(document, len(records))
-    policies = _validate_stored_policies(document, identities)
-    transactions = _validate_stored_transactions(document, identities)
-    acks = _validate_stored_acks(document, checkpoints, records)
-    repairs = _validate_stored_repairs(document, checkpoints, records)
-    policy_events = _validate_stored_policy_events(document)
-    compensations = _validate_stored_compensations(document, identities, transactions)
-    return (
-        records,
-        checkpoints,
-        policies,
-        transactions,
-        acks,
-        repairs,
-        policy_events,
-        compensations,
-    )
+    return _validate_recovery_sections(document)
 
 
 def load_data_file_full(
@@ -5960,87 +6152,24 @@ class StateStore:
         file persists, no internal fields, and no extra metadata. It is
         the shape :meth:`_persist_locked` writes atomically and
         :meth:`get_store_export` returns, so an export of a recovered
-        state is byte-identical to the export before the restart.
+        state is byte-identical to the export before the restart. The
+        assembly itself is shared with the store-import idempotence
+        comparison (see :func:`_recovery_document_from_sections`), so an
+        imported document always compares against exactly what a later
+        export emits.
         """
-        return {
-            "version": DATA_FORMAT_VERSION,
-            "operations": [
-                {"replicaId": replica_id, "operation": operation}
-                for replica_id, operation in self._accepted
-            ],
-            "checkpoints": dict(self._checkpoints),
-            # Policy bindings ride along in commit order, so each binding is
-            # durable in the same atomic commit as its operation.
-            "policies": [
-                {
-                    "replicaId": replica_id,
-                    "operationId": operation["operationId"],
-                    "policy": self._policies[(replica_id, operation["operationId"])],
-                }
-                for replica_id, operation in self._accepted
-                if (replica_id, operation["operationId"]) in self._policies
-            ],
-            # Transaction bindings ride along in commit order, so each
-            # binding is durable in the same atomic commit as its
-            # operations. The binding itself is local: it is never part of
-            # the exported sync records.
-            "transactions": [
-                {"transactionId": transaction_id, "operations": entries}
-                for transaction_id, entries in self._transactions.items()
-            ],
-            # Consumption receipts ride along in commit order, so each
-            # binding is durable in the same atomic commit as the
-            # checkpoint advance it caused. A receipt is not an operation:
-            # it is never part of the accepted log or the exported sync
-            # records.
-            "acks": [
-                {
-                    "peerId": peer_id,
-                    "ackId": ack_id,
-                    "cursor": receipt["cursor"],
-                    "operations": receipt["operations"],
-                }
-                for (peer_id, ack_id), receipt in self._acks.items()
-            ],
-            # Conditional repair executions ride along in the same atomic
-            # commit as the checkpoint advance they caused. A repair is
-            # not an operation: it is never part of the accepted log or
-            # exported by sync; the binding only records what execution
-            # the ``(peerId, ackId)`` pair is bound to, so an identical
-            # replay appends nothing and advances nothing.
-            "repairExecutions": [
-                {
-                    "peerId": peer_id,
-                    "ackId": ack_id,
-                    "expectedCheckpoint": binding["expectedCheckpoint"],
-                    "expectedReceipts": binding["expectedReceipts"],
-                    "suggestions": binding["suggestions"],
-                    "results": binding["results"],
-                    "cursor": binding["cursor"],
-                }
-                for (peer_id, ack_id), binding in self._repairs.items()
-            ],
-            # Scope-policy change events ride along in the order their
-            # reloads committed, so every successful hot reload and its
-            # event become durable in one atomic commit together.
-            "policyEvents": [dict(event) for event in self._policy_events],
-            # Compensation bindings ride along in the same atomic commit
-            # as their compensation operations. Like transaction
-            # bindings, a compensation is local: it is never part of the
-            # accepted log or exported by sync; the binding only records
-            # what compensation the id is bound to, so an identical
-            # replay appends nothing.
-            "compensations": [
-                {
-                    "compensationId": compensation_id,
-                    "transactionId": binding["transactionId"],
-                    "expectedPlanDigest": binding["expectedPlanDigest"],
-                    "operations": binding["operations"],
-                    "status": binding["status"],
-                }
-                for compensation_id, binding in self._compensations.items()
-            ],
-        }
+        return _recovery_document_from_sections(
+            (
+                self._accepted,
+                self._checkpoints,
+                self._policies,
+                self._transactions,
+                self._acks,
+                self._repairs,
+                self._policy_events,
+                self._compensations,
+            )
+        )
 
     def get_store_export(self) -> dict[str, Any]:
         """Return the full store export from one committed snapshot.
@@ -6056,6 +6185,106 @@ class StateStore:
         """
         with self._lock:
             return self._export_document_locked()
+
+    def _is_empty_locked(self) -> bool:
+        """Return True when no section holds any committed content."""
+        return not (
+            self._accepted
+            or self._checkpoints
+            or self._policies
+            or self._transactions
+            or self._acks
+            or self._repairs
+            or self._policy_events
+            or self._compensations
+        )
+
+    def import_store(self, sections: RecoverySections) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Commit a validated version-1 recovery document, or replay it.
+
+        The whole decision runs under the commit lock, so a concurrent
+        first import commits exactly once: a document whose canonical
+        recovery form equals the current export is an idempotent replay
+        (HTTP 200 ``{"status":"ok","version":1}``) that appends no
+        operation, advances no cursor, and adds no audit record; a virgin
+        store — every section empty — commits the document atomically and
+        answers HTTP 201 ``{"status":"created","version":1}``; anything
+        else is HTTP 409 ``{"error":"store_conflict"}`` and changes
+        nothing.
+
+        The commit follows the same discipline as every other mutation:
+        with a data file configured, the full new document is persisted
+        atomically before the in-memory state becomes visible, and a
+        durable failure raises PersistenceError with memory, the identity
+        index, and the file exactly as before. The imported operations
+        join the shared accepted log (and therefore the incremental sync
+        stream); the policy, transaction, receipt, repair, policy-event,
+        and compensation bindings stay local and are never exported by
+        sync, exactly as when they were committed live.
+        """
+        canonical = _recovery_document_from_sections(sections)
+        (
+            records,
+            checkpoints,
+            policies,
+            transactions,
+            acks,
+            repairs,
+            policy_events,
+            compensations,
+        ) = sections
+        with self._lock:
+            if self._export_document_locked() == canonical:
+                return HTTPStatus.OK, {"status": "ok", "version": DATA_FORMAT_VERSION}
+            if not self._is_empty_locked():
+                return HTTPStatus.CONFLICT, {"error": "store_conflict"}
+            # First import into a virgin store. Stage the whole document
+            # by swapping in fresh structures, make the atomic rename the
+            # single commit point, and roll the swap back on any failure,
+            # so a failed durable commit leaves memory and the file
+            # exactly as before.
+            previous = (
+                self._candidates,
+                self._operations,
+                self._accepted,
+                self._checkpoints,
+                self._policies,
+                self._transactions,
+                self._acks,
+                self._repairs,
+                self._policy_events,
+                self._compensations,
+            )
+            self._candidates = {}
+            self._operations = {}
+            self._accepted = []
+            self._checkpoints = dict(checkpoints)
+            self._policies = dict(policies)
+            self._transactions = dict(transactions)
+            self._acks = dict(acks)
+            self._repairs = dict(repairs)
+            self._policy_events = [dict(event) for event in policy_events]
+            self._compensations = dict(compensations)
+            try:
+                for replica_id, operation in records:
+                    self._commit_locked(replica_id, operation)
+                if self._data_file is not None:
+                    self._persist_locked()
+            except BaseException:
+                (
+                    self._candidates,
+                    self._operations,
+                    self._accepted,
+                    self._checkpoints,
+                    self._policies,
+                    self._transactions,
+                    self._acks,
+                    self._repairs,
+                    self._policy_events,
+                    self._compensations,
+                ) = previous
+                raise
+            return HTTPStatus.CREATED, {"status": "created", "version": DATA_FORMAT_VERSION}
 
     def _persist_locked(self) -> None:
         """Atomically write the full accepted-operation log.
@@ -14226,6 +14455,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json_newline(HTTPStatus.OK, self._store.get_store_export())
 
+    def _handle_store_import_post(self) -> None:
+        # The Content-Length contract ran first in do_POST (a malformed
+        # declaration is 400 and an over-limit one 413 before
+        # authentication), then authentication and the admin scope
+        # decision ran before the body is read or any state is observed.
+        # The body must be exactly the nine-field version-1 recovery
+        # document; a non-UTF-8 or malformed body, a missing or extra
+        # root field, a wrong version, a duplicate identity, an illegal
+        # field, an inconsistent cross-section reference, an out-of-log
+        # cursor, or an over-wide clock is 400 invalid_request with
+        # memory and the data file untouched. The commit decision runs
+        # under the commit lock: a document equal to the current export
+        # is an idempotent 200 replay appending nothing, a virgin store
+        # commits the document and answers 201 (persisted atomically
+        # first when --data-file is configured; a durable failure is 500
+        # internal_error with memory and the file unchanged), and any
+        # other state is 409 store_conflict.
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            sections = parse_store_import_payload(raw)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status, payload = self._store.import_store(sections)
+        except PersistenceError:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            return
+        self._json(status, payload)
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
         matched_ack, acknowledge_peer = self._acknowledge_route()
@@ -14300,6 +14561,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "admin"
             and segments[2] == "scope-policy"
             and segments[3] == "reload"
+        )
+        is_store_import_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "store"
+            and segments[3] == "import"
         )
         is_causal_at_post = (
             len(segments) == 4
@@ -14377,6 +14645,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_transaction_plan_post
             or is_transaction_compensate_post
             or is_scope_policy_reload_post
+            or is_store_import_post
             or is_causal_at_post
             or is_states_causal_at_post
             or is_replication_compare_post
@@ -14406,6 +14675,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 if getattr(self.server, "scope_policy", None) is None:
                     self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+            elif is_store_import_post:
+                # The full-store import is published in every mode and
+                # admin-gated, exactly like the store export: the length
+                # contract kept its priority above, then authentication
+                # and the scope decision run before the body is read, the
+                # commit lock is taken, or any state or data file is
+                # touched, so a rejected request leaves the body unread
+                # and never observes the state. The legacy single token
+                # and anonymous mode pass.
+                if not self._require_scope(SCOPE_ADMIN):
                     return
             elif is_auto_resolve_plan_post:
                 # The preview changes no state, so it is gated like the read
@@ -14553,6 +14833,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_scope_policy_reload_post:
             self._handle_scope_policy_reload_post()
+            return
+        if is_store_import_post:
+            self._handle_store_import_post()
             return
         if is_causal_at_post:
             self._handle_state_causal_at_post(segments[2])
