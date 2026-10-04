@@ -5441,9 +5441,12 @@ def _validate_stored_compensations(
     return compensations
 
 
-def _load_data_file_complete(
-    path: str,
-) -> tuple[
+# The validated sections of a version-1 recovery document, in the order
+# every consumer returns them: the accepted operations in commit order,
+# the checkpoints, the policy bindings, the transaction bindings, the
+# consumption receipts, the repair executions, the policy events, and the
+# compensations.
+RecoverySections = tuple[
     list[tuple[str, dict[str, Any]]],
     dict[str, int],
     dict[tuple[str, str], str],
@@ -5452,7 +5455,98 @@ def _load_data_file_complete(
     dict[tuple[str, str], dict[str, Any]],
     list[dict[str, Any]],
     dict[str, dict[str, Any]],
-]:
+]
+
+
+def _validate_recovery_document(document: dict[str, Any]) -> RecoverySections:
+    """Validate every section of a parsed version-1 recovery document.
+
+    Shared by the data-file recovery and the store-import endpoint: both
+    enforce the same per-record constraints, duplicate-identity rules, and
+    cross-section references. Assumes the root shape and the version were
+    already checked by the caller. Raises PersistenceError on any
+    violation.
+    """
+    records_raw = document["operations"]
+    if not isinstance(records_raw, list):
+        raise PersistenceError("data file operations must be a list")
+    records: list[tuple[str, dict[str, Any]]] = []
+    identities: set[tuple[str, str]] = set()
+    for entry in records_raw:
+        replica_id, operation = _validate_stored_operation(entry)
+        identity = (replica_id, operation["operationId"])
+        if identity in identities:
+            raise PersistenceError(f"duplicate accepted operation {identity!r} in data file")
+        identities.add(identity)
+        records.append((replica_id, operation))
+    checkpoints = _validate_stored_checkpoints(document, len(records))
+    policies = _validate_stored_policies(document, identities)
+    transactions = _validate_stored_transactions(document, identities)
+    acks = _validate_stored_acks(document, checkpoints, records)
+    repairs = _validate_stored_repairs(document, checkpoints, records)
+    policy_events = _validate_stored_policy_events(document)
+    compensations = _validate_stored_compensations(document, identities, transactions)
+    return (
+        records,
+        checkpoints,
+        policies,
+        transactions,
+        acks,
+        repairs,
+        policy_events,
+        compensations,
+    )
+
+
+def parse_store_import_payload(raw: bytes) -> RecoverySections:
+    """Parse and strictly validate a store-import request body.
+
+    The body must be a UTF-8 JSON object carrying exactly the nine
+    version-1 recovery sections — ``version``, ``operations``,
+    ``checkpoints``, ``policies``, ``transactions``, ``acks``,
+    ``repairExecutions``, ``policyEvents``, and ``compensations`` — with
+    no missing and no extra root field, ``version`` equal to 1, and every
+    section satisfying the same constraints and cross-section references
+    a data file is recovered under. Returns the validated sections in
+    :data:`RecoverySections` order. Raises ValueError on any violation;
+    nothing is committed anywhere.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("body must be UTF-8 JSON") from exc
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("body must be valid JSON") from exc
+    if not isinstance(document, dict) or set(document.keys()) != {
+        "version",
+        "operations",
+        "checkpoints",
+        "policies",
+        "transactions",
+        "acks",
+        "repairExecutions",
+        "policyEvents",
+        "compensations",
+    }:
+        raise ValueError(
+            "import document must be an object with exactly version, operations, "
+            "checkpoints, policies, transactions, acks, repairExecutions, "
+            "policyEvents, and compensations"
+        )
+    version = document["version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != DATA_FORMAT_VERSION:
+        raise ValueError(f"unsupported recovery document version: {version!r}")
+    try:
+        return _validate_recovery_document(document)
+    except PersistenceError as exc:
+        raise ValueError(f"import document violates the recovery constraints: {exc}") from exc
+
+
+def _load_data_file_complete(
+    path: str,
+) -> RecoverySections:
     """Read and strictly validate a data file, returning every section.
 
     Returns the accepted operations in their original commit order, the
@@ -5501,36 +5595,7 @@ def _load_data_file_complete(
     version = document["version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != DATA_FORMAT_VERSION:
         raise PersistenceError(f"unsupported data file version: {version!r}")
-    records_raw = document["operations"]
-    if not isinstance(records_raw, list):
-        raise PersistenceError("data file operations must be a list")
-
-    records: list[tuple[str, dict[str, Any]]] = []
-    identities: set[tuple[str, str]] = set()
-    for entry in records_raw:
-        replica_id, operation = _validate_stored_operation(entry)
-        identity = (replica_id, operation["operationId"])
-        if identity in identities:
-            raise PersistenceError(f"duplicate accepted operation {identity!r} in data file")
-        identities.add(identity)
-        records.append((replica_id, operation))
-    checkpoints = _validate_stored_checkpoints(document, len(records))
-    policies = _validate_stored_policies(document, identities)
-    transactions = _validate_stored_transactions(document, identities)
-    acks = _validate_stored_acks(document, checkpoints, records)
-    repairs = _validate_stored_repairs(document, checkpoints, records)
-    policy_events = _validate_stored_policy_events(document)
-    compensations = _validate_stored_compensations(document, identities, transactions)
-    return (
-        records,
-        checkpoints,
-        policies,
-        transactions,
-        acks,
-        repairs,
-        policy_events,
-        compensations,
-    )
+    return _validate_recovery_document(document)
 
 
 def load_data_file_full(
@@ -5611,16 +5676,7 @@ def load_data_file_compensations(path: str) -> dict[str, dict[str, Any]]:
 
 def ensure_data_file(
     path: str,
-) -> tuple[
-    list[tuple[str, dict[str, Any]]],
-    dict[str, int],
-    dict[tuple[str, str], str],
-    dict[str, list[dict[str, Any]]],
-    dict[tuple[str, str], dict[str, Any]],
-    dict[tuple[str, str], dict[str, Any]],
-    list[dict[str, Any]],
-    dict[str, dict[str, Any]],
-]:
+) -> RecoverySections:
     """Validate the data-file location and return its committed state.
 
     A missing target file is accepted (its parent directory must exist and
@@ -5884,6 +5940,13 @@ class StateStore:
         # transaction: the binding is local to this replica and is
         # never exported by sync.
         self._compensations: dict[str, dict[str, Any]] = {}
+        # Whether a store import has committed on this instance. It keeps
+        # the first import of the all-empty document into a still-empty
+        # store a "created" commit while every later identical submission
+        # is an idempotent replay. The flag is deliberately not persisted:
+        # a recovered store answers an identical document from its
+        # committed sections alone.
+        self._import_committed = False
         self._data_file: str | None = None
         if data_file is not None:
             path = os.path.abspath(data_file)
@@ -6056,6 +6119,92 @@ class StateStore:
         """
         with self._lock:
             return self._export_document_locked()
+
+    def import_store_document(self, sections: RecoverySections) -> HTTPStatus:
+        """Commit a validated version-1 recovery document, or replay it.
+
+        ``sections`` is the output of :func:`parse_store_import_payload`,
+        already validated against every recovery constraint. The whole
+        decision runs under the commit lock, so a concurrent first import
+        commits exactly once: the first submission into a fresh empty
+        store commits and returns 201, a later submission of the document
+        the committed state already exports returns 200 without appending
+        anything, and any other document against a store that already
+        holds state returns 409. With ``--data-file`` the new state is
+        persisted atomically before it becomes visible; a persistence
+        failure raises PersistenceError with memory and the file
+        unchanged. The imported local bindings (transactions, receipts,
+        repairs, compensations) stay local: they never enter the
+        incremental sync stream, exactly as if they had been committed
+        here.
+        """
+        (
+            records,
+            checkpoints,
+            policies,
+            transactions,
+            acks,
+            repairs,
+            policy_events,
+            compensations,
+        ) = sections
+        with self._lock:
+            fresh = not self._import_committed and not (
+                self._accepted
+                or self._checkpoints
+                or self._policies
+                or self._transactions
+                or self._acks
+                or self._repairs
+                or self._policy_events
+                or self._compensations
+            )
+            if not fresh:
+                # The store already holds state (or already imported): an
+                # identical document is an idempotent replay, anything
+                # else conflicts with the committed state.
+                if (
+                    records == self._accepted
+                    and checkpoints == self._checkpoints
+                    and policies == self._policies
+                    and transactions == self._transactions
+                    and acks == self._acks
+                    and repairs == self._repairs
+                    and policy_events == self._policy_events
+                    and compensations == self._compensations
+                ):
+                    return HTTPStatus.OK
+                return HTTPStatus.CONFLICT
+            for replica_id, operation in records:
+                self._commit_locked(replica_id, operation)
+            self._checkpoints = dict(checkpoints)
+            self._policies = dict(policies)
+            self._transactions = dict(transactions)
+            self._acks = dict(acks)
+            self._repairs = dict(repairs)
+            self._policy_events = [dict(event) for event in policy_events]
+            self._compensations = dict(compensations)
+            if self._data_file is not None:
+                # The atomic rename is the single commit point; only after
+                # it succeeds does the imported state stay visible, so a
+                # crash or failure leaves memory and file on the previous
+                # (empty) commit.
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    self._candidates.clear()
+                    self._operations.clear()
+                    self._accepted.clear()
+                    self._checkpoints.clear()
+                    self._policies.clear()
+                    self._transactions.clear()
+                    self._acks.clear()
+                    self._repairs.clear()
+                    self._policy_events.clear()
+                    self._compensations.clear()
+                    raise
+            self._import_committed = True
+            return HTTPStatus.CREATED
 
     def _persist_locked(self) -> None:
         """Atomically write the full accepted-operation log.
@@ -14226,6 +14375,45 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json_newline(HTTPStatus.OK, self._store.get_store_export())
 
+    def _handle_store_import_post(self) -> None:
+        # Content-Length validation and the admin-scope decision ran in
+        # do_POST before the body was read, so a rejected request never
+        # observes or changes any state. The body must be exactly the
+        # version-1 recovery document — the nine sections, no missing or
+        # extra root field, version 1, every recovery and cross-section
+        # constraint satisfied; any violation is 400 invalid_request with
+        # memory and the data file untouched. The commit itself is
+        # atomic: with --data-file the imported state is persisted before
+        # it becomes visible, and a persistence failure is 500
+        # internal_error with memory and file unchanged. The first import
+        # into a fresh empty store answers 201 created; an identical
+        # resubmission is the idempotent 200 ok and appends no operation,
+        # cursor, or audit; any other document against a store that
+        # already holds state is 409 store_conflict.
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            sections = parse_store_import_payload(raw)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        try:
+            status = self._store.import_store_document(sections)
+        except PersistenceError:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json(status, {"error": "store_conflict"})
+            return
+        self._json(
+            status,
+            {
+                "status": "created" if status is HTTPStatus.CREATED else "ok",
+                "version": DATA_FORMAT_VERSION,
+            },
+        )
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
         matched_ack, acknowledge_peer = self._acknowledge_route()
@@ -14300,6 +14488,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[1] == "admin"
             and segments[2] == "scope-policy"
             and segments[3] == "reload"
+        )
+        is_store_import_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "store"
+            and segments[3] == "import"
         )
         is_causal_at_post = (
             len(segments) == 4
@@ -14377,6 +14572,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_transaction_plan_post
             or is_transaction_compensate_post
             or is_scope_policy_reload_post
+            or is_store_import_post
             or is_causal_at_post
             or is_states_causal_at_post
             or is_replication_compare_post
@@ -14395,7 +14591,19 @@ class RequestHandler(BaseHTTPRequestHandler):
             # closed.
             if self._validate_declared_length() is None:
                 return
-            if is_scope_policy_reload_post:
+            if is_store_import_post:
+                # The store import shares the length-first priority and is
+                # admin-gated like the store export: authentication and the
+                # scope decision run before the body is read, the commit
+                # lock is taken, or any state or data file is touched, so
+                # a rejected request never observes the state. The endpoint
+                # is published in every mode — anonymous and legacy
+                # single-token configurations pass, exactly like on the
+                # export; in scope-policy mode only the admin scope may
+                # import, a read or write token is 403.
+                if not self._require_scope(SCOPE_ADMIN):
+                    return
+            elif is_scope_policy_reload_post:
                 # The reload endpoint shares the length-first priority but
                 # is admin-gated rather than write-gated. Authentication
                 # still runs before the mode gate, so a missing or bad
@@ -14553,6 +14761,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_scope_policy_reload_post:
             self._handle_scope_policy_reload_post()
+            return
+        if is_store_import_post:
+            self._handle_store_import_post()
             return
         if is_causal_at_post:
             self._handle_state_causal_at_post(segments[2])
