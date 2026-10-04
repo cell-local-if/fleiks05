@@ -4801,6 +4801,72 @@ class ScopePolicyManager:
             self._digest = digest
         return digest, entries
 
+    def preview(self) -> tuple[str, int, str | None, int, dict[str, int]]:
+        """Compare the configured file against the live policy, changing nothing.
+
+        Re-reads the same file the service started with (exactly one read
+        of its bytes), validates it under exactly the startup and reload
+        constraints, and diffs the candidate mapping against one snapshot
+        of the live mapping taken under the same lock that serializes
+        reloads. Returns ``(candidate_digest, candidate_tokens,
+        current_digest, current_tokens, changes)`` where the digests are
+        the 64-character lowercase hexadecimal SHA-256 of the candidate
+        and current raw UTF-8 bytes respectively, and ``changes`` maps
+        ``added``/``removed``/``changed``/``unchanged`` to their counts:
+        a token only in the candidate is added, only in the live policy
+        is removed, in both with a different scope set is changed, and in
+        both with the same scope set is unchanged (scope-array order is
+        irrelevant). A missing, unreadable, non-regular, or otherwise
+        unreadable file raises ScopePolicyReloadError(kind="unavailable");
+        readable-but-invalid content raises
+        ScopePolicyReloadError(kind="conflict"). The preview never swaps
+        the live mapping, never records an event, and never writes the
+        data file or a temporary file, so an unchanged input yields an
+        identical response.
+        """
+        path = self._path
+        if path is None:
+            raise ScopePolicyReloadError(
+                "unavailable", "no scope policy file was configured at startup"
+            )
+        # The same serialization as reloads: the read, the validation, and
+        # the comparison observe exactly one committed revision of the live
+        # mapping, so the reported diff is never a mix of two revisions.
+        with self._lock:
+            try:
+                raw = read_scope_policy_bytes(path)
+            except ScopePolicyError as exc:
+                raise ScopePolicyReloadError("unavailable", str(exc)) from exc
+            try:
+                candidate = parse_scope_policy(raw)
+            except ScopePolicyError as exc:
+                raise ScopePolicyReloadError("conflict", str(exc)) from exc
+            added = removed = changed = unchanged = 0
+            for token, scopes in candidate.items():
+                live_scopes = self._policy.get(token)
+                if live_scopes is None:
+                    added += 1
+                elif live_scopes != scopes:
+                    changed += 1
+                else:
+                    unchanged += 1
+            for token in self._policy:
+                if token not in candidate:
+                    removed += 1
+            changes = {
+                "added": added,
+                "removed": removed,
+                "changed": changed,
+                "unchanged": unchanged,
+            }
+            return (
+                hashlib.sha256(raw).hexdigest(),
+                len(candidate),
+                self._digest,
+                len(self._policy),
+                changes,
+            )
+
 
 def _validate_stored_operation(entry: Any) -> tuple[str, dict[str, Any]]:
     """Validate one persisted operation record against the input constraints.
@@ -12088,15 +12154,24 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "scope-policy"
             and segments[3] == "status"
         )
+        is_scope_policy_preview_get = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "scope-policy"
+            and segments[3] == "preview"
+        )
         if (
             is_scope_policy_audit_verify_get
             or is_scope_policy_audit_get
             or is_scope_policy_status_get
+            or is_scope_policy_preview_get
         ):
-            # The change-audit entries and the policy-status entry are
-            # admin-gated, like the reload endpoint, and exist only in
-            # scope-policy mode. Authentication still runs before the mode
-            # gate, so a missing or bad credential is 401 in every mode, a
+            # The change-audit entries, the policy-status entry, and the
+            # reload-preview entry are admin-gated, like the reload
+            # endpoint, and exist only in scope-policy mode. Authentication
+            # still runs before the mode gate, so a missing or bad
+            # credential is 401 in every mode, a
             # valid token without the admin scope is 403 without a
             # challenge, and single-token plus anonymous modes answer 404
             # exactly like an unpublished route. Path-shape mismatches
@@ -12111,8 +12186,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._handle_scope_policy_audit_verify_get()
             elif is_scope_policy_audit_get:
                 self._handle_scope_policy_audit_get()
-            else:
+            elif is_scope_policy_status_get:
                 self._handle_scope_policy_status_get()
+            else:
+                self._handle_scope_policy_preview_get()
             return
         is_store_export_get = (
             len(segments) == 4
@@ -14066,6 +14143,64 @@ class RequestHandler(BaseHTTPRequestHandler):
         # verification (status then the four anomaly lists), terminated by
         # one newline.
         self._json_ordered_newline(status, payload)
+
+    def _handle_scope_policy_preview_get(self) -> None:
+        # Authentication, the admin scope, and the scope-mode gate all ran
+        # in do_GET; route-shape mismatches — missing, extra, or a trailing
+        # slash — fall through to the generic 404 before this handler runs.
+        # The route accepts no query parameters, and that check runs before
+        # the configured file is ever read.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        manager = getattr(self.server, "scope_policy", None)
+        if manager is None:
+            # Defensive: the mode gate already ran in do_GET. This keeps a
+            # missing manager a not-found rather than a server error.
+            self._json_ordered_newline(
+                HTTPStatus.NOT_FOUND, {"error": "not_found"}
+            )
+            return
+        # The preflight reads the configured file once and diffs it against
+        # one snapshot of the live policy: it never swaps the boundary,
+        # never records an audit event, and never writes the data file or
+        # a temporary file. Failures reuse the reload classification —
+        # unreadable file is 503, invalid content is 409 — and never echo
+        # the file's tokens, scopes, or validation details.
+        try:
+            (
+                candidate_digest,
+                candidate_tokens,
+                current_digest,
+                current_tokens,
+                changes,
+            ) = manager.preview()
+        except ScopePolicyReloadError as exc:
+            if exc.kind == "unavailable":
+                self._json_ordered_newline(
+                    HTTPStatus.SERVICE_UNAVAILABLE, {"error": "policy_unavailable"}
+                )
+            else:
+                self._json_ordered_newline(
+                    HTTPStatus.CONFLICT, {"error": "policy_conflict"}
+                )
+            return
+        # Field order is part of the contract: status, candidateDigest,
+        # candidateTokens, currentDigest, currentTokens, changes (added,
+        # removed, changed, unchanged), terminated by one newline.
+        self._json_ordered_newline(
+            HTTPStatus.OK,
+            {
+                "status": "valid",
+                "candidateDigest": candidate_digest,
+                "candidateTokens": candidate_tokens,
+                "currentDigest": current_digest,
+                "currentTokens": current_tokens,
+                "changes": changes,
+            },
+        )
 
     def _handle_store_export_get(self) -> None:
         # Authentication and the admin scope decision ran in do_GET;

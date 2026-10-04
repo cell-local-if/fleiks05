@@ -126,6 +126,22 @@ In scope policy mode an administrator can read the currently effective policy's 
 - A successful HTTP 200 response is a compact UTF-8 JSON object with exactly three fields, in this order: `{"status":"active","policyDigest":"<64 lowercase hex>","tokens":<non-negative integer>}`. `policyDigest` is the SHA-256 of the raw UTF-8 bytes the **live** policy was loaded from — captured at startup and advanced only by a successful reload — and `tokens` is the live policy's entry count.
 - The query never re-reads the `--scope-policy-file` file, never writes the data file, and records no audit event; it observes one committed revision under the same serialization as reloads. It is the way to learn the digest a conditional reload's `expectedPolicyDigest` is compared against.
 
+#### Previewing a policy replacement: `GET /v1/admin/scope-policy/preview`
+
+In scope policy mode an administrator can validate the `--scope-policy-file` file and quantify its impact **before** replacing the live boundary. The preflight reads the configured file's bytes once, validates them under exactly the startup and reload constraints, and diffs the candidate mapping against one snapshot of the live policy. It is published **only** in scope policy mode: single-token mode and anonymous mode answer it with `404 {"error":"not_found"}` (after the single-token authentication check, exactly like the reload endpoint).
+
+- The request must carry an `admin` token: a missing or bad credential is HTTP 401 with `{"error":"unauthorized"}` and the `WWW-Authenticate: Bearer` challenge; an authenticated token without the `admin` scope is HTTP 403 with `{"error":"forbidden"}` and no challenge.
+- The path must be exactly `/v1/admin/scope-policy/preview` — a missing segment, extra segment, or trailing slash is `404 {"error":"not_found"}`, and any other method on the path is 404 as well. The route accepts no query parameters; any parameter is HTTP 400 with `{"error":"invalid_request"}`, and that check runs before the file is ever read.
+- If the configured file is missing, unreadable, non-regular, or cannot be read, the response is HTTP 503 with `{"error":"policy_unavailable"}`; if it is readable but its content violates the token/scope constraints, the response is HTTP 409 with `{"error":"policy_conflict"}`. Errors never echo the file's content, tokens, scopes, or validation details.
+- A successful HTTP 200 response is one compact UTF-8 JSON line terminated by a single newline, with exactly six fields, in this order:
+
+  ```json
+  {"status":"valid","candidateDigest":"<64 lowercase hex>","candidateTokens":3,"currentDigest":"<64 lowercase hex>","currentTokens":3,"changes":{"added":1,"removed":1,"changed":1,"unchanged":1}}
+  ```
+
+  `candidateDigest`/`currentDigest` are the 64-character lowercase hexadecimal SHA-256 of the candidate's and the live policy's **raw UTF-8 bytes** respectively (the bytes are hashed, never canonicalized). `changes` counts the diff without naming any token or scope: a token only in the candidate is `added`, only in the live policy is `removed`, in both with a different scope set is `changed`, and in both with the same scope set is `unchanged` (scope-array order is irrelevant). `candidateTokens` is `added + changed + unchanged` and `currentTokens` is `removed + changed + unchanged`.
+- The preflight never swaps the live policy, never records an audit event, and never writes the data file or a temporary file; the comparison observes one committed revision under the same serialization as reloads, so an unchanged input yields an identical response. The reload itself — its conditional compare, atomic swap, auditing, and keep-the-old-policy-on-failure behavior — is unchanged.
+
 #### Auditing scope-policy changes: `GET /v1/admin/scope-policy/audit`
 
 In scope policy mode an administrator can page the history of successful policy replacements made through the reload endpoint. The query is strictly read-only and is published **only** in scope policy mode: single-token mode and anonymous mode answer it with `404 {"error":"not_found"}` (after the single-token authentication check, exactly like the reload endpoint).
