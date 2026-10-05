@@ -14730,6 +14730,107 @@ def _max_clock_components_value(token: str) -> int:
     return value
 
 
+def _load_existing_data_file(
+    path: str,
+) -> tuple[
+    list[tuple[str, dict[str, Any]]],
+    dict[str, int],
+    dict[tuple[str, str], str],
+    dict[str, list[dict[str, Any]]],
+    dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    """Read and strictly validate an existing data file for ``--check``.
+
+    Applies exactly the recovery validation of :func:`ensure_data_file` to
+    an existing target, but a missing target is a failure here: check mode
+    never creates the file, never probes the parent directory, and never
+    writes anything. Sections absent from an older version:1 file recover
+    as empty exactly as they do at startup.
+    """
+    absolute = os.path.abspath(path)
+    try:
+        exists = os.path.lexists(absolute)
+        if exists:
+            mode = os.stat(absolute).st_mode
+    except OSError as exc:
+        raise PersistenceError(f"cannot access data file {absolute!r}: {exc}") from exc
+    if not exists:
+        raise PersistenceError(f"data file does not exist: {absolute!r}")
+    if not stat.S_ISREG(mode):
+        raise PersistenceError(f"data file path is not a regular file: {absolute!r}")
+    return _load_data_file_complete(absolute)
+
+
+def _run_startup_check(args: argparse.Namespace) -> None:
+    """Execute ``--check``: validate the startup inputs without starting.
+
+    The authentication files have already been read and validated by
+    :func:`main` and the clock-width bound is already published, so
+    recovery applies it to every stored clock exactly like a real startup.
+    A configured data file must already exist and be accepted by the
+    current recovery logic; nothing is created, probed, rewritten, or
+    deleted, and no port is bound. On success one compact JSON summary
+    line is written to stdout and the process exits 0; on any failure
+    stdout stays empty and the process exits 2 with the standard
+    startup-failure line on stderr, never echoing token or policy
+    contents.
+    """
+    if args.auth_token_file is not None:
+        authentication = "single-token"
+    elif args.scope_policy_file is not None:
+        authentication = "scope-policy"
+    else:
+        authentication = "anonymous"
+
+    data_file_summary: dict[str, Any] = {
+        "configured": args.data_file is not None,
+        "operations": 0,
+        "checkpoints": 0,
+        "transactions": 0,
+        "acks": 0,
+        "repairs": 0,
+        "policyEvents": 0,
+        "compensations": 0,
+    }
+    if args.data_file is not None:
+        try:
+            (
+                records,
+                checkpoints,
+                _policies,
+                transactions,
+                acks,
+                repairs,
+                policy_events,
+                compensations,
+            ) = _load_existing_data_file(args.data_file)
+        except PersistenceError as exc:
+            print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        data_file_summary.update(
+            {
+                "operations": len(records),
+                "checkpoints": len(checkpoints),
+                "transactions": len(transactions),
+                "acks": len(acks),
+                "repairs": len(repairs),
+                "policyEvents": len(policy_events),
+                "compensations": len(compensations),
+            }
+        )
+
+    summary = {
+        "status": "ok",
+        "authentication": authentication,
+        "dataFile": data_file_summary,
+        "maxClockComponents": args.max_clock_components,
+    }
+    sys.stdout.write(json.dumps(summary, separators=(",", ":")) + "\n")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the Semantic State Engine HTTP service")
     parser.add_argument("--host", default="127.0.0.1")
@@ -14775,6 +14876,17 @@ def main(argv: list[str] | None = None) -> None:
             "from the data file) may hold at most N components, a decimal "
             "integer between 1 and 1024; without it clock width is "
             "unrestricted and every behavior is unchanged"
+        ),
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "validate the argument combination, authentication files, "
+            "clock-width bound, and data file exactly as startup would, "
+            "then print a one-line JSON summary and exit without binding a "
+            "port or starting the service; a configured data file must "
+            "already exist and is never created, rewritten, or deleted"
         ),
     )
     args = parser.parse_args(argv)
@@ -14823,6 +14935,14 @@ def main(argv: list[str] | None = None) -> None:
         except ScopePolicyError as exc:
             print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
+
+    if args.check:
+        # Check-only preflight: every startup validation above has already
+        # run (argument combination, authentication, clock-width bound);
+        # the data file is validated by recovery without being created,
+        # and no port is bound.
+        _run_startup_check(args)
+        return
 
     try:
         store = StateStore(data_file=args.data_file)
