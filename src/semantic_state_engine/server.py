@@ -271,10 +271,11 @@ AUTO_RESOLVE_POLICIES = (
     "highest_identity",
     "lowest_value",
     "highest_value",
+    "plurality_value",
 )
 AUTO_RESOLVE_POLICY_MESSAGE = (
     "policy must be one of 'lowest_identity', 'highest_identity', "
-    "'lowest_value', or 'highest_value'"
+    "'lowest_value', 'highest_value', or 'plurality_value'"
 )
 
 
@@ -290,6 +291,12 @@ def _select_auto_resolution_candidate(
     nothing observable: every candidate carrying the extreme string
     supplies that same value, so which tied record is read only affects
     which identical string is copied.
+
+    ``plurality_value`` groups the candidates by their value and picks
+    the value carried by the most candidates; a tie is broken by the
+    smallest value in Unicode code-point order. The outcome depends only
+    on the multiset of candidate values, so it is independent of the
+    candidate order and of which identities carry each value.
     """
     if policy == "highest_identity":
         return max(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
@@ -297,6 +304,12 @@ def _select_auto_resolution_candidate(
         return min(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
     if policy == "highest_value":
         return max(candidates, key=lambda c: c["value"])
+    if policy == "plurality_value":
+        counts: dict[str, int] = {}
+        for candidate in candidates:
+            counts[candidate["value"]] = counts.get(candidate["value"], 0) + 1
+        winning = min(counts, key=lambda value: (-counts[value], value))
+        return next(c for c in candidates if c["value"] == winning)
     return min(candidates, key=lambda c: c["value"])
 
 
@@ -309,8 +322,10 @@ def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, A
     server: the value is taken from a current candidate selected by
     ``policy``); ``policy`` selects which current candidate supplies the
     resolution value — the smallest or largest ``(replicaId,
-    operationId)`` for the identity policies, or the smallest or largest
-    string value (Unicode code-point order) for the value policies.
+    operationId)`` for the identity policies, the smallest or largest
+    string value (Unicode code-point order) for the value policies, or
+    the value carried by the most candidates (ties broken by the
+    smallest value) for ``plurality_value``.
     Returns a normalized request dict. Raises ValueError on any violation.
     """
     if isinstance(raw, (bytes, bytearray)):
@@ -6266,10 +6281,12 @@ class StateStore:
         with at least two distinct values, and the resolution value is taken
         deterministically from a current candidate selected by the request
         policy — the smallest or largest ``(replicaId, operationId)`` for
-        the identity policies, or the candidate carrying the smallest or
+        the identity policies, the candidate carrying the smallest or
         largest string value in Unicode code-point order for the value
         policies (a repeated extreme value still resolves to that same
-        value). The request clock must dominate every current candidate.
+        value), or the value carried by the most candidates for
+        ``plurality_value`` (ties broken by the smallest value). The
+        request clock must dominate every current candidate.
         The resolution then commits exactly like a manual resolution — one
         ordinary operation in the shared commit order, so it flows through
         sync export/import, the audit streams, the metrics, and the data
@@ -6327,7 +6344,9 @@ class StateStore:
 
             # Deterministic policy: the identity policies select by
             # (replicaId, operationId), the value policies by the candidate
-            # string in Unicode code-point order.
+            # string in Unicode code-point order, and plurality_value by
+            # the value carried by the most candidates (ties broken by the
+            # smallest value).
             chosen = _select_auto_resolution_candidate(current, request["policy"])
             operation["value"] = chosen["value"]
 
@@ -8921,8 +8940,8 @@ class StateStore:
         ``"conflict"``.
 
         ``origin`` is ``"automatic_resolution"`` only when the operation
-        carries a local automatic-resolution policy binding (one of the four
-        published policies in :data:`AUTO_RESOLVE_POLICIES`), in which case
+        carries a local automatic-resolution policy binding (one of the
+        five published policies in :data:`AUTO_RESOLVE_POLICIES`), in which case
         ``policy`` names that policy; every other record — a plain write, a
         manual resolution, or a sync-imported operation with no local
         binding — reports ``"other"`` with ``policy`` null. A data file
@@ -11434,8 +11453,8 @@ class StateStore:
           reporting which current candidate each of the two identity-based
           automatic-resolution policies would select — the smallest and
           largest ``(replicaId, operationId)`` — in the same shape as the
-          ``candidates`` entries. The value policies add no keys here; the
-          response shape is unchanged.
+          ``candidates`` entries. The value policies and ``plurality_value``
+          add no keys here; the response shape is unchanged.
 
         With ``--data-file`` the candidate state is rebuilt identically
         during recovery, so the same state yields the same relations,
