@@ -4512,14 +4512,14 @@ class AuthTokenError(Exception):
     """
 
 
-def load_auth_token(path: str) -> str:
-    """Read and strictly validate the bearer token file.
+def read_auth_token_bytes(path: str) -> bytes:
+    """Read the raw bytes of the auth token file at ``path``.
 
-    The target must be a readable regular file whose entire content is one
-    non-empty ASCII printable token (bytes 0x21-0x7E): no whitespace, no
-    newlines, nothing before or after the token. Raises AuthTokenError on a
-    missing, unreadable, or non-regular target and on any format violation;
-    the error never echoes the file's content.
+    The target must be a readable regular file. A missing, unreadable, or
+    non-regular target (for example a directory) and any read failure raise
+    AuthTokenError; the error never echoes the file's content. The bytes
+    themselves are not validated here, so a reload can tell an unreadable
+    file (503) apart from an invalid token (409).
     """
     try:
         mode = os.stat(path).st_mode
@@ -4529,15 +4529,120 @@ def load_auth_token(path: str) -> str:
         raise AuthTokenError(f"auth token path is not a regular file: {path!r}")
     try:
         with open(path, "rb") as handle:
-            raw = handle.read()
+            return handle.read()
     except OSError as exc:
         raise AuthTokenError(f"cannot read auth token file {path!r}: {exc}") from exc
+
+
+def parse_auth_token(raw: bytes) -> str:
+    """Validate raw auth-token bytes and return the token.
+
+    The bytes must be exactly one non-empty ASCII printable token (bytes
+    0x21-0x7E): no whitespace, no newlines, nothing before or after the
+    token. Any format violation raises AuthTokenError; the error never
+    echoes the content.
+    """
     if not raw or any(byte < 0x21 or byte > 0x7E for byte in raw):
         raise AuthTokenError(
             "auth token file must contain exactly one non-empty ASCII "
             "printable token without whitespace or newlines"
         )
     return raw.decode("ascii")
+
+
+def load_auth_token(path: str) -> str:
+    """Read and strictly validate the bearer token file.
+
+    The target must be a readable regular file whose entire content is one
+    non-empty ASCII printable token (bytes 0x21-0x7E): no whitespace, no
+    newlines, nothing before or after the token. Raises AuthTokenError on a
+    missing, unreadable, or non-regular target and on any format violation;
+    the error never echoes the file's content.
+    """
+    return parse_auth_token(read_auth_token_bytes(path))
+
+
+class AuthTokenReloadError(Exception):
+    """Raised when a runtime auth-token reload cannot be completed.
+
+    ``kind`` classifies the failure for the HTTP boundary: ``"unavailable"``
+    means the configured file is missing, unreadable, not a regular file, or
+    could not be read (HTTP 503 ``auth_token_unavailable``); ``"conflict"``
+    means the file was readable but its content failed the same token
+    validation as startup (HTTP 409 ``auth_token_conflict``). Either way the
+    live token stays in force and the error never echoes the file's content.
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+class AuthTokenManager:
+    """Thread-safe holder of the live single bearer token.
+
+    The manager owns the live token and the path of the file given at
+    startup. Authentication takes a snapshot of the token under the
+    manager's lock; a reload re-reads and validates that same configured
+    file and only then swaps the token, so the replacement is one atomic
+    commit: concurrent reloads run strictly one after another as complete
+    read-validate-swap units, and every request authenticates against
+    either the old token or the new one, never a partial state. A failed
+    reload leaves the live token untouched.
+    """
+
+    def __init__(self, path: str | None, token: str) -> None:
+        # The path comes from the startup configuration; reloads may only
+        # ever re-read this exact file, never a request-supplied path. It is
+        # None only for servers assembled directly without a token file, in
+        # which case a reload reports the token as unavailable.
+        self._path = os.path.abspath(path) if path is not None else None
+        self._lock = threading.Lock()
+        self._token = token
+
+    @property
+    def path(self) -> str | None:
+        return self._path
+
+    def snapshot(self) -> str:
+        """Return a point-in-time copy of the live token."""
+        with self._lock:
+            return self._token
+
+    def reload(self) -> None:
+        """Atomically reload the token from the startup-configured file.
+
+        Re-reads the same file the service started with (the request may
+        not name another path), validates it under exactly the startup
+        constraints, and swaps the live token in one commit serialized
+        against concurrent reloads and authentication snapshots. A missing,
+        unreadable, non-regular, or otherwise unreadable file raises
+        AuthTokenReloadError(kind="unavailable"); readable-but-invalid
+        content raises AuthTokenReloadError(kind="conflict"). Either
+        failure leaves the live token complete and in force — no half
+        update — and neither error echoes the file's content. No temporary
+        file is created and nothing is written to the data file or any log.
+        """
+        path = self._path
+        if path is None:
+            raise AuthTokenReloadError(
+                "unavailable", "no auth token file was configured at startup"
+            )
+        # Hold the lock across the read, validation, and the swap, so each
+        # reload is one complete commit serialized against other reloads
+        # and against authentication snapshots: while a reload is reading
+        # or validating, every request still sees the old token, and once
+        # it releases every request sees the new one.
+        with self._lock:
+            try:
+                raw = read_auth_token_bytes(path)
+            except AuthTokenError as exc:
+                raise AuthTokenReloadError("unavailable", str(exc)) from exc
+            try:
+                token = parse_auth_token(raw)
+            except AuthTokenError as exc:
+                raise AuthTokenReloadError("conflict", str(exc)) from exc
+            self._token = token
 
 
 SCOPE_READ = "read"
@@ -11853,6 +11958,7 @@ class SemanticStateServer(ThreadingHTTPServer):
         auth_scopes: dict[str, frozenset[str]] | None = None,
         scope_policy_file: str | None = None,
         scope_policy_digest: str | None = None,
+        auth_token_file: str | None = None,
     ) -> None:
         # Build (and thus preflight/recover) the store before binding and
         # listening, so a rejected data file fails startup before any port is
@@ -11878,6 +11984,16 @@ class SemanticStateServer(ThreadingHTTPServer):
         self.scope_policy = (
             ScopePolicyManager(scope_policy_file, auth_scopes, digest=scope_policy_digest)
             if auth_scopes is not None
+            else None
+        )
+        # The manager owns the live single token and the startup-configured
+        # token file, so the admin reload endpoint can atomically swap the
+        # token without a restart. It exists only in single-token mode;
+        # None means the endpoint is not published (scope-policy mode and
+        # anonymous mode answer it with 404).
+        self.auth_token_manager = (
+            AuthTokenManager(auth_token_file, auth_token)
+            if auth_token is not None
             else None
         )
 
@@ -11980,7 +12096,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if token is not None:
                     # Legacy single-token mode: the one token keeps its full,
                     # unrestricted access — the configured scope boundary is
-                    # only enforced in the scope-policy mode.
+                    # only enforced in the scope-policy mode. Take one
+                    # point-in-time copy of the live token so the whole
+                    # authentication runs against a single committed token
+                    # even if a reload swaps it meanwhile: a request that
+                    # has entered authentication is decided entirely by the
+                    # token in force when it authenticated, never by a
+                    # later rotation.
+                    token_manager = getattr(self.server, "auth_token_manager", None)
+                    if token_manager is not None:
+                        token = token_manager.snapshot()
                     if hmac.compare_digest(credential, token.encode("ascii")):
                         return True, frozenset(ALLOWED_SCOPES)
                 else:
@@ -14073,6 +14198,51 @@ class RequestHandler(BaseHTTPRequestHandler):
             {"status": "reloaded", "policyDigest": digest, "tokens": tokens},
         )
 
+    def _handle_auth_token_reload_post(self) -> None:
+        # The declared-length check (400/413), authentication, the admin
+        # scope, and the single-token mode gate (404) all ran in do_POST,
+        # none of them reading the body or the token file; route-shape
+        # mismatches — missing, extra, or a trailing slash — fall through
+        # to the generic 404 before any of those. The route accepts no
+        # query parameters, and that check precedes the body check even on
+        # a correct route.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            parse_empty_object_payload(raw)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        manager = getattr(self.server, "auth_token_manager", None)
+        if manager is None:
+            # Defensive: the mode gate already ran in do_POST. This keeps a
+            # missing manager a not-found rather than a server error.
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        # The manager re-reads only the startup-configured file, validates
+        # it under exactly the startup constraints, and swaps the live
+        # token in one commit serialized against concurrent reloads and
+        # authentication snapshots. Every failure keeps the old token
+        # whole and in force, touches no state, and never echoes the
+        # file's content; a successful reload changes nothing but the
+        # in-memory token — no store, cursor, checkpoint, audit, or data
+        # file write.
+        try:
+            manager.reload()
+        except AuthTokenReloadError as exc:
+            if exc.kind == "unavailable":
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE, {"error": "auth_token_unavailable"}
+                )
+            else:
+                self._json(HTTPStatus.CONFLICT, {"error": "auth_token_conflict"})
+            return
+        self._json(HTTPStatus.OK, {"status": "reloaded"})
+
     def _handle_scope_policy_status_get(self) -> None:
         # Authentication, the admin scope, and the scope-mode gate all ran
         # in do_GET; route-shape mismatches — missing, extra, or a trailing
@@ -14301,6 +14471,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "scope-policy"
             and segments[3] == "reload"
         )
+        is_auth_token_reload_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "auth-token"
+            and segments[3] == "reload"
+        )
         is_causal_at_post = (
             len(segments) == 4
             and segments[0] == "v1"
@@ -14377,6 +14554,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_transaction_plan_post
             or is_transaction_compensate_post
             or is_scope_policy_reload_post
+            or is_auth_token_reload_post
             or is_causal_at_post
             or is_states_causal_at_post
             or is_replication_compare_post
@@ -14405,6 +14583,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not self._require_scope(SCOPE_ADMIN):
                     return
                 if getattr(self.server, "scope_policy", None) is None:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+            elif is_auth_token_reload_post:
+                # The token reload endpoint shares the length-first
+                # priority but is admin-gated rather than write-gated.
+                # Authentication still runs before the mode gate, so a
+                # missing or bad credential is 401 in every mode; the
+                # endpoint then exists only in single-token mode —
+                # scope-policy and anonymous modes answer 404, exactly
+                # like an unpublished route.
+                if not self._require_scope(SCOPE_ADMIN):
+                    return
+                if getattr(self.server, "auth_token_manager", None) is None:
                     self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                     return
             elif is_auto_resolve_plan_post:
@@ -14553,6 +14744,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_scope_policy_reload_post:
             self._handle_scope_policy_reload_post()
+            return
+        if is_auth_token_reload_post:
+            self._handle_auth_token_reload_post()
             return
         if is_causal_at_post:
             self._handle_state_causal_at_post(segments[2])
@@ -14749,6 +14943,7 @@ def main(argv: list[str] | None = None) -> None:
         auth_scopes=auth_scopes,
         scope_policy_file=args.scope_policy_file,
         scope_policy_digest=scope_policy_digest,
+        auth_token_file=args.auth_token_file,
     )
     try:
         server.serve_forever()

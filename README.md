@@ -84,6 +84,17 @@ Pass `--auth-token-file PATH` to require one bearer token on every endpoint exce
 PYTHONPATH=src python3 -m semantic_state_engine.server --auth-token-file ./var/token
 ```
 
+#### Runtime token rotation: `POST /v1/admin/auth-token/reload`
+
+In single token mode an administrator can atomically rotate the live bearer token without a restart. The reload re-reads **only the file supplied with `--auth-token-file` at startup** — the request never names, and the server never accepts, another path. The endpoint is published **only** in single token mode: scope-policy mode and anonymous mode answer it with `404 {"error":"not_found"}`, exactly like an unpublished route.
+
+- The request must carry the token that is valid **before** the rotation. Authentication failure is HTTP 401 with `{"error":"unauthorized"}` and the `WWW-Authenticate: Bearer` challenge; the rejection never reads the body or the token file.
+- The request body must be exactly the empty JSON object `{}` (JSON whitespace around the object is allowed). Malformed JSON, a non-object document, or any field — known or unknown — is HTTP 400 with `{"error":"invalid_request"}`.
+- The shared Content-Length priority applies: a missing/malformed declaration is 400 and an over-limit declaration is 413, both **before** authentication, and neither rejection reads the token file or changes the token. The path must be exactly `/v1/admin/auth-token/reload` — a missing segment, extra segment, or trailing slash is `404 {"error":"not_found"}`, decided before any query or body check. Any query parameter is 400 `invalid_request`, and that check precedes the body check even on the correct route.
+- The configured file must remain a readable **regular** file whose entire content is one non-empty ASCII printable token, under exactly the startup constraints. If it is missing, unreadable, non-regular, or cannot be read, the response is HTTP 503 with `{"error":"auth_token_unavailable"}`. If it is readable but its content is invalid, the response is HTTP 409 with `{"error":"auth_token_conflict"}`. Every failure keeps the **old** token fully in force — no half update — and never echoes the file's content.
+- On success the response is HTTP 200 with exactly one field: `{"status":"reloaded"}`. The new token authenticates immediately and the old token is rejected immediately with HTTP 401. The replacement is one atomic commit serialized across concurrent reloads: every request observes either the old token or the new one, and a request already authenticated continues to execute under the token in force when it authenticated, unaffected by the rotation.
+- A rotation changes nothing but the in-memory token: the token is never written to the data file, the audit stream, a response extension field, or any log, and the state store, cursors, checkpoints, acknowledgements, repair records, and persisted audit content are untouched. The data-file format is unchanged and a restart still initializes the token from the `--auth-token-file` file; `GET /health` stays anonymous and every other endpoint's authentication, scope-policy management, and error precedence are unchanged.
+
 #### Scope policy mode: `--scope-policy-file PATH`
 
 Pass `--scope-policy-file PATH` to require a bearer token that also carries an authorization scope. The file must be a readable **regular** UTF-8 JSON **object** whose keys are tokens and whose values are scope arrays:
