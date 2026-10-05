@@ -72,6 +72,20 @@ PYTHONPATH=src python3 -m semantic_state_engine.server --max-clock-components 8
 - Startup recovery applies the same bound: if any clock stored in the data file — in an operation, an automatic-resolution policy's operation, a transaction, a compensation, a replication-repair record, or a causal-boundary record — exceeds N components, startup fails with exit code 2, the file is left unchanged, and no port is opened. A width-compliant file recovers exactly as it would without the bound: candidates, log order, audit digests, and persistence results are identical.
 - The bound constrains only the component count. Tick ranges, clock domination and concurrency classification, key/value constraints, the sync export format, paging summaries, error priorities, the request body limit, and the authentication and scope semantics are all unchanged, and old data files keep recovering when the option is not passed.
 
+### Check-only startup validation: `--check`
+
+Pass `--check` to validate the startup configuration **without starting the service** — a pre-launch verification entry point that binds no port and never creates, rewrites, or deletes any file:
+
+```bash
+PYTHONPATH=src python3 -m semantic_state_engine.server --check --data-file ./var/state.json
+```
+
+- `--check` composes with `--data-file`, `--auth-token-file`, `--scope-policy-file`, and `--max-clock-components`, which keep their exact startup meanings: the argument combination (the two authentication options stay mutually exclusive), the authentication files (readable, regular, and well-formed), the clock-width bound, and the data file are validated by the same rules and the same recovery logic a real startup would apply, in the same order.
+- With `--data-file`, a **missing** target fails the check — check mode never creates the empty first-store file a real startup would create, and it never runs the atomic-commit directory preflight, so no probe files appear either. An existing target must be a regular file accepted by the current recovery validation; a file written before a section existed checks out with that section empty, exactly as at startup.
+- On success the exit code is 0 and stdout carries exactly one compact JSON line: `{"status":"ok","authentication":"anonymous|single-token|scope-policy","dataFile":{"configured":bool,"operations":N,"checkpoints":N,"transactions":N,"acks":N,"repairs":N,"policyEvents":N,"compensations":N},"maxClockComponents":N|null}`. `dataFile.configured` records whether `--data-file` was passed; without it every count is 0, and with it each count is the number of records or mappings that section recovers into memory. `maxClockComponents` is the configured bound, or `null` when unrestricted. Repeating a check over an unchanged configuration prints a byte-identical line.
+- On any failure — conflicting options, an unreadable or illegal authentication file, a missing or corrupt data file, or a stored clock wider than the configured bound — the exit code is 2, stdout stays empty, and stderr carries only the single `semantic-state-engine: startup failed: ...` line; token and policy contents are never echoed.
+- Without `--check` every startup behavior is unchanged: pure in-memory mode, first-creation of a missing data file, the atomic-commit directory preflight, port binding, the health probe, and every HTTP, persistence, idempotency, audit, and authentication semantic.
+
 ### Optional bearer-token authentication
 
 The service is anonymous by default: without authentication options every documented behavior above is unchanged. There are two mutually exclusive ways to enable authentication — at most one of `--auth-token-file` and `--scope-policy-file` may be passed; supplying both makes startup fail with exit code 2 before any port is bound.

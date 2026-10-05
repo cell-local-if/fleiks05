@@ -14,7 +14,7 @@ import tempfile
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
 
 DATA_FORMAT_VERSION = 1
@@ -5700,6 +5700,42 @@ def ensure_data_file(
             raise PersistenceError(f"data file path is not a regular file: {path!r}")
         return _load_data_file_complete(path)
     return [], {}, {}, {}, {}, {}, [], {}
+
+
+def load_data_file_for_check(
+    path: str,
+) -> tuple[
+    list[tuple[str, dict[str, Any]]],
+    dict[str, int],
+    dict[tuple[str, str], str],
+    dict[str, list[dict[str, Any]]],
+    dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    """Read and strictly validate an existing data file for ``--check``.
+
+    Unlike :func:`ensure_data_file`, a missing target is a failure: the
+    check-only entry point never creates the file, never probes the parent
+    directory, and never writes, renames, or deletes anything. An existing
+    target must be a regular file accepted by exactly the recovery
+    validation used at startup (:func:`_load_data_file_complete`), so a
+    file written before a section existed recovers with that section
+    empty, exactly as at startup. Returns the same eight-section tuple.
+    """
+    abspath = os.path.abspath(path)
+    try:
+        exists = os.path.lexists(abspath)
+        if exists:
+            mode = os.stat(abspath).st_mode
+    except OSError as exc:
+        raise PersistenceError(f"cannot access data file {abspath!r}: {exc}") from exc
+    if not exists:
+        raise PersistenceError(f"data file does not exist: {abspath!r}")
+    if not stat.S_ISREG(mode):
+        raise PersistenceError(f"data file path is not a regular file: {abspath!r}")
+    return _load_data_file_complete(abspath)
 
 
 def _fsync_directory(directory: str) -> None:
@@ -14730,8 +14766,130 @@ def _max_clock_components_value(token: str) -> int:
     return value
 
 
+class _CheckArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser for ``--check`` runs: parse failures use the startup channel.
+
+    A rejected command line is reported as ``semantic-state-engine:
+    startup failed: ...`` on stderr with exit code 2 and no usage text, so
+    a failed pre-flight check never emits anything but the single
+    startup-failure line. Normal startup keeps the stock parser, whose
+    usage-and-error output is unchanged.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        print(f"semantic-state-engine: startup failed: {message}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def _fail_startup(message: str) -> NoReturn:
+    """Report a startup failure on stderr and exit with code 2."""
+    print(f"semantic-state-engine: startup failed: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _validate_startup_authentication(
+    args: argparse.Namespace,
+) -> tuple[str, str | None, dict[str, frozenset[str]] | None, str | None]:
+    """Validate the authentication arguments exactly as startup does.
+
+    Returns ``(mode, auth_token, auth_scopes, scope_policy_digest)`` where
+    ``mode`` is ``"anonymous"``, ``"single-token"``, or
+    ``"scope-policy"``. Any rejection fails startup with exit code 2
+    before any port is bound, and neither the token nor the policy
+    contents are ever echoed.
+    """
+    if args.auth_token_file is not None and args.scope_policy_file is not None:
+        # The two authentication configurations are mutually exclusive;
+        # fail before any file is read or any port is bound, and never echo
+        # either configuration's contents.
+        _fail_startup(
+            "--auth-token-file and --scope-policy-file are mutually exclusive"
+        )
+    if args.auth_token_file is not None:
+        # Read and validate the token before binding any port; a rejected
+        # file fails startup exactly like a rejected data file, and the
+        # token is never printed.
+        try:
+            return "single-token", load_auth_token(args.auth_token_file), None, None
+        except AuthTokenError as exc:
+            _fail_startup(str(exc))
+    if args.scope_policy_file is not None:
+        # Read and validate the whole policy before binding any port; a
+        # rejected file fails startup exactly like a rejected token file,
+        # and neither tokens nor scopes are ever printed. The digest of
+        # these exact bytes seeds the live policy's status digest, so the
+        # status endpoint never has to re-read the file.
+        try:
+            policy_bytes = read_scope_policy_bytes(args.scope_policy_file)
+            auth_scopes = parse_scope_policy(policy_bytes)
+            digest = hashlib.sha256(policy_bytes).hexdigest()
+            return "scope-policy", None, auth_scopes, digest
+        except ScopePolicyError as exc:
+            _fail_startup(str(exc))
+    return "anonymous", None, None, None
+
+
+def _startup_check_summary(args: argparse.Namespace) -> dict[str, Any]:
+    """Run the check-only pre-flight and return the summary document.
+
+    Applies the startup validation rules for the argument combination, the
+    authentication configuration, the clock-width bound, and the data file
+    without binding a port, probing a directory, or creating, rewriting,
+    or deleting any file. Any failure is reported on stderr as
+    ``semantic-state-engine: startup failed: ...`` and exits with code 2
+    with stdout left empty; the token and the policy contents are never
+    echoed. The returned document has a fixed key order so repeated checks
+    of an unchanged configuration are byte-identical.
+    """
+    authentication, _, _, _ = _validate_startup_authentication(args)
+    data_file: dict[str, Any] = {
+        "configured": False,
+        "operations": 0,
+        "checkpoints": 0,
+        "transactions": 0,
+        "acks": 0,
+        "repairs": 0,
+        "policyEvents": 0,
+        "compensations": 0,
+    }
+    if args.data_file is not None:
+        try:
+            (
+                records,
+                checkpoints,
+                _policies,
+                transactions,
+                acks,
+                repairs,
+                policy_events,
+                compensations,
+            ) = load_data_file_for_check(args.data_file)
+        except PersistenceError as exc:
+            _fail_startup(str(exc))
+        data_file = {
+            "configured": True,
+            "operations": len(records),
+            "checkpoints": len(checkpoints),
+            "transactions": len(transactions),
+            "acks": len(acks),
+            "repairs": len(repairs),
+            "policyEvents": len(policy_events),
+            "compensations": len(compensations),
+        }
+    return {
+        "status": "ok",
+        "authentication": authentication,
+        "dataFile": data_file,
+        "maxClockComponents": args.max_clock_components,
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Run the Semantic State Engine HTTP service")
+    effective_argv = sys.argv[1:] if argv is None else argv
+    parser_class = (
+        _CheckArgumentParser if "--check" in effective_argv else argparse.ArgumentParser
+    )
+    parser = parser_class(description="Run the Semantic State Engine HTTP service")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument(
@@ -14777,6 +14935,20 @@ def main(argv: list[str] | None = None) -> None:
             "unrestricted and every behavior is unchanged"
         ),
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "validate the startup configuration without starting the "
+            "service: check the argument combination, the authentication "
+            "files, the clock-width bound, and the data file exactly as "
+            "startup would, never bind a port, and never create, rewrite, "
+            "or delete any file; on success print one compact JSON summary "
+            "line on stdout and exit 0, on any failure print "
+            "semantic-state-engine: startup failed: ... on stderr and "
+            "exit 2"
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Publish the clock-width admission bound before any authentication
@@ -14787,48 +14959,21 @@ def main(argv: list[str] | None = None) -> None:
     global _MAX_CLOCK_COMPONENTS
     _MAX_CLOCK_COMPONENTS = args.max_clock_components
 
-    if args.auth_token_file is not None and args.scope_policy_file is not None:
-        # The two authentication configurations are mutually exclusive;
-        # fail before any file is read or any port is bound, and never echo
-        # either configuration's contents.
-        print(
-            "semantic-state-engine: startup failed: --auth-token-file and "
-            "--scope-policy-file are mutually exclusive",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+    if args.check:
+        # Check-only pre-flight: validate everything startup would, bind no
+        # port, and touch no file for writing. The summary goes to stdout
+        # only after every check has passed, so a failure leaves stdout
+        # empty.
+        summary = _startup_check_summary(args)
+        print(json.dumps(summary, separators=(",", ":")))
+        return
 
-    auth_token = None
-    auth_scopes = None
-    scope_policy_digest = None
-    if args.auth_token_file is not None:
-        # Read and validate the token before binding any port; a rejected
-        # file fails startup exactly like a rejected data file, and the
-        # token is never printed.
-        try:
-            auth_token = load_auth_token(args.auth_token_file)
-        except AuthTokenError as exc:
-            print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
-            raise SystemExit(2) from exc
-    elif args.scope_policy_file is not None:
-        # Read and validate the whole policy before binding any port; a
-        # rejected file fails startup exactly like a rejected token file,
-        # and neither tokens nor scopes are ever printed. The digest of
-        # these exact bytes seeds the live policy's status digest, so the
-        # status endpoint never has to re-read the file.
-        try:
-            policy_bytes = read_scope_policy_bytes(args.scope_policy_file)
-            auth_scopes = parse_scope_policy(policy_bytes)
-            scope_policy_digest = hashlib.sha256(policy_bytes).hexdigest()
-        except ScopePolicyError as exc:
-            print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
-            raise SystemExit(2) from exc
+    _, auth_token, auth_scopes, scope_policy_digest = _validate_startup_authentication(args)
 
     try:
         store = StateStore(data_file=args.data_file)
     except PersistenceError as exc:
-        print(f"semantic-state-engine: startup failed: {exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
+        _fail_startup(str(exc))
 
     server = SemanticStateServer(
         (args.host, args.port),
