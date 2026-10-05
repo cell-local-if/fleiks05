@@ -68,7 +68,7 @@ def batch_entry(
 
 
 class ValuePolicyParseTests(unittest.TestCase):
-    def test_constant_lists_all_five_policies(self) -> None:
+    def test_constant_lists_all_six_policies(self) -> None:
         self.assertEqual(
             AUTO_RESOLVE_POLICIES,
             (
@@ -77,6 +77,7 @@ class ValuePolicyParseTests(unittest.TestCase):
                 "lowest_value",
                 "highest_value",
                 "plurality_value",
+                "largest_causal_history",
             ),
         )
 

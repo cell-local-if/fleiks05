@@ -272,15 +272,19 @@ AUTO_RESOLVE_POLICIES = (
     "lowest_value",
     "highest_value",
     "plurality_value",
+    "largest_causal_history",
 )
 AUTO_RESOLVE_POLICY_MESSAGE = (
     "policy must be one of 'lowest_identity', 'highest_identity', "
-    "'lowest_value', 'highest_value', or 'plurality_value'"
+    "'lowest_value', 'highest_value', 'plurality_value', or "
+    "'largest_causal_history'"
 )
 
 
 def _select_auto_resolution_candidate(
-    candidates: list[dict[str, Any]], policy: str
+    candidates: list[dict[str, Any]],
+    policy: str,
+    accepted: list[tuple[str, dict[str, Any]]],
 ) -> dict[str, Any]:
     """Select the current candidate supplying a resolution value.
 
@@ -298,6 +302,17 @@ def _select_auto_resolution_candidate(
     multiset of candidate values, never on the candidate order or on
     which identities carry a value, so the same snapshot always yields
     the same selection.
+
+    ``largest_causal_history`` selects the candidate with the richest
+    causal history: the number of distinct operations in the shared
+    accepted log ``accepted`` whose clock the candidate's clock strictly
+    dominates, excluding the candidate's own identity. Operations on
+    every key count, an equal clock is not an ancestor, and a duplicate
+    import of the same ``(replicaId, operationId)`` is one operation, not
+    two. Ties break by the smallest ``(replicaId, operationId)`` in
+    Unicode code-point order. The count is a pure function of the log
+    contents, so the same state selects the same candidate regardless of
+    log order, batch position, or pagination.
     """
     if policy == "highest_identity":
         return max(candidates, key=lambda c: (c["replicaId"], c["operationId"]))
@@ -311,6 +326,30 @@ def _select_auto_resolution_candidate(
             votes[candidate["value"]] = votes.get(candidate["value"], 0) + 1
         winning = min(votes, key=lambda value: (-votes[value], value))
         return next(c for c in candidates if c["value"] == winning)
+    if policy == "largest_causal_history":
+        # Distinct accepted operations by identity: a duplicate import of
+        # the same (replicaId, operationId) is one operation, not two.
+        history: dict[tuple[str, str], dict[str, int]] = {}
+        for accepted_replica, accepted_operation in accepted:
+            history.setdefault(
+                (accepted_replica, accepted_operation["operationId"]),
+                accepted_operation["clock"],
+            )
+
+        def causal_history_size(candidate: dict[str, Any]) -> int:
+            identity = (candidate["replicaId"], candidate["operationId"])
+            clock = candidate["clock"]
+            return sum(
+                1
+                for operation_identity, operation_clock in history.items()
+                if operation_identity != identity
+                and clock_dominates(clock, operation_clock)
+            )
+
+        return min(
+            candidates,
+            key=lambda c: (-causal_history_size(c), c["replicaId"], c["operationId"]),
+        )
     return min(candidates, key=lambda c: c["value"])
 
 
@@ -324,9 +363,11 @@ def parse_auto_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, A
     ``policy``); ``policy`` selects which current candidate supplies the
     resolution value — the smallest or largest ``(replicaId,
     operationId)`` for the identity policies, the smallest or largest
-    string value (Unicode code-point order) for the value policies, or
-    the value carried by the most candidates (ties broken by the smallest
-    such string) for ``plurality_value``.
+    string value (Unicode code-point order) for the value policies, the
+    value carried by the most candidates (ties broken by the smallest
+    such string) for ``plurality_value``, or the candidate whose clock
+    strictly dominates the most distinct accepted operations for
+    ``largest_causal_history`` (ties broken by the smallest identity).
     Returns a normalized request dict. Raises ValueError on any violation.
     """
     if isinstance(raw, (bytes, bytearray)):
@@ -6288,7 +6329,12 @@ class StateStore:
         value), or the value carried by the most candidates for
         ``plurality_value`` (ties broken by the smallest such string in
         Unicode code-point order, so the selection is independent of
-        candidate order and of which identities carry a value). The request
+        candidate order and of which identities carry a value), or the
+        candidate with the largest causal history for
+        ``largest_causal_history`` — the count of distinct accepted-log
+        operations (any key) whose clock the candidate's clock strictly
+        dominates, excluding the candidate's own identity, with ties
+        broken by the smallest ``(replicaId, operationId)``. The request
         clock must dominate every current candidate.
         The resolution then commits exactly like a manual resolution — one
         ordinary operation in the shared commit order, so it flows through
@@ -6347,9 +6393,14 @@ class StateStore:
 
             # Deterministic policy: the identity policies select by
             # (replicaId, operationId), the value policies by the candidate
-            # string in Unicode code-point order, and plurality_value by
-            # the most-carried value (ties to the smallest such string).
-            chosen = _select_auto_resolution_candidate(current, request["policy"])
+            # string in Unicode code-point order, plurality_value by
+            # the most-carried value (ties to the smallest such string),
+            # and largest_causal_history by the richest strictly-dominated
+            # slice of the committed accepted log (ties to the smallest
+            # identity).
+            chosen = _select_auto_resolution_candidate(
+                current, request["policy"], self._accepted
+            )
             operation["value"] = chosen["value"]
 
             if not all(clock_dominates(operation["clock"], c["clock"]) for c in current):
@@ -6418,11 +6469,16 @@ class StateStore:
         with self._lock:
             # Staged copies keep the whole dry run off the visible state:
             # the batch is fixed in its entirety before the single commit.
+            # The staged accepted log grows with each staged resolution so
+            # a largest_causal_history entry counts the operations the
+            # earlier entries of the same batch would commit — exactly the
+            # state a sequence of single resolutions would observe.
             staged_operations = dict(self._operations)
             staged_policies = dict(self._policies)
             staged_candidates = {
                 key: list(candidates) for key, candidates in self._candidates.items()
             }
+            staged_accepted = list(self._accepted)
             new_records: list[tuple[str, dict[str, Any]]] = []
             new_policies: dict[tuple[str, str], str] = {}
             results: list[dict[str, Any]] = []
@@ -6466,7 +6522,9 @@ class StateStore:
                 if not current or all(c["value"] == current[0]["value"] for c in current):
                     return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
 
-                chosen = _select_auto_resolution_candidate(current, entry["policy"])
+                chosen = _select_auto_resolution_candidate(
+                    current, entry["policy"], staged_accepted
+                )
                 operation["value"] = chosen["value"]
 
                 # A legal clock that nevertheless fails to dominate the live
@@ -6481,6 +6539,7 @@ class StateStore:
                 )
                 staged_operations[identity] = operation
                 staged_policies[identity] = entry["policy"]
+                staged_accepted.append((replica_id, operation))
                 new_records.append((replica_id, operation))
                 new_policies[identity] = entry["policy"]
                 accepted += 1
@@ -6561,12 +6620,17 @@ class StateStore:
         with self._lock:
             # Staged copies keep the entire preview off the visible state;
             # the same discipline as the committing batch, but nothing from
-            # the staging is ever written back or persisted.
+            # the staging is ever written back or persisted. The staged
+            # accepted log grows with each staged resolution so a
+            # largest_causal_history entry counts the operations the
+            # earlier entries of the same plan would commit — exactly the
+            # state the committing batch would observe.
             staged_operations = dict(self._operations)
             staged_policies = dict(self._policies)
             staged_candidates = {
                 key: list(candidates) for key, candidates in self._candidates.items()
             }
+            staged_accepted = list(self._accepted)
             results: list[dict[str, Any]] = []
             accepted = 0
             replayed = 0
@@ -6608,7 +6672,9 @@ class StateStore:
                 if not current or all(c["value"] == current[0]["value"] for c in current):
                     return HTTPStatus.CONFLICT, [], 0, 0, "resolution_conflict"
 
-                chosen = _select_auto_resolution_candidate(current, entry["policy"])
+                chosen = _select_auto_resolution_candidate(
+                    current, entry["policy"], staged_accepted
+                )
                 operation["value"] = chosen["value"]
 
                 # A legal clock that nevertheless fails to dominate the live
@@ -6623,6 +6689,7 @@ class StateStore:
                 )
                 staged_operations[identity] = operation
                 staged_policies[identity] = entry["policy"]
+                staged_accepted.append((replica_id, operation))
                 accepted += 1
                 results.append(
                     {
@@ -8942,7 +9009,7 @@ class StateStore:
         ``"conflict"``.
 
         ``origin`` is ``"automatic_resolution"`` only when the operation
-        carries a local automatic-resolution policy binding (one of the five
+        carries a local automatic-resolution policy binding (one of the six
         published policies in :data:`AUTO_RESOLVE_POLICIES`), in which case
         ``policy`` names that policy; every other record — a plain write, a
         manual resolution, or a sync-imported operation with no local
@@ -11455,8 +11522,8 @@ class StateStore:
           reporting which current candidate each of the two identity-based
           automatic-resolution policies would select — the smallest and
           largest ``(replicaId, operationId)`` — in the same shape as the
-          ``candidates`` entries. The value and plurality policies add no
-          keys here; the response shape is unchanged.
+          ``candidates`` entries. The value, plurality, and causal-history
+          policies add no keys here; the response shape is unchanged.
 
         With ``--data-file`` the candidate state is rebuilt identically
         during recovery, so the same state yields the same relations,

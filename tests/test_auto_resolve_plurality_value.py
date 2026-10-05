@@ -70,7 +70,7 @@ def batch_entry(
 
 
 class PluralityPolicyParseTests(unittest.TestCase):
-    def test_constant_lists_plurality_value_last(self) -> None:
+    def test_constant_lists_plurality_value_before_causal_history(self) -> None:
         self.assertEqual(
             AUTO_RESOLVE_POLICIES,
             (
@@ -79,6 +79,7 @@ class PluralityPolicyParseTests(unittest.TestCase):
                 "lowest_value",
                 "highest_value",
                 "plurality_value",
+                "largest_causal_history",
             ),
         )
 
