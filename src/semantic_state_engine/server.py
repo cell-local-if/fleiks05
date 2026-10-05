@@ -4512,14 +4512,31 @@ class AuthTokenError(Exception):
     """
 
 
-def load_auth_token(path: str) -> str:
-    """Read and strictly validate the bearer token file.
+class AuthTokenReloadError(Exception):
+    """Raised when a runtime single-token reload cannot be completed.
 
-    The target must be a readable regular file whose entire content is one
-    non-empty ASCII printable token (bytes 0x21-0x7E): no whitespace, no
-    newlines, nothing before or after the token. Raises AuthTokenError on a
-    missing, unreadable, or non-regular target and on any format violation;
+    ``kind`` classifies the failure for the HTTP boundary: ``"unavailable"``
+    means the startup-configured file is missing, unreadable, not a regular
+    file, or could not be read (HTTP 503 ``auth_token_unavailable``);
+    ``"conflict"`` means the file was readable but its content failed the
+    same single-token validation as startup (HTTP 409
+    ``auth_token_conflict``). Either way the live token stays in force and
     the error never echoes the file's content.
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def read_auth_token_bytes(path: str) -> bytes:
+    """Read the raw bytes of the auth token file at ``path``.
+
+    The target must be a readable regular file. A missing, unreadable, or
+    non-regular target (for example a directory) and any read failure raise
+    AuthTokenError; the error never echoes the file's content. The bytes are
+    not decoded or validated here, so a reload can tell an unreadable file
+    (503) apart from invalid content (409).
     """
     try:
         mode = os.stat(path).st_mode
@@ -4529,15 +4546,112 @@ def load_auth_token(path: str) -> str:
         raise AuthTokenError(f"auth token path is not a regular file: {path!r}")
     try:
         with open(path, "rb") as handle:
-            raw = handle.read()
+            return handle.read()
     except OSError as exc:
         raise AuthTokenError(f"cannot read auth token file {path!r}: {exc}") from exc
+
+
+def parse_auth_token(raw: bytes) -> str:
+    """Validate raw auth token bytes and return the token string.
+
+    The bytes must be one non-empty ASCII printable token (bytes 0x21-0x7E):
+    no whitespace, no newlines, nothing before or after the token. Any
+    violation raises AuthTokenError and never echoes the content.
+    """
     if not raw or any(byte < 0x21 or byte > 0x7E for byte in raw):
         raise AuthTokenError(
             "auth token file must contain exactly one non-empty ASCII "
             "printable token without whitespace or newlines"
         )
     return raw.decode("ascii")
+
+
+def load_auth_token(path: str) -> str:
+    """Read and strictly validate the bearer token file.
+
+    The target must be a readable regular file whose entire content is one
+    non-empty ASCII printable token (bytes 0x21-0x7E): no whitespace, no
+    newlines, nothing before or after the token. Raises AuthTokenError on a
+    missing, unreadable, or non-regular target and on any format violation;
+    the error never echoes the file's content.
+    """
+    return parse_auth_token(read_auth_token_bytes(path))
+
+
+class AuthTokenManager:
+    """Thread-safe holder of the live single bearer token.
+
+    The manager owns the live token and the path of the file given at
+    startup. Authentication takes one point-in-time copy of the token under
+    the manager's lock; a reload re-reads and validates that same configured
+    file and only then swaps the token, so the replacement is one atomic
+    commit: concurrent reloads run strictly one after another as complete
+    read-validate-swap units, and every request authenticates against either
+    the whole old token or the whole new one, never a partial state. A
+    failed reload leaves the live token untouched.
+
+    The manager exists only in single-token mode; it is never constructed in
+    anonymous or scope-policy mode.
+    """
+
+    def __init__(self, path: str | None, token: str) -> None:
+        # The path comes from the startup configuration; reloads may only
+        # ever re-read this exact file, never a request-supplied path. It is
+        # None only for servers assembled directly without a token file, in
+        # which case a reload reports the token as unavailable.
+        self._path = os.path.abspath(path) if path is not None else None
+        self._lock = threading.Lock()
+        self._token = token
+
+    @property
+    def path(self) -> str | None:
+        return self._path
+
+    def snapshot(self) -> str | None:
+        """Return a point-in-time copy of the live token.
+
+        A request authenticating against the returned string keeps using it
+        for the whole authentication even if a reload swaps the live token
+        meanwhile: a request is authorized entirely by the token in force
+        when it authenticated, never by a later one.
+        """
+        with self._lock:
+            return self._token
+
+    def reload(self) -> None:
+        """Atomically reload the token from the startup-configured file.
+
+        Re-reads the same file the service started with (the request may not
+        name another path), validates it under exactly the startup
+        constraints, and swaps the live token in one commit serialized
+        against concurrent reloads and authentication snapshots. A missing,
+        unreadable, non-regular, or otherwise unreadable file raises
+        AuthTokenReloadError(kind="unavailable"); readable-but-invalid
+        content raises AuthTokenReloadError(kind="conflict") and leaves the
+        live token fully in force. No temporary file is created and nothing
+        is persisted: the data file, audit stream, and every other state are
+        untouched.
+        """
+        path = self._path
+        if path is None:
+            raise AuthTokenReloadError(
+                "unavailable", "no auth token file was configured at startup"
+            )
+        # Hold the lock across the read, validation, and swap, so each
+        # reload is one complete commit serialized against other reloads and
+        # against authentication snapshots: while a reload is reading or
+        # validating every request still sees the old token, and once it
+        # releases every request sees the new one.
+        with self._lock:
+            try:
+                raw = read_auth_token_bytes(path)
+            except AuthTokenError as exc:
+                raise AuthTokenReloadError("unavailable", str(exc)) from exc
+            try:
+                token = parse_auth_token(raw)
+            except AuthTokenError as exc:
+                raise AuthTokenReloadError("conflict", str(exc)) from exc
+            self._token = token
 
 
 SCOPE_READ = "read"
@@ -11851,6 +11965,7 @@ class SemanticStateServer(ThreadingHTTPServer):
         store: StateStore | None = None,
         auth_token: str | None = None,
         auth_scopes: dict[str, frozenset[str]] | None = None,
+        auth_token_file: str | None = None,
         scope_policy_file: str | None = None,
         scope_policy_digest: str | None = None,
     ) -> None:
@@ -11860,13 +11975,21 @@ class SemanticStateServer(ThreadingHTTPServer):
         resolved_store = store if store is not None else StateStore(data_file=data_file)
         super().__init__(server_address, handler_class or RequestHandler)
         self.store = resolved_store
-        # The bearer token clients must present, or None when authentication
-        # is disabled. It is never written to the data file or any log.
-        self.auth_token = auth_token
+        # The single-token manager owns the live bearer token and its
+        # startup-configured file, so the admin reload endpoint can
+        # atomically swap the token without a restart and authentication can
+        # take a point-in-time snapshot. It exists only in single-token
+        # mode; None means the reload endpoint is not published (anonymous
+        # and scope-policy modes answer it with 404). Like the token itself,
+        # it is never written to the data file or any log.
+        self.auth_token_manager = (
+            AuthTokenManager(auth_token_file, auth_token)
+            if auth_token is not None
+            else None
+        )
         # The scope policy: configured tokens mapped to their allowed scopes.
-        # Exactly one of auth_token and auth_scopes is set; both are None only
-        # when authentication is disabled. Like the single token, the policy
-        # is never written to the data file or any log.
+        # Exactly one of single-token mode and scope-policy mode is active;
+        # both managers are None only when authentication is disabled.
         self.auth_scopes = auth_scopes
         # The manager owns the live policy, its startup-configured file, and
         # the digest of the bytes the live mapping was loaded from, so the
@@ -11880,6 +12003,16 @@ class SemanticStateServer(ThreadingHTTPServer):
             if auth_scopes is not None
             else None
         )
+
+    @property
+    def auth_token(self) -> str | None:
+        """The live bearer token, or None when single-token mode is off.
+
+        Reads through the manager under its lock, so a rotation is observed
+        immediately; the token never appears in the data file or any log.
+        """
+        manager = self.auth_token_manager
+        return manager.snapshot() if manager is not None else None
 
 
 _FALLBACK_STORE = StateStore()
@@ -11968,20 +12101,28 @@ class RequestHandler(BaseHTTPRequestHandler):
         each configured token), the request body is never read here, and
         neither memory nor the data file is touched.
         """
-        token = getattr(self.server, "auth_token", None)
         manager = getattr(self.server, "scope_policy", None)
-        if token is None and manager is None:
+        token_manager = getattr(self.server, "auth_token_manager", None)
+        if token_manager is None and manager is None:
             return True, None
         values = self.headers.get_all("Authorization")
         if values is not None and len(values) == 1:
             presented = values[0]
             if presented.startswith("Bearer "):
                 credential = presented[len("Bearer "):].encode("utf-8")
-                if token is not None:
+                if token_manager is not None:
                     # Legacy single-token mode: the one token keeps its full,
                     # unrestricted access — the configured scope boundary is
-                    # only enforced in the scope-policy mode.
-                    if hmac.compare_digest(credential, token.encode("ascii")):
+                    # only enforced in the scope-policy mode. Take one
+                    # point-in-time copy of the live token so the whole
+                    # authentication runs against a single committed token
+                    # even if a reload swaps it meanwhile: a request is
+                    # authorized entirely by the token in force when it
+                    # authenticated, never by a later one.
+                    token = token_manager.snapshot()
+                    if token is not None and hmac.compare_digest(
+                        credential, token.encode("ascii")
+                    ):
                         return True, frozenset(ALLOWED_SCOPES)
                 else:
                     # Take one point-in-time copy of the live policy so the
@@ -14020,6 +14161,50 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json_newline(status, payload)
 
+    def _handle_auth_token_reload_post(self) -> None:
+        # The declared-length check (400/413), authentication, and the
+        # single-token mode gate (404) all ran in do_POST, none of them
+        # reading the body; route-shape mismatches — missing, extra, or a
+        # trailing slash — fall through to the generic 404 before any of
+        # those. The route accepts no query parameters, and that check
+        # precedes the body check even on a correct route.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            parse_empty_object_payload(raw)
+        except ValueError:
+            # Malformed JSON, a non-object document, or any field: the file
+            # is never read and the live token is never changed.
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        manager = getattr(self.server, "auth_token_manager", None)
+        if manager is None:
+            # Defensive: the mode gate already ran in do_POST. This keeps a
+            # missing manager a not-found rather than a server error.
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        try:
+            manager.reload()
+        except AuthTokenReloadError as exc:
+            # A failed reload leaves the old token fully in force: the swap
+            # is the last step inside the manager's serialized commit, so a
+            # failure during the read or validation never produces a partial
+            # update. The response never echoes the old token, the candidate
+            # token, or any file content.
+            if exc.kind == "unavailable":
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "auth_token_unavailable"},
+                )
+            else:
+                self._json(HTTPStatus.CONFLICT, {"error": "auth_token_conflict"})
+            return
+        self._json(HTTPStatus.OK, {"status": "reloaded"})
+
     def _handle_scope_policy_reload_post(self) -> None:
         # The declared-length check (400/413), authentication, the admin
         # scope, and the scope-mode gate (404) all ran in do_POST, none of
@@ -14301,6 +14486,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "scope-policy"
             and segments[3] == "reload"
         )
+        is_auth_token_reload_post = (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "auth-token"
+            and segments[3] == "reload"
+        )
         is_causal_at_post = (
             len(segments) == 4
             and segments[0] == "v1"
@@ -14377,6 +14569,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or is_transaction_plan_post
             or is_transaction_compensate_post
             or is_scope_policy_reload_post
+            or is_auth_token_reload_post
             or is_causal_at_post
             or is_states_causal_at_post
             or is_replication_compare_post
@@ -14405,6 +14598,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not self._require_scope(SCOPE_ADMIN):
                     return
                 if getattr(self.server, "scope_policy", None) is None:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+            elif is_auth_token_reload_post:
+                # The single-token reload shares the length-first priority
+                # and is admin-gated rather than write-gated. Authentication
+                # still runs before the mode gate, so a missing or bad
+                # credential is 401 in every mode; the endpoint then exists
+                # only in single-token mode — scope-policy and anonymous
+                # modes answer 404, exactly like an unpublished route.
+                if not self._require_scope(SCOPE_ADMIN):
+                    return
+                if getattr(self.server, "auth_token_manager", None) is None:
                     self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                     return
             elif is_auto_resolve_plan_post:
@@ -14553,6 +14758,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if is_scope_policy_reload_post:
             self._handle_scope_policy_reload_post()
+            return
+        if is_auth_token_reload_post:
+            self._handle_auth_token_reload_post()
             return
         if is_causal_at_post:
             self._handle_state_causal_at_post(segments[2])
@@ -14747,6 +14955,7 @@ def main(argv: list[str] | None = None) -> None:
         store=store,
         auth_token=auth_token,
         auth_scopes=auth_scopes,
+        auth_token_file=args.auth_token_file,
         scope_policy_file=args.scope_policy_file,
         scope_policy_digest=scope_policy_digest,
     )
