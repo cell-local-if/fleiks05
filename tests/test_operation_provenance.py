@@ -10,7 +10,7 @@ with the fields ``replicaId``, ``operationId``, ``operation``, ``origin``,
 ``policy``, ``before``, and ``after`` in that order; ``before`` and
 ``after`` are ``{"status", "candidates"}`` snapshots of the target key
 replayed from the shared accepted log immediately before and after the
-target record. ``origin`` is ``automatic_resolution`` (with one of the five
+target record. ``origin`` is ``automatic_resolution`` (with one of the six
 published policies) only for an operation carrying a local automatic
 resolution policy binding; every other record is ``other`` with a null
 policy. The query is strictly read-only and shares the commit lock.

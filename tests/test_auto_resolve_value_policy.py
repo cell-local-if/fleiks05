@@ -6,7 +6,7 @@ The three automatic-resolution entry points::
     POST /v1/resolve/auto/batch
     POST /v1/resolve/auto/plan
 
-each accept five policies. Alongside the identity policies
+each accept six policies. Alongside the identity policies
 (``lowest_identity``/``highest_identity``), ``lowest_value`` selects the
 smallest current candidate string value and ``highest_value`` the largest,
 compared by Unicode code point in ascending order. A repeated extreme value
@@ -68,7 +68,7 @@ def batch_entry(
 
 
 class ValuePolicyParseTests(unittest.TestCase):
-    def test_constant_lists_all_five_policies(self) -> None:
+    def test_constant_lists_all_six_policies(self) -> None:
         self.assertEqual(
             AUTO_RESOLVE_POLICIES,
             (
@@ -77,6 +77,7 @@ class ValuePolicyParseTests(unittest.TestCase):
                 "lowest_value",
                 "highest_value",
                 "plurality_value",
+                "largest_causal_history",
             ),
         )
 
