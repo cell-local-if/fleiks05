@@ -1290,6 +1290,22 @@ def parse_scope_policy_audit_verify_query(query: str) -> tuple[int, int] | None:
     return parse_peer_pickup_query(query)
 
 
+def parse_scope_policy_audit_changes_query(query: str) -> tuple[int, int] | None:
+    """Validate the scope-policy token-change audit query string.
+
+    Shares the plain change-audit route's contract exactly: both
+    ``after`` and ``limit`` are required non-repeated ASCII decimal
+    integers, ``after`` a 0-based resume cursor starting at ``0`` and
+    ``limit`` between 1 and 100; a missing, repeated, blank, signed,
+    whitespace-bearing, decimal-point, or non-ASCII-decimal value and
+    any unknown parameter are rejected. Kept as a named entry point for
+    the changes route; the bound on ``after`` against the committed
+    event count is checked by the store against the committed snapshot
+    (``after`` equal to the count is a valid stable empty page).
+    """
+    return parse_peer_pickup_query(query)
+
+
 CAUSAL_COMPARE_IDENTITY_PARAMS = (
     "leftReplicaId",
     "leftOperationId",
@@ -3590,6 +3606,89 @@ def _policy_events_digest_input(events: list[dict[str, Any]]) -> bytes:
     return "".join(parts).encode("utf-8")
 
 
+def _scope_token_fingerprint(token: str) -> str:
+    """Return the 64-character lowercase hex SHA-256 of a policy token.
+
+    The hash is taken over the token's UTF-8 bytes, so a change-audit
+    detail identifies which configured token changed without ever
+    recording the token itself, its scope set, or anything reversible.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _scope_token_changes_locked(
+    old: dict[str, frozenset[str]], new: dict[str, frozenset[str]]
+) -> dict[str, list[str]]:
+    """Diff two live policy snapshots into fingerprint arrays.
+
+    Returns exactly ``{"added", "removed", "changed"}``: ``added`` lists
+    fingerprints of tokens only in ``new``, ``removed`` those only in
+    ``old``, and ``changed`` those present in both whose scope set
+    differs (scope arrays compare as sets, so order is irrelevant). Each
+    array is sorted ascending and deduplicated: distinct tokens hash to
+    distinct fingerprints with overwhelming probability and every token
+    appears in at most one of the three lists by construction, so the
+    sort alone yields the required shape.
+    """
+    added = sorted(_scope_token_fingerprint(token) for token in new if token not in old)
+    removed = sorted(
+        _scope_token_fingerprint(token) for token in old if token not in new
+    )
+    changed = sorted(
+        _scope_token_fingerprint(token)
+        for token in new
+        if token in old and new[token] != old[token]
+    )
+    return {"added": added, "removed": removed, "changed": changed}
+
+
+def _policy_change_events_digest_input(events: list[dict[str, Any]]) -> bytes:
+    """Serialize the detailed policy-change history to the digest input.
+
+    The result is a compact UTF-8 JSON array with one entry per
+    successful scope-policy hot reload, in commit order. Each entry
+    carries its fields in the fixed order ``sequence``, ``policyDigest``,
+    ``tokenChanges``: the event's 1-based history position, the
+    64-character lowercase hexadecimal SHA-256 of the reloaded policy
+    file's raw UTF-8 bytes (read from the stored event's ``digest``
+    field), and either ``null`` (an older event whose detail cannot be
+    rebuilt) or an object with ``added``, ``removed``, ``changed`` in
+    that order, each an ascending array of 64 lowercase hexadecimal
+    token fingerprints serialized with
+    :func:`_fingerprint_array_json`. No whitespace is emitted anywhere
+    and numbers are plain JSON integers. An empty history serializes to
+    ``[]``.
+    """
+    parts: list[str] = ["["]
+    for index, event in enumerate(events):
+        if index:
+            parts.append(",")
+        parts.append('{"sequence":')
+        parts.append(str(event["sequence"]))
+        parts.append(',"policyDigest":')
+        parts.append(_escape_digest_string(event["digest"]))
+        parts.append(',"tokenChanges":')
+        changes = event.get("tokenChanges")
+        if changes is None:
+            parts.append("null")
+        else:
+            parts.append('{"added":')
+            parts.append(_fingerprint_array_json(changes["added"]))
+            parts.append(',"removed":')
+            parts.append(_fingerprint_array_json(changes["removed"]))
+            parts.append(',"changed":')
+            parts.append(_fingerprint_array_json(changes["changed"]))
+            parts.append("}")
+        parts.append("}")
+    parts.append("]")
+    return "".join(parts).encode("utf-8")
+
+
+def _fingerprint_array_json(fingerprints: list[str]) -> str:
+    """Serialize one ascending fingerprint array to compact JSON."""
+    return "[" + ",".join(_escape_digest_string(value) for value in fingerprints) + "]"
+
+
 def _policy_events_verification_locked(
     events: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -4784,7 +4883,7 @@ class ScopePolicyManager:
 
     def reload(
         self,
-        recorder: "Callable[[str, int], Any] | None" = None,
+        recorder: "Callable[[str, int, dict[str, list[str]]], Any] | None" = None,
         expected_digest: str | None = None,
     ) -> tuple[str, int]:
         """Atomically reload the policy from the startup-configured file.
@@ -4812,12 +4911,17 @@ class ScopePolicyManager:
         compare-then-swap against concurrent reloads.
 
         When ``recorder`` is given it is called with
-        ``(policy_digest, tokens)`` *before* the live mapping is swapped,
-        still under this manager's lock, so the durable audit commit and
-        the policy swap are one commit serialized against other reloads.
-        Any exception the recorder raises (for example a failed durable
-        write) propagates unchanged and prevents the swap: the old policy
-        stays fully in force and the failed reload records no event.
+        ``(policy_digest, tokens, token_changes)`` *before* the live
+        mapping is swapped, still under this manager's lock, so the
+        durable audit commit and the policy swap are one commit
+        serialized against other reloads. ``token_changes`` is the
+        ``{"added", "removed", "changed"}`` fingerprint detail produced
+        by :func:`_scope_token_changes_locked` from the old and new
+        mappings; it carries only SHA-256 token fingerprints, never a
+        token or scope value. Any exception the recorder raises (for
+        example a failed durable write) propagates unchanged and
+        prevents the swap: the old policy stays fully in force and the
+        failed reload records no event.
         """
         path = self._path
         if path is None:
@@ -4849,11 +4953,14 @@ class ScopePolicyManager:
                 raise ScopePolicyReloadError("conflict", str(exc)) from exc
             digest = hashlib.sha256(raw).hexdigest()
             entries = len(policy)
+            # The detail is derived from the old and the validated new
+            # mapping while both are whole and under the commit lock.
+            token_changes = _scope_token_changes_locked(self._policy, policy)
             if recorder is not None:
                 # Durably commit the change event before swapping the live
                 # boundary: if this raises, the lines below never run, so
                 # the old policy and the old history both survive.
-                recorder(digest, entries)
+                recorder(digest, entries, token_changes)
             self._policy = policy
             self._digest = digest
         return digest, entries
@@ -5368,19 +5475,64 @@ def _is_sha256_hex64(value: Any) -> bool:
     )
 
 
+def _validate_stored_token_changes(value: Any) -> dict[str, list[str]] | None:
+    """Validate one persisted ``tokenChanges`` detail.
+
+    Returns the cleaned ``{"added", "removed", "changed"}`` mapping, or
+    ``None`` when the detail is JSON null (an event recorded before the
+    detail existed). When present it must be an object carrying exactly
+    those three keys, each an array of 64 lowercase hexadecimal
+    fingerprints, strictly ascending and deduplicated — the shape a
+    successful reload records. Anything else is a corrupt file.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value.keys()) != {
+        "added",
+        "removed",
+        "changed",
+    }:
+        raise PersistenceError(
+            "policy event tokenChanges must be null or an object with "
+            "added, removed, and changed"
+        )
+    changes: dict[str, list[str]] = {}
+    for name in ("added", "removed", "changed"):
+        fingerprints = value[name]
+        if not isinstance(fingerprints, list) or any(
+            not _is_sha256_hex64(item) for item in fingerprints
+        ):
+            raise PersistenceError(
+                f"policy event tokenChanges {name} must be sha256 fingerprints"
+            )
+        if fingerprints != sorted(set(fingerprints)):
+            raise PersistenceError(
+                f"policy event tokenChanges {name} must be ascending and deduplicated"
+            )
+        changes[name] = list(fingerprints)
+    return changes
+
+
 def _validate_stored_policy_events(document: Any) -> list[dict[str, Any]]:
     """Validate the optional ``policyEvents`` section of a data file.
 
     Returns a clean ordered list of policy-change events, each
-    ``{"sequence", "digest", "tokens"}``. The section is optional (a
-    version:1 file written before scope-policy change auditing existed
-    simply has none, and recovers with an empty history); when present it
-    must be a list whose entries carry exactly those three keys:
-    ``sequence`` is a non-boolean positive integer starting at 1 and
-    increasing without gaps, ``digest`` is 64 lowercase hexadecimal
-    characters (the SHA-256 recorded at reload time), and ``tokens`` is a
-    non-boolean non-negative integer (the reloaded policy's entry count).
-    Anything else is a corrupt file.
+    ``{"sequence", "digest", "tokens"}`` plus ``"tokenChanges"`` when
+    the file recorded the detail. The section is optional (a version:1
+    file written before scope-policy change auditing existed simply has
+    none, and recovers with an empty history); when present it must be a
+    list whose entries carry the three baseline keys and may carry one
+    optional ``tokenChanges`` key: ``sequence`` is a non-boolean positive
+    integer starting at 1 and increasing without gaps, ``digest`` is 64
+    lowercase hexadecimal characters (the SHA-256 recorded at reload
+    time), ``tokens`` is a non-boolean non-negative integer (the
+    reloaded policy's entry count), and ``tokenChanges`` — absent or
+    null for an event whose detail cannot be rebuilt, otherwise an
+    ``{"added", "removed", "changed"}`` object of ascending
+    deduplicated 64-character lowercase hexadecimal token
+    fingerprints — is validated by
+    :func:`_validate_stored_token_changes`. Anything else is a corrupt
+    file.
     """
     if "policyEvents" not in document:
         return []
@@ -5389,13 +5541,15 @@ def _validate_stored_policy_events(document: Any) -> list[dict[str, Any]]:
         raise PersistenceError("data file policyEvents must be a list")
     events: list[dict[str, Any]] = []
     for entry in raw:
-        if not isinstance(entry, dict) or set(entry.keys()) != {
+        if not isinstance(entry, dict) or not set(entry.keys()) <= {
             "sequence",
             "digest",
             "tokens",
-        }:
+            "tokenChanges",
+        } or not {"sequence", "digest", "tokens"} <= set(entry.keys()):
             raise PersistenceError(
-                "each policy event must be an object with sequence, digest, tokens"
+                "each policy event must be an object with sequence, digest, "
+                "tokens and an optional tokenChanges"
             )
         sequence = entry["sequence"]
         tokens = entry["tokens"]
@@ -5409,9 +5563,19 @@ def _validate_stored_policy_events(document: Any) -> list[dict[str, Any]]:
             raise PersistenceError("policy event digest must be 64 lowercase hex characters")
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
             raise PersistenceError("policy event tokens must be a non-negative integer")
-        events.append(
-            {"sequence": sequence, "digest": entry["digest"], "tokens": tokens}
+        # An event written before the detail existed simply omits the
+        # key; both the missing key and an explicit null recover as null.
+        token_changes = _validate_stored_token_changes(
+            entry["tokenChanges"] if "tokenChanges" in entry else None
         )
+        event = {
+            "sequence": sequence,
+            "digest": entry["digest"],
+            "tokens": tokens,
+        }
+        if "tokenChanges" in entry:
+            event["tokenChanges"] = token_changes
+        events.append(event)
     return events
 
 
@@ -5962,11 +6126,16 @@ class StateStore:
         self._repairs: dict[tuple[str, str], dict[str, Any]] = {}
         # Scope-policy change history: one event per successful hot reload,
         # in commit order. Each event is ``{"sequence", "digest",
-        # "tokens"}``: a 1-based continuous position, the SHA-256 of the
-        # reloaded policy file's raw UTF-8 bytes, and the new policy's entry
-        # count. Like the policy itself, the history rides in the data file
-        # but is otherwise unrelated to business state; a file written
-        # before this section existed recovers with an empty history.
+        # "tokens"}`` with a ``"tokenChanges"`` detail once the change
+        # detail is available: a 1-based continuous position, the SHA-256
+        # of the reloaded policy file's raw UTF-8 bytes, the new policy's
+        # entry count, and either null (an older event whose detail
+        # cannot be rebuilt) or the added/removed/changed token
+        # fingerprints. The fingerprints are all the history ever holds
+        # of a token: raw tokens and scope sets are never recorded. Like
+        # the policy itself, the history rides in the data file but is
+        # otherwise unrelated to business state; a file written before
+        # this section existed recovers with an empty history.
         self._policy_events: list[dict[str, Any]] = []
         # Verifiable transaction-compensation bindings, keyed by the
         # compensation id. Each binding records the compensated
@@ -6002,6 +6171,9 @@ class StateStore:
                 self._transactions = dict(transactions)
                 self._acks = dict(acks)
                 self._repairs = dict(repairs)
+                # Events recovered from a file written before the
+                # detail existed simply lack the tokenChanges key; the
+                # detailed change-audit surface reports them as null.
                 self._policy_events = [dict(event) for event in policy_events]
                 self._compensations = dict(compensations)
                 self._data_file = path
@@ -6115,8 +6287,25 @@ class StateStore:
             ],
             # Scope-policy change events ride along in the order their
             # reloads committed, so every successful hot reload and its
-            # event become durable in one atomic commit together.
-            "policyEvents": [dict(event) for event in self._policy_events],
+            # event become durable in one atomic commit together. The
+            # persisted event keeps the version-1 three-field shape
+            # (sequence, digest, tokens) and additionally carries the
+            # tokenChanges detail when the reload recorded one. The
+            # token fingerprint detail rides in the same commit but is
+            # not part of the plain change-audit or integrity surfaces.
+            "policyEvents": [
+                {
+                    "sequence": event["sequence"],
+                    "digest": event["digest"],
+                    "tokens": event["tokens"],
+                    **(
+                        {"tokenChanges": event["tokenChanges"]}
+                        if event.get("tokenChanges") is not None
+                        else {}
+                    ),
+                }
+                for event in self._policy_events
+            ],
             # Compensation bindings ride along in the same atomic commit
             # as their compensation operations. Like transaction
             # bindings, a compensation is local: it is never part of the
@@ -11389,26 +11578,38 @@ class StateStore:
                 "conclusion": conclusion,
             }
 
-    def record_policy_reload(self, digest: str, tokens: int) -> dict[str, Any]:
+    def record_policy_reload(
+        self,
+        digest: str,
+        tokens: int,
+        token_changes: dict[str, list[str]] | None = None,
+    ) -> dict[str, Any]:
         """Commit one successful scope-policy hot reload to the audit history.
 
-        Appends an event ``{"sequence", "digest", "tokens"}`` — the next
-        1-based position, the 64-character lowercase SHA-256 of the
-        reloaded policy file's raw UTF-8 bytes, and the new policy's entry
-        count — in the reload's commit order. With ``--data-file`` the
-        event is made durable by the same atomic commit protocol as
-        business state *before* it becomes visible: a durable failure
-        raises PersistenceError and leaves the in-memory history exactly
-        as it was, so a caller can answer HTTP 500 while both the old
-        policy and the old history stay in force. Returns the committed
-        event.
+        Appends an event carrying ``{"sequence", "digest", "tokens"}``
+        plus ``"tokenChanges"`` when the reload supplied the detail —
+        the next 1-based position, the 64-character lowercase SHA-256
+        of the reloaded policy file's raw UTF-8 bytes, the new policy's
+        entry count, and the added/removed/changed token fingerprint
+        detail. A reload always supplies the detail; a null or omitted
+        detail marks an event whose fingerprints cannot be rebuilt (an
+        event recovered from an older data file), and the detailed
+        change-audit surface then reports ``tokenChanges: null`` for
+        it. With ``--data-file`` the event is made durable by the same
+        atomic commit protocol as business state *before* it becomes
+        visible: a durable failure raises PersistenceError and leaves
+        the in-memory history exactly as it was, so a caller can answer
+        HTTP 500 while both the old policy and the old history stay in
+        force. Returns the committed event.
         """
         with self._lock:
-            event = {
+            event: dict[str, Any] = {
                 "sequence": len(self._policy_events) + 1,
                 "digest": digest,
                 "tokens": tokens,
             }
+            if token_changes is not None:
+                event["tokenChanges"] = token_changes
             self._policy_events.append(event)
             if self._data_file is not None:
                 try:
@@ -11453,7 +11654,18 @@ class StateStore:
             if after > total:
                 raise ValueError("after is past the end of the policy event history")
             digest_input = _policy_events_digest_input(self._policy_events)
-            page = [dict(event) for event in self._policy_events[after : after + limit]]
+            # The plain history projects exactly the three contracted
+            # fields; the token-change detail rides along in memory and
+            # in the data file but is exported only by the detailed
+            # change-audit surface.
+            page = [
+                {
+                    "sequence": event["sequence"],
+                    "digest": event["digest"],
+                    "tokens": event["tokens"],
+                }
+                for event in self._policy_events[after : after + limit]
+            ]
         next_cursor = after + len(page)
         return HTTPStatus.OK, {
             "events": page,
@@ -11505,7 +11717,16 @@ class StateStore:
                 raise ValueError("after is past the end of the policy event history")
             digest_input = _policy_events_digest_input(self._policy_events)
             verification = _policy_events_verification_locked(self._policy_events)
-            page = [dict(event) for event in self._policy_events[after : after + limit]]
+            # Project the same three contracted fields as the plain
+            # change-audit page; the detail stays on its own surface.
+            page = [
+                {
+                    "sequence": event["sequence"],
+                    "digest": event["digest"],
+                    "tokens": event["tokens"],
+                }
+                for event in self._policy_events[after : after + limit]
+            ]
         next_cursor = after + len(page)
         return HTTPStatus.OK, {
             "events": page,
@@ -11515,6 +11736,64 @@ class StateStore:
             "digest": hashlib.sha256(digest_input).hexdigest(),
             "eventsCount": total,
             "verification": verification,
+        }
+
+    def get_policy_change_events(
+        self, after: int, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Return one page of the detailed scope-policy change history.
+
+        The read-only companion to :meth:`get_policy_events`: it pages
+        the same successful-reload history with the same ``after`` /
+        ``limit`` paging semantics, but each page item carries
+        ``sequence``, ``policyDigest``, and ``tokenChanges`` — never the
+        token count, a raw token, a scope value, or policy bytes.
+        ``tokenChanges`` is ``null`` for an event whose detail cannot be
+        rebuilt (an event recovered from a data file written before the
+        detail existed); otherwise it is exactly
+        ``{"added", "removed", "changed"}``, each an ascending
+        deduplicated array of 64-character lowercase hexadecimal token
+        fingerprints (the SHA-256 of the token's UTF-8 bytes): added
+        tokens only in the reloaded mapping, removed tokens only in the
+        previous mapping, and changed tokens present in both whose scope
+        set differed.
+
+        Returns ``(200, report)`` with exactly six fields: ``events``,
+        ``nextCursor``, ``hasMore``, ``algorithm`` (``"sha256"``),
+        ``digest``, and ``eventsCount``. ``digest`` is the SHA-256 of
+        the canonical compact JSON array produced by
+        :func:`_policy_change_events_digest_input` over the **whole**
+        detailed history (an empty history hashing ``[]``), so it is
+        identical on every page and distinct in field names from the
+        plain audit digest. An ``after`` equal to the event count is a
+        valid empty tail; ``after`` past it raises ValueError. The page
+        slice, cursors, digest, and count all come from one snapshot
+        under the commit lock, and the query changes no memory, log,
+        receipt, checkpoint, policy, or data file.
+        """
+        with self._lock:
+            total = len(self._policy_events)
+            if after > total:
+                raise ValueError("after is past the end of the policy event history")
+            digest_input = _policy_change_events_digest_input(self._policy_events)
+            page = [
+                {
+                    "sequence": event["sequence"],
+                    "policyDigest": event["digest"],
+                    # A recovered pre-detail event lacks the key; the
+                    # contract surfaces that as an explicit null.
+                    "tokenChanges": event.get("tokenChanges"),
+                }
+                for event in self._policy_events[after : after + limit]
+            ]
+        next_cursor = after + len(page)
+        return HTTPStatus.OK, {
+            "events": page,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor < total,
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(digest_input).hexdigest(),
+            "eventsCount": total,
         }
 
     def get_state_explanation(self, key: str) -> tuple[HTTPStatus, dict[str, Any]]:
@@ -12267,6 +12546,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[3] == "audit"
             and segments[4] == "verify"
         )
+        is_scope_policy_audit_changes_get = (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "admin"
+            and segments[2] == "scope-policy"
+            and segments[3] == "audit"
+            and segments[4] == "changes"
+        )
         is_scope_policy_audit_get = (
             len(segments) == 4
             and segments[0] == "v1"
@@ -12290,6 +12577,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
         if (
             is_scope_policy_audit_verify_get
+            or is_scope_policy_audit_changes_get
             or is_scope_policy_audit_get
             or is_scope_policy_status_get
             or is_scope_policy_preview_get
@@ -12311,6 +12599,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if is_scope_policy_audit_verify_get:
                 self._handle_scope_policy_audit_verify_get()
+            elif is_scope_policy_audit_changes_get:
+                self._handle_scope_policy_audit_changes_get()
             elif is_scope_policy_audit_get:
                 self._handle_scope_policy_audit_get()
             elif is_scope_policy_status_get:
@@ -14325,6 +14615,31 @@ class RequestHandler(BaseHTTPRequestHandler):
         # nextCursor, hasMore, algorithm, digest, eventsCount,
         # verification (status then the four anomaly lists), terminated by
         # one newline.
+        self._json_ordered_newline(status, payload)
+
+    def _handle_scope_policy_audit_changes_get(self) -> None:
+        # Authentication, the admin scope, and the scope-mode gate all ran
+        # in do_GET; route-shape mismatches — missing, extra, or a trailing
+        # slash — fall through to the generic 404 before this handler runs.
+        # The query accepts only the required after/limit pair, exactly
+        # like the plain change-audit route.
+        params = parse_scope_policy_audit_changes_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            status, payload = self._store.get_policy_change_events(after, limit)
+        except ValueError:
+            self._json_ordered_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        # The response keeps the payload's contracted field order: events,
+        # nextCursor, hasMore, algorithm, digest, eventsCount (and per event
+        # sequence, policyDigest, tokenChanges), terminated by one newline.
         self._json_ordered_newline(status, payload)
 
     def _handle_store_export_get(self) -> None:
