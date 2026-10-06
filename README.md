@@ -480,6 +480,33 @@ An empty store reports six zeroes; a single-candidate key contributes only to `k
 
 All six counters are computed from one snapshot under the same commit lock used by local writes, sync-import batches, and repairs, so they always describe a single commit. The request is strictly read-only — it modifies neither memory, the data file, logs, nor audits. With `--data-file`, the recovered candidate state yields the same counters after a restart as just before it.
 
+### Read-only per-key conflict-pressure report
+
+`GET /v1/metrics/conflicts/keys` pinpoints which keys carry the most conflict pressure. It returns HTTP 200 with a compact UTF-8 JSON object containing exactly four fields, with the field order `entries`, `hasMore`, `nextCursor`, `summary`:
+
+```json
+{"entries":[{"key":"color","candidates":3,"candidatePairs":3,"conflictPairs":3,"distinctValues":3},{"key":"size","candidates":2,"candidatePairs":1,"conflictPairs":1,"distinctValues":2}],"hasMore":false,"nextCursor":2,"summary":{"conflictKeys":2,"conflictPairs":4,"returnedKeys":2}}
+```
+
+A key **qualifies** only when at least one pair of its current candidates carries two different values — the same classification `GET /v1/metrics/conflicts` uses for `conflictKeys`. Each entry contains exactly five fields:
+
+- `key`: the business key.
+- `candidates`: the number of current candidates on the key.
+- `candidatePairs`: the number of unordered candidate pairs on the key, each pair counted once after enumerating candidates in ascending `(replicaId, operationId)` order.
+- `conflictPairs`: the subset of those pairs whose two candidates disagree on the value; same-value pairs never count as conflicts, even when their clocks are concurrent.
+- `distinctValues`: the number of distinct values currently held on the key.
+
+Qualifying keys are ordered by `conflictPairs` descending, then `candidates` descending, then `key` ascending in lexicographic (Unicode code point) order.
+
+- `entries`: the current page.
+- `nextCursor`: the number of qualifying keys skipped after this page — feed it back as the next `after`.
+- `hasMore`: whether further qualifying keys remain.
+- `summary`: counts over the **complete** snapshot, identical on every page: `conflictKeys` (the total number of qualifying keys), `conflictPairs` (the sum of `conflictPairs` across all qualifying keys — the same total the overview reports), and `returnedKeys` (the number of entries on this page).
+
+Paging follows the sync-export rules: `after` is the number of qualifying keys already skipped (a 0-based resume cursor) and defaults to `0`; `limit` defaults to `100` and must be between `1` and `100`. A negative, blank, whitespace-bearing, or non-ASCII-decimal `after`/`limit`, a repeated or unknown query parameter, a `limit` outside `1-100`, or an `after` past the qualifying-key count returns HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state; an `after` equal to the count is a valid stable empty page (`entries` is `[]`, `hasMore` is `false`). With no qualifying keys, `entries` is `[]` and all three summary counts are `0`. A missing or extra path segment or a trailing slash (for example `/v1/metrics/conflicts/keys/`) returns HTTP 404 with `{"error":"not_found"}`, as does any non-GET method; the route-shape check takes precedence over the query-parameter check.
+
+The entries, order, page slice, cursor, remaining flag, and summary are all computed from one snapshot under the same commit lock used by local writes, sync-import batches, and repairs, so they always describe a single commit: a read can never observe half a batch or counts that disagree with the page they summarize. The request is strictly read-only — it modifies neither memory, the data file, logs, nor audits — and an unexpected internal failure returns HTTP 500 with `{"error":"internal_error"}`. When bearer-token authentication is enabled, the endpoint follows the same rule as every other non-`/health` read: a missing or invalid credential is 401 `{"error":"unauthorized"}`, and in scope-policy mode a token lacking the `read` or `admin` scope is 403 `{"error":"forbidden"}`. With `--data-file`, the recovered candidate state yields the same entries, order, counts, and pages after a restart as just before it.
+
 ### Replica-convergence verification digest
 
 `GET /v1/verification/digest` returns HTTP 200 with a UTF-8 JSON object containing exactly four fields:

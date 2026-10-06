@@ -7900,6 +7900,111 @@ class StateStore:
                 "maxDistinctValuesInKey": max_distinct_values,
             }
 
+    def get_conflict_key_report(
+        self, after: int, limit: int
+    ) -> dict[str, Any]:
+        """Return one page of the read-only per-key conflict-pressure report.
+
+        This is the read-side computation behind
+        ``GET /v1/metrics/conflicts/keys``: the qualifying keys, their pair
+        counts, the page slice, the cursor, and the summary are all computed
+        together from one committed snapshot under the same commit lock used
+        by local writes, sync imports, and resolutions, so the report always
+        describes a single commit — a read can never observe half an import
+        batch, a partially applied repair, or counts that disagree with the
+        page they summarize. The snapshot mutates neither memory nor the
+        data file.
+
+        A key **qualifies** only when at least one unordered pair of its
+        current candidates carries two different values — the same
+        classification :meth:`get_conflict_metrics` uses for
+        ``conflictKeys``. Within each key the candidates are enumerated in
+        ascending ``(replicaId, operationId)`` order and every unordered
+        pair is counted once in ``candidatePairs``; a pair additionally
+        counts in ``conflictPairs`` only when the two candidates disagree
+        on the value, so same-value pairs — same-value concurrent
+        candidates included — never count as conflicts.
+
+        Each qualifying-key entry carries exactly ``key``, ``candidates``
+        (the candidate count), ``candidatePairs``, ``conflictPairs``, and
+        ``distinctValues`` (the number of distinct values on the key).
+        Qualifying keys are ordered by ``conflictPairs`` descending, then
+        ``candidates`` descending, then ``key`` ascending by Unicode code
+        point, so the report pinpoints the keys under the most pressure
+        first.
+
+        ``after`` is the number of qualifying keys already skipped (a
+        0-based resume cursor starting at ``0``) and ``limit`` the page
+        size between 1 and 100. ``nextCursor`` is the number of qualifying
+        keys skipped after this page and ``hasMore`` reports whether
+        further qualifying keys remain; an ``after`` equal to the
+        qualifying-key count is a valid stable empty page. ``summary``
+        always covers the complete snapshot, independently of paging:
+        ``conflictKeys`` is the total number of qualifying keys,
+        ``conflictPairs`` the sum of their ``conflictPairs`` (the same
+        total :meth:`get_conflict_metrics` reports), and ``returnedKeys``
+        the number of entries on this page. Raises ValueError when
+        ``after`` is past the qualifying-key count of the snapshot. With
+        ``--data-file`` the candidate state is rebuilt identically during
+        recovery, so the same state yields the same entries, order,
+        counts, and pages before and after a restart.
+        """
+        with self._lock:
+            entries: list[dict[str, Any]] = []
+            total_conflict_pairs = 0
+            for key, candidates in self._candidates.items():
+                ordered = sorted(
+                    candidates,
+                    key=lambda c: (c["replicaId"], c["operationId"]),
+                )
+                count = len(ordered)
+                candidate_pairs = 0
+                conflict_pairs = 0
+                for first in range(count):
+                    first_value = ordered[first]["value"]
+                    for second in range(first + 1, count):
+                        candidate_pairs += 1
+                        if ordered[second]["value"] != first_value:
+                            conflict_pairs += 1
+                if conflict_pairs == 0:
+                    # No pair of candidates disagrees on the value: a key
+                    # with a single candidate or only same-value
+                    # concurrent candidates is not a conflict key.
+                    continue
+                distinct_values = len({c["value"] for c in ordered})
+                total_conflict_pairs += conflict_pairs
+                entries.append(
+                    {
+                        "key": key,
+                        "candidates": count,
+                        "candidatePairs": candidate_pairs,
+                        "conflictPairs": conflict_pairs,
+                        "distinctValues": distinct_values,
+                    }
+                )
+            entries.sort(
+                key=lambda entry: (
+                    -entry["conflictPairs"],
+                    -entry["candidates"],
+                    entry["key"],
+                )
+            )
+            total = len(entries)
+            if after > total:
+                raise ValueError("after is past the end of the conflict keys")
+            page = entries[after : after + limit]
+            next_cursor = after + len(page)
+            return {
+                "entries": page,
+                "hasMore": next_cursor < total,
+                "nextCursor": next_cursor,
+                "summary": {
+                    "conflictKeys": total,
+                    "conflictPairs": total_conflict_pairs,
+                    "returnedKeys": len(page),
+                },
+            }
+
     def get_verification_digest(self) -> dict[str, Any]:
         """Return the read-only replica-convergence digest from one snapshot.
 
@@ -12911,6 +13016,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_metrics_conflicts_get()
             return
         if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "metrics"
+            and segments[2] == "conflicts"
+            and segments[3] == "keys"
+        ):
+            self._handle_metrics_conflicts_keys_get()
+            return
+        if (
             len(segments) == 3
             and segments[0] == "v1"
             and segments[1] == "integrity"
@@ -13446,6 +13560,46 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         self._json(HTTPStatus.OK, self._store.get_conflict_metrics())
+
+    def _handle_metrics_conflicts_keys_get(self) -> None:
+        # The route-shape check in do_GET already ran: a missing or extra
+        # segment, a trailing slash, or a non-GET method is 404 there,
+        # before any query check, so a wrong path shape with an illegal
+        # query is still 404. The endpoint accepts only ``after``
+        # (default 0) and ``limit`` (default 100, range 1-100), each a
+        # non-negative ASCII decimal integer appearing at most once — an
+        # unknown, repeated, blank, signed, whitespace-bearing,
+        # non-ASCII-decimal, or out-of-range value is 400
+        # invalid_request without reading or changing any state; an
+        # ``after`` past the qualifying-key count of the snapshot is 400
+        # as well. The page, cursor, remaining flag, and summary are
+        # computed from one committed snapshot under the commit lock and
+        # the read is strictly read-only: it changes neither memory, the
+        # data file, logs, nor audits; an unexpected internal failure is
+        # 500 internal_error with all state unchanged. The success body
+        # fixes the field order (entries, hasMore, nextCursor, summary;
+        # each entry key, candidates, candidatePairs, conflictPairs,
+        # distinctValues).
+        params = parse_paging_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_ordered(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        after, limit = params
+        try:
+            payload = self._store.get_conflict_key_report(after, limit)
+        except ValueError:
+            self._json_ordered(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        except Exception:
+            self._json_ordered(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+            )
+            return
+        self._json_ordered(HTTPStatus.OK, payload)
 
     def _handle_integrity_verify_get(self) -> None:
         # The route-shape check in do_GET already ran: a missing or extra
