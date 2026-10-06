@@ -8,9 +8,11 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import stat
 import sys
 import tempfile
+import time
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +23,9 @@ DATA_FORMAT_VERSION = 1
 
 # The largest value --max-clock-components may take.
 MAX_CLOCK_COMPONENTS_LIMIT = 1024
+
+# The largest value --request-timeout-seconds may take.
+MAX_REQUEST_TIMEOUT_SECONDS = 300
 
 # Optional admission bound on vector-clock width, configured with
 # --max-clock-components. None means no bound (the default): every clock
@@ -12256,6 +12261,7 @@ class SemanticStateServer(ThreadingHTTPServer):
         auth_scopes: dict[str, frozenset[str]] | None = None,
         scope_policy_file: str | None = None,
         scope_policy_digest: str | None = None,
+        request_timeout_seconds: int | None = None,
     ) -> None:
         # Build (and thus preflight/recover) the store before binding and
         # listening, so a rejected data file fails startup before any port is
@@ -12283,6 +12289,10 @@ class SemanticStateServer(ThreadingHTTPServer):
             if auth_scopes is not None
             else None
         )
+        # The optional cumulative per-request receive deadline, in seconds.
+        # None (the default) means receiving is never timed out and every
+        # behavior is exactly the baseline's.
+        self.request_timeout_seconds = request_timeout_seconds
 
 
 _FALLBACK_STORE = StateStore()
@@ -12294,12 +12304,149 @@ _FALLBACK_STORE = StateStore()
 _PERSISTENCE_UNAVAILABLE_HEADERS = {"Retry-After": "1"}
 
 
+class _ReceiveDeadlineExceeded(Exception):
+    """Internal signal: the per-request cumulative receive deadline expired.
+
+    A dedicated exception (rather than ``socket.timeout``) because the
+    base handler catches ``TimeoutError`` itself and silently drops the
+    connection; the 408 contract needs the expiry to reach the handler's
+    own response path.
+    """
+
+
+class _ReceiveDeadlineReader:
+    """File-like socket reader enforcing one cumulative deadline per request.
+
+    Installed in place of the buffered ``rfile`` only when the server is
+    configured with ``--request-timeout-seconds``; without that option the
+    stock ``makefile`` reader is used and every behavior is unchanged. The
+    handler stamps a fresh absolute ``deadline`` before each request, and
+    every ``recv`` arms the socket with exactly the time remaining until
+    that deadline, so a peer dribbling single bytes cannot extend the
+    limit — the budget is cumulative across the request line, the headers,
+    and a legally declared body. After each ``recv`` the socket returns to
+    blocking mode, so response generation and response sending stay
+    outside the boundary, exactly as when the option is omitted.
+    """
+
+    def __init__(self, connection: socket.socket) -> None:
+        self._connection = connection
+        self._buffer = bytearray()
+        self.deadline: float | None = None
+
+    def _recv_some(self, wanted: int) -> bytes:
+        deadline = self.deadline
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise _ReceiveDeadlineExceeded("request receive deadline exceeded")
+        self._connection.settimeout(remaining)
+        try:
+            return self._connection.recv(max(1, wanted))
+        except (socket.timeout, TimeoutError):
+            raise _ReceiveDeadlineExceeded(
+                "request receive deadline exceeded"
+            ) from None
+        finally:
+            self._connection.settimeout(None)
+
+    def readline(self, size: int = -1) -> bytes:
+        while True:
+            newline = self._buffer.find(b"\n")
+            if newline >= 0:
+                end = newline + 1
+                if 0 <= size < end:
+                    end = size
+                line = bytes(self._buffer[:end])
+                del self._buffer[:end]
+                return line
+            if 0 <= size <= len(self._buffer):
+                line = bytes(self._buffer[:size])
+                del self._buffer[:size]
+                return line
+            chunk = self._recv_some(65536)
+            if not chunk:
+                line = bytes(self._buffer)
+                self._buffer.clear()
+                return line
+            self._buffer += chunk
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            while True:
+                chunk = self._recv_some(65536)
+                if not chunk:
+                    break
+                self._buffer += chunk
+            data = bytes(self._buffer)
+            self._buffer.clear()
+            return data
+        while len(self._buffer) < size:
+            chunk = self._recv_some(size - len(self._buffer))
+            if not chunk:
+                break
+            self._buffer += chunk
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def close(self) -> None:
+        self._buffer.clear()
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "SemanticStateEngine/0.1"
 
     @property
     def _store(self) -> StateStore:
         return getattr(self.server, "store", _FALLBACK_STORE)
+
+    def setup(self) -> None:
+        super().setup()
+        if getattr(self.server, "request_timeout_seconds", None) is not None:
+            # Swap the buffered reader for the deadline-enforcing one; the
+            # discarded makefile object is closed without touching the
+            # connection itself. When the option is omitted the stock
+            # reader stays in place and nothing changes.
+            self.rfile.close()
+            self.rfile = _ReceiveDeadlineReader(self.connection)
+
+    def handle_one_request(self) -> None:
+        timeout = getattr(self.server, "request_timeout_seconds", None)
+        if timeout is None:
+            return super().handle_one_request()
+        # The cumulative receive deadline starts when the server begins
+        # processing this request and covers the unfinished request line,
+        # the headers, and a legally declared body. It is stamped once per
+        # request; arriving bytes never reset it.
+        self.rfile.deadline = time.monotonic() + timeout
+        try:
+            return super().handle_one_request()
+        except _ReceiveDeadlineExceeded:
+            # The request line, the headers, or the legally declared body
+            # did not fully arrive within the deadline. Routing,
+            # authentication, and every state mutation only run after the
+            # request is fully received, so nothing was created or
+            # modified: answer 408 with the fixed body and close the
+            # connection. The socket is back in blocking mode (see
+            # _ReceiveDeadlineReader), so sending this response is itself
+            # outside the deadline.
+            self.close_connection = True
+            # The deadline may have expired before the request line was
+            # parsed, leaving the logging/version attributes unset; fill
+            # them the same way the base handler does for an over-long
+            # request line, with a non-HTTP/0.9 version so the status line
+            # and headers are still emitted.
+            if not hasattr(self, "request_version"):
+                self.request_version = ""
+            if not hasattr(self, "requestline"):
+                self.requestline = ""
+            if not hasattr(self, "command"):
+                self.command = ""
+            try:
+                self._json(HTTPStatus.REQUEST_TIMEOUT, {"error": "request_timeout"})
+            except OSError:
+                pass
+            return None
 
     def _json(
         self,
@@ -15137,6 +15284,32 @@ def _max_clock_components_value(token: str) -> int:
     return value
 
 
+def _request_timeout_seconds_value(token: str) -> int:
+    """Argparse type for --request-timeout-seconds: a decimal integer 1-300.
+
+    Only a non-empty run of ASCII decimal digits is accepted, which
+    rejects signs, decimals, whitespace, blanks, and non-ASCII numerals;
+    the value must lie between 1 and 300 inclusive. Any rejection makes
+    argparse fail startup with exit code 2 before any file is read or any
+    port is bound.
+    """
+    if not token or any(ch < "0" or ch > "9" for ch in token):
+        raise argparse.ArgumentTypeError(
+            "must be a decimal integer between 1 and 300"
+        )
+    significant = token.lstrip("0")
+    if len(significant) > len(str(MAX_REQUEST_TIMEOUT_SECONDS)):
+        raise argparse.ArgumentTypeError(
+            "must be a decimal integer between 1 and 300"
+        )
+    value = int(significant) if significant else 0
+    if not 1 <= value <= MAX_REQUEST_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(
+            "must be a decimal integer between 1 and 300"
+        )
+    return value
+
+
 class _CheckArgumentParser(argparse.ArgumentParser):
     """ArgumentParser for ``--check`` runs: parse failures use the startup channel.
 
@@ -15252,6 +15425,7 @@ def _startup_check_summary(args: argparse.Namespace) -> dict[str, Any]:
         "authentication": authentication,
         "dataFile": data_file,
         "maxClockComponents": args.max_clock_components,
+        "requestTimeoutSeconds": args.request_timeout_seconds or 0,
     }
 
 
@@ -15307,6 +15481,21 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--request-timeout-seconds",
+        type=_request_timeout_seconds_value,
+        default=None,
+        metavar="N",
+        help=(
+            "optional cumulative receive deadline per request: the request "
+            "line, the headers, and a legally declared body must fully "
+            "arrive within N seconds of the server starting to process the "
+            "request, a decimal integer between 1 and 300; an overdue "
+            "request is answered with HTTP 408 and closed without creating "
+            "or modifying any state; without it receiving is never timed "
+            "out and every behavior is unchanged"
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help=(
@@ -15353,6 +15542,7 @@ def main(argv: list[str] | None = None) -> None:
         auth_scopes=auth_scopes,
         scope_policy_file=args.scope_policy_file,
         scope_policy_digest=scope_policy_digest,
+        request_timeout_seconds=args.request_timeout_seconds,
     )
     try:
         server.serve_forever()

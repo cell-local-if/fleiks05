@@ -106,7 +106,8 @@ class CheckModeTests(unittest.TestCase):
             '{"status":"ok","authentication":"anonymous","dataFile":'
             '{"configured":false,"operations":0,"checkpoints":0,'
             '"transactions":0,"acks":0,"repairs":0,"policyEvents":0,'
-            '"compensations":0},"maxClockComponents":null}\n',
+            '"compensations":0},"maxClockComponents":null,'
+            '"requestTimeoutSeconds":0}\n',
         )
 
     def test_check_without_data_file_creates_nothing(self) -> None:
