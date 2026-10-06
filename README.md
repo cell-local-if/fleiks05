@@ -298,6 +298,29 @@ With `--data-file`, a first accept is atomically persisted before the 201 respon
 
 Keys are isolated from each other, and reads reflect the latest writes.
 
+### Paging the current state overview
+
+`GET /v1/states` returns a read-only, paged overview of every key that currently holds at least one candidate, ordered by key in Unicode code-point ascending order — a way to discover and read the currently held keys without exporting the full store. Each page entry is exactly what `GET /v1/states/{key}` reports for the same key on the same snapshot: `{"key","value","clock","status":"resolved"}` when every candidate agrees on the value, `{"key","status":"conflict","candidates":[...]}` otherwise, with the candidates sorted by `(replicaId, operationId)` ascending. Paging never changes the single-key read semantics.
+
+The query string accepts two optional parameters, each at most once:
+
+- `afterKey`: one non-empty string naming the exclusive lower bound of the page — only keys strictly after it in Unicode code-point order are reported. The boundary keeps its meaning even when that key does not currently exist.
+- `limit`: an ASCII decimal integer between 1 and 100, defaulting to 100.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object with exactly three fields, terminated by a single newline:
+
+```json
+{"cursor":"color","keys":[{"clock":{"r1":1},"key":"color","status":"resolved","value":"blue"}],"more":false}
+```
+
+- `keys`: the page entries in key order, each a single key's result as described above.
+- `cursor`: the page's last key, or `null` for an empty page.
+- `more`: whether any key follows the page in the same order.
+
+A repeated, unknown, blank, or malformed parameter, an out-of-range `limit`, and an empty, repeated, or valueless `afterKey` return HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state. A missing, empty, or extra path segment (for example `/v1/states/` or `/v1/states/overview`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check.
+
+The key set, the ordering, the page boundary, and every entry's content all come from one committed snapshot under the same commit lock used by local writes, sync imports, transactions, and repairs, so a concurrent commit only ever lets adjacent pages each see the complete old or the complete new state — never half an import batch, transaction, or repair. The request is strictly read-only: it adds no operation, candidate, audit record, checkpoint, metric, or persistence record, creates no file, and with `--data-file` it only observes the committed in-memory state without reading or writing the data file, so recovered identical state pages identically. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` read route: a missing or bad credential is HTTP 401, and in scope-policy mode a token without the `read` or `admin` scope is HTTP 403 — a failed response never reveals any page content.
+
 ### Reading historical state
 
 `GET /v1/states/{key}/at?cursor=N` returns a read-only report of one key's candidate state **as it was after the first `cursor` records of the shared accepted-operation log**, replayed from the empty state in commit order. The replay covers exactly what the log holds — first-accepted ordinary writes, stale writes whose clock was already dominated, accepted conflict repairs, and sync-imported records — and nothing else: identical replays (`200`), conflicting or malformed requests (`409`/`400`), uncommitted requests, and records whose durable commit failed never enter the log and so never move the replayed state.

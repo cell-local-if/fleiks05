@@ -901,6 +901,39 @@ def parse_state_at_query(query: str) -> int | None:
     return _non_negative_int(values[0])
 
 
+def parse_states_query(query: str) -> tuple[str | None, int] | None:
+    """Validate the current-state overview query string.
+
+    Accepts only the optional paging parameters ``afterKey`` and
+    ``limit``, each appearing at most once. ``afterKey`` must carry one
+    non-empty percent-decoded value (percent decoding is applied by
+    ``parse_qs``) and names the exclusive lower bound of the page: only
+    keys strictly after it in Unicode code-point order are reported,
+    whether or not that key currently exists. ``limit`` defaults to 100
+    and must be an ASCII decimal integer between 1 and 100. An unknown
+    or repeated parameter, a blank or valueless ``afterKey``, and a
+    blank, signed, decimal-point, whitespace-bearing, non-ASCII-digit,
+    or out-of-range ``limit`` return None.
+    """
+    parsed = parse_qs(query, keep_blank_values=True)
+    if any(len(values) != 1 for values in parsed.values()):
+        return None
+    if not set(parsed) <= {"afterKey", "limit"}:
+        return None
+    after_key: str | None = None
+    limit = SYNC_DEFAULT_LIMIT
+    if "afterKey" in parsed:
+        after_key = parsed["afterKey"][0]
+        if after_key == "":
+            return None
+    if "limit" in parsed:
+        limit_value = _non_negative_int(parsed["limit"][0])
+        if limit_value is None or not (1 <= limit_value <= SYNC_BATCH_MAX):
+            return None
+        limit = limit_value
+    return after_key, limit
+
+
 def parse_audit_log_verify_query(
     query: str,
 ) -> tuple[int, int, str, int] | None:
@@ -12037,6 +12070,80 @@ class StateStore:
             ],
         }
 
+    def get_states(
+        self, after_key: str | None, limit: int
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Page the current per-key states in Unicode code-point order.
+
+        Reports every key that currently holds at least one candidate,
+        ordered by key in Unicode code-point ascending order. ``after_key``
+        is an exclusive lower bound: only keys strictly after it in that
+        order are reported, whether or not the boundary key itself
+        currently exists; ``None`` starts from the first key. ``limit``
+        caps the page size. Each page entry is exactly what
+        :meth:`get_state` reports for the same key on the same snapshot:
+        ``{"key", "value", "clock", "status": "resolved"}`` when every
+        candidate agrees on the value, ``{"key", "status": "conflict",
+        "candidates": [...]}`` otherwise, with the candidates sorted by
+        ``(replicaId, operationId)`` ascending.
+
+        The key set, the ordering, the page boundary, and every entry's
+        content are copied from one committed snapshot under the same
+        commit lock used by local writes, sync imports, transactions, and
+        repairs, so a concurrent commit is either fully below or fully
+        above the answered page — never half an import batch, transaction,
+        or repair. The read mutates neither memory, the data file, logs,
+        nor checkpoints and creates no files; with ``--data-file`` the
+        recovered state pages identically.
+
+        Returns ``(200, report)`` with exactly three fields: ``keys`` (the
+        page entries in key order), ``cursor`` (the page's last key, or
+        None for an empty page), and ``more`` (whether any key follows the
+        page in the same order).
+        """
+        with self._lock:
+            present = {
+                key: [
+                    {
+                        "value": candidate["value"],
+                        "clock": dict(candidate["clock"]),
+                        "replicaId": candidate["replicaId"],
+                        "operationId": candidate["operationId"],
+                    }
+                    for candidate in sorted(
+                        candidates,
+                        key=lambda c: (c["replicaId"], c["operationId"]),
+                    )
+                ]
+                for key, candidates in self._candidates.items()
+                if candidates
+            }
+        ordered_keys = sorted(present)
+        if after_key is not None:
+            ordered_keys = [key for key in ordered_keys if key > after_key]
+        page_keys = ordered_keys[:limit]
+        entries: list[dict[str, Any]] = []
+        for key in page_keys:
+            candidates = present[key]
+            if all(c["value"] == candidates[0]["value"] for c in candidates):
+                entries.append(
+                    {
+                        "key": key,
+                        "value": candidates[0]["value"],
+                        "clock": candidates[0]["clock"],
+                        "status": "resolved",
+                    }
+                )
+            else:
+                entries.append(
+                    {"key": key, "status": "conflict", "candidates": candidates}
+                )
+        return HTTPStatus.OK, {
+            "keys": entries,
+            "cursor": page_keys[-1] if page_keys else None,
+            "more": len(ordered_keys) > len(page_keys),
+        }
+
     def get_state_at(self, key: str, cursor: int) -> tuple[HTTPStatus, dict[str, Any]]:
         """Replay the accepted log up to ``cursor`` and report one key's state.
 
@@ -12727,6 +12834,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         ):
             self._handle_replication_repairs_get()
             return
+        if len(segments) == 2 and segments[0] == "v1" and segments[1] == "states":
+            self._handle_states_get()
+            return
         if len(segments) == 3 and segments[0] == "v1" and segments[1] == "states":
             status, payload = self._store.get_state(segments[2])
             self._json(status, payload)
@@ -13186,6 +13296,21 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             return
         self._json_ordered_newline(status, payload)
+
+    def _handle_states_get(self) -> None:
+        # The route-shape check in do_GET already ran (missing or extra
+        # segments — including a trailing slash — are 404 there, before any
+        # query check), so a malformed query is rejected here without any
+        # state being read or changed. The overview follows the
+        # compact-single-line contract: compact UTF-8 JSON, one trailing
+        # newline, and the query is strictly read-only.
+        params = parse_states_query(urlsplit(self.path).query)
+        if params is None:
+            self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        after_key, limit = params
+        status, payload = self._store.get_states(after_key, limit)
+        self._json_newline(status, payload)
 
     def _handle_state_at_get(self, key: str) -> None:
         # The route-shape check in do_GET already ran (missing or extra
