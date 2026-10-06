@@ -298,6 +298,29 @@ With `--data-file`, a first accept is atomically persisted before the 201 respon
 
 Keys are isolated from each other, and reads reflect the latest writes.
 
+### Paging the current-state overview
+
+`GET /v1/states` returns a read-only, paginated overview of every key that currently holds at least one candidate, so the live keys can be discovered and read without exporting the full store. Keys are ordered by Unicode code point ascending, and each page entry is exactly what `GET /v1/states/{key}` reports for the same key on the same snapshot: `{"key","value","clock","status":"resolved"}` when every candidate agrees on the value, otherwise `{"key","status":"conflict","candidates":[...]}` with the candidates sorted by `(replicaId, operationId)` ascending.
+
+The query string accepts two optional parameters, each at most once:
+
+- `afterKey`: an exclusive lower bound on the key order — the page starts at the first key strictly after it in Unicode code-point order. It must be one non-empty string and is a boundary, not a lookup: it need not name an existing key, and a boundary that matches no key still applies.
+- `limit`: the page size, defaulting to `100`; it must be an ASCII decimal integer between `1` and `100`.
+
+A repeated, unknown, blank, or malformed parameter, a `limit` outside `1-100` (or signed, decimal, whitespace-padded, or non-ASCII-digit), and an empty, repeated, or valueless `afterKey` return HTTP 400 with `{"error":"invalid_request"}` without reading or changing any state. A missing, empty, or extra path segment (for example `/v1/states/` or `/v1/states/a/b`) returns HTTP 404 with `{"error":"not_found"}`; the route-shape check takes precedence over the query-parameter check.
+
+A successful HTTP 200 response is a compact UTF-8 JSON object with exactly three fields, terminated by a single newline:
+
+```json
+{"cursor":"color","keys":[{"clock":{"r1":1},"key":"color","status":"resolved","value":"blue"}],"more":false}
+```
+
+- `keys`: the page's entries, in key order.
+- `cursor`: the page's last key, or `null` when the page is empty; pass it as `afterKey` to fetch the next page.
+- `more`: whether any key follows the page in the same order.
+
+The sort, the boundary, the page contents, and the `more` flag all come from one committed snapshot taken under the same commit lock used by local writes, sync imports, transactions, and repairs, so a concurrent commit only moves the whole page from the complete old state to the complete new state — a page never observes half an import batch, transaction, or repair. The request is strictly read-only: it records no operation, candidate, audit entry, checkpoint, or metric, touches neither the data file nor any other file, and with `--data-file` the recovered state pages identically after a restart. When bearer-token authentication is enabled, the endpoint authenticates like every other non-`/health` read route: a missing or bad credential is HTTP 401, and in scope-policy mode a token without the `read` or `admin` scope is HTTP 403; failure responses carry only the error object and never any page content.
+
 ### Reading historical state
 
 `GET /v1/states/{key}/at?cursor=N` returns a read-only report of one key's candidate state **as it was after the first `cursor` records of the shared accepted-operation log**, replayed from the empty state in commit order. The replay covers exactly what the log holds — first-accepted ordinary writes, stale writes whose clock was already dominated, accepted conflict repairs, and sync-imported records — and nothing else: identical replays (`200`), conflicting or malformed requests (`409`/`400`), uncommitted requests, and records whose durable commit failed never enter the log and so never move the replayed state.
