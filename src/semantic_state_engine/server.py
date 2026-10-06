@@ -8,10 +8,12 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import stat
 import sys
 import tempfile
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, NoReturn
@@ -21,6 +23,9 @@ DATA_FORMAT_VERSION = 1
 
 # The largest value --max-clock-components may take.
 MAX_CLOCK_COMPONENTS_LIMIT = 1024
+
+# The largest value --request-timeout-seconds may take.
+REQUEST_TIMEOUT_SECONDS_LIMIT = 300
 
 # Optional admission bound on vector-clock width, configured with
 # --max-clock-components. None means no bound (the default): every clock
@@ -12240,6 +12245,82 @@ class StateStore:
         }
 
 
+class _RequestReceiveTimeout(Exception):
+    """The cumulative per-request receive deadline expired mid-request."""
+
+
+class _DeadlineReader:
+    """Buffered socket reader enforcing one cumulative receive deadline.
+
+    Installed as the handler's ``rfile`` when ``--request-timeout-seconds``
+    is set. ``deadline`` is an absolute ``time.monotonic()`` timestamp the
+    handler arms when it starts processing a request; while it is set,
+    every socket receive is given only the time remaining until that
+    deadline — never the full budget again — so a peer dribbling one byte
+    at a time cannot extend the limit. Between receives the socket returns
+    to blocking mode and buffered bytes cost no time, so once the request
+    is fully received the response work stays outside the boundary. A
+    receive that would cross the deadline raises
+    :class:`_RequestReceiveTimeout`.
+    """
+
+    def __init__(self, connection: socket.socket) -> None:
+        self._connection = connection
+        self._buffer = bytearray()
+        self.deadline: float | None = None
+
+    def _recv_more(self) -> bool:
+        """Pull one chunk from the socket; False means the peer hung up."""
+        if self.deadline is None:
+            self._connection.settimeout(None)
+        else:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise _RequestReceiveTimeout()
+            self._connection.settimeout(remaining)
+        try:
+            chunk = self._connection.recv(65536)
+        except socket.timeout as exc:
+            raise _RequestReceiveTimeout() from exc
+        finally:
+            self._connection.settimeout(None)
+        if not chunk:
+            return False
+        self._buffer.extend(chunk)
+        return True
+
+    def _take(self, size: int) -> bytes:
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def readline(self, size: int = -1) -> bytes:
+        limit = None if size is None or size < 0 else size
+        while True:
+            newline = self._buffer.find(b"\n")
+            if newline >= 0:
+                end = newline + 1 if limit is None else min(newline + 1, limit)
+                return self._take(end)
+            if limit is not None and len(self._buffer) >= limit:
+                return self._take(limit)
+            if not self._recv_more():
+                return self._take(len(self._buffer))
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            while self._recv_more():
+                pass
+            return self._take(len(self._buffer))
+        while len(self._buffer) < size:
+            if not self._recv_more():
+                break
+        return self._take(min(size, len(self._buffer)))
+
+    def close(self) -> None:
+        # The server owns the socket; there is no wrapped file to close.
+        return
+
+
 class SemanticStateServer(ThreadingHTTPServer):
     """Threading HTTP server carrying its own StateStore."""
 
@@ -12256,6 +12337,7 @@ class SemanticStateServer(ThreadingHTTPServer):
         auth_scopes: dict[str, frozenset[str]] | None = None,
         scope_policy_file: str | None = None,
         scope_policy_digest: str | None = None,
+        request_timeout_seconds: int | None = None,
     ) -> None:
         # Build (and thus preflight/recover) the store before binding and
         # listening, so a rejected data file fails startup before any port is
@@ -12283,6 +12365,10 @@ class SemanticStateServer(ThreadingHTTPServer):
             if auth_scopes is not None
             else None
         )
+        # The optional cumulative per-request receive deadline in seconds,
+        # or None when --request-timeout-seconds was not given: every
+        # request is then received exactly as the baseline did.
+        self.request_timeout_seconds = request_timeout_seconds
 
 
 _FALLBACK_STORE = StateStore()
@@ -12296,6 +12382,55 @@ _PERSISTENCE_UNAVAILABLE_HEADERS = {"Retry-After": "1"}
 
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "SemanticStateEngine/0.1"
+
+    def setup(self) -> None:
+        super().setup()
+        if getattr(self.server, "request_timeout_seconds", None) is not None:
+            # Swap the socket's buffered file for the deadline-enforcing
+            # reader before the first byte of the connection is read, so no
+            # read-ahead bytes can be stranded in the replaced buffer.
+            # Closing the unread file leaves the socket itself open.
+            self.rfile.close()
+            self.rfile = _DeadlineReader(self.connection)
+
+    def handle_one_request(self) -> None:
+        timeout = getattr(self.server, "request_timeout_seconds", None)
+        if timeout is None:
+            super().handle_one_request()
+            return
+        # The cumulative deadline starts when the server begins processing
+        # this request and covers the unfinished request line, the headers,
+        # and a legally declared body. Once the body is read to completion
+        # no further reads happen, so response generation and sending stay
+        # outside the boundary, as does every request when the option is
+        # not configured.
+        self.rfile.deadline = time.monotonic() + timeout
+        try:
+            super().handle_one_request()
+        except _RequestReceiveTimeout:
+            # An incomplete request never reached routing, authentication,
+            # or the store, so nothing was created or modified; answer with
+            # the fixed 408 contract and close the connection.
+            self.close_connection = True
+            self._answer_request_timeout()
+        finally:
+            self.rfile.deadline = None
+
+    def _answer_request_timeout(self) -> None:
+        """Answer a receive-deadline expiry with the fixed 408 contract."""
+        # parse_request may never have run (the request line itself
+        # stalled), so guarantee the attributes the response machinery
+        # consults.
+        if not hasattr(self, "request_version"):
+            self.request_version = "HTTP/1.0"
+        if not hasattr(self, "requestline"):
+            self.requestline = ""
+        try:
+            self._json(HTTPStatus.REQUEST_TIMEOUT, {"error": "request_timeout"})
+        except OSError:
+            # The stalled peer may already be gone; the connection is being
+            # closed either way.
+            pass
 
     @property
     def _store(self) -> StateStore:
@@ -15137,6 +15272,32 @@ def _max_clock_components_value(token: str) -> int:
     return value
 
 
+def _request_timeout_seconds_value(token: str) -> int:
+    """Argparse type for --request-timeout-seconds: a decimal integer 1-300.
+
+    Only a non-empty run of ASCII decimal digits is accepted, which
+    rejects signs, decimals, whitespace, blanks, and non-ASCII numerals;
+    the value must lie between 1 and 300 inclusive. Any rejection makes
+    argparse fail startup with exit code 2 before any file is read or any
+    port is bound.
+    """
+    if not token or any(ch < "0" or ch > "9" for ch in token):
+        raise argparse.ArgumentTypeError(
+            "must be a decimal integer between 1 and 300"
+        )
+    significant = token.lstrip("0")
+    if len(significant) > len(str(REQUEST_TIMEOUT_SECONDS_LIMIT)):
+        raise argparse.ArgumentTypeError(
+            "must be a decimal integer between 1 and 300"
+        )
+    value = int(significant) if significant else 0
+    if not 1 <= value <= REQUEST_TIMEOUT_SECONDS_LIMIT:
+        raise argparse.ArgumentTypeError(
+            "must be a decimal integer between 1 and 300"
+        )
+    return value
+
+
 class _CheckArgumentParser(argparse.ArgumentParser):
     """ArgumentParser for ``--check`` runs: parse failures use the startup channel.
 
@@ -15204,8 +15365,8 @@ def _startup_check_summary(args: argparse.Namespace) -> dict[str, Any]:
     """Run the check-only pre-flight and return the summary document.
 
     Applies the startup validation rules for the argument combination, the
-    authentication configuration, the clock-width bound, and the data file
-    without binding a port, probing a directory, or creating, rewriting,
+    authentication configuration, the clock-width bound, the
+    receive-timeout bound, and the data file without binding a port, probing a directory, or creating, rewriting,
     or deleting any file. Any failure is reported on stderr as
     ``semantic-state-engine: startup failed: ...`` and exits with code 2
     with stdout left empty; the token and the policy contents are never
@@ -15252,6 +15413,11 @@ def _startup_check_summary(args: argparse.Namespace) -> dict[str, Any]:
         "authentication": authentication,
         "dataFile": data_file,
         "maxClockComponents": args.max_clock_components,
+        "requestTimeoutSeconds": (
+            args.request_timeout_seconds
+            if args.request_timeout_seconds is not None
+            else 0
+        ),
     }
 
 
@@ -15307,12 +15473,28 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--request-timeout-seconds",
+        type=_request_timeout_seconds_value,
+        default=None,
+        metavar="N",
+        help=(
+            "optional cumulative receive deadline per request: the request "
+            "line, the request headers, and a legally declared request body "
+            "must fully arrive within N seconds of the server starting to "
+            "process the request, a decimal integer between 1 and 300, or "
+            "the request is answered with HTTP 408 request_timeout and the "
+            "connection closes; without it no receive deadline applies and "
+            "every behavior is unchanged"
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help=(
             "validate the startup configuration without starting the "
             "service: check the argument combination, the authentication "
-            "files, the clock-width bound, and the data file exactly as "
+            "files, the clock-width bound, the receive-timeout bound, and "
+            "the data file exactly as "
             "startup would, never bind a port, and never create, rewrite, "
             "or delete any file; on success print one compact JSON summary "
             "line on stdout and exit 0, on any failure print "
@@ -15353,6 +15535,7 @@ def main(argv: list[str] | None = None) -> None:
         auth_scopes=auth_scopes,
         scope_policy_file=args.scope_policy_file,
         scope_policy_digest=scope_policy_digest,
+        request_timeout_seconds=args.request_timeout_seconds,
     )
     try:
         server.serve_forever()
