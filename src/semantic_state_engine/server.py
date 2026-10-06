@@ -7900,6 +7900,94 @@ class StateStore:
                 "maxDistinctValuesInKey": max_distinct_values,
             }
 
+    def get_conflict_key_metrics(
+        self, after: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int, bool, dict[str, int]]:
+        """Return one page of the per-key conflict report from one snapshot.
+
+        A key qualifies for the report when at least one pair of its
+        candidates disagrees on the value (equivalently, its candidates
+        carry more than one distinct value); keys whose candidates all
+        agree never appear. Within each key the candidates are enumerated
+        in ascending ``(replicaId, operationId)`` order and every unordered
+        pair is counted once in ``candidatePairs``; a pair additionally
+        counts in ``conflictPairs`` only when the two candidates disagree
+        on the value, so same-value concurrent candidates never count as
+        conflicts — the same pair semantics as
+        :meth:`get_conflict_metrics`. Each entry carries exactly ``key``,
+        ``candidates`` (the candidate count), ``candidatePairs``,
+        ``conflictPairs``, and ``distinctValues`` (the number of distinct
+        candidate values).
+
+        Qualifying keys are ordered by ``conflictPairs`` descending, then
+        ``candidates`` descending, then ``key`` in ascending Unicode
+        code-point order, so the heaviest keys page first and the order is
+        total. ``after`` is the number of qualifying keys already skipped
+        (a 0-based cursor) and ``limit`` the page size; the ordering, the
+        slice, the returned cursor, ``has_more``, and the summary are all
+        computed against the same snapshot under the commit lock, so a
+        page never observes half an import batch or counts that disagree
+        with the entries. Returns ``(entries, next_cursor, has_more,
+        summary)`` where ``next_cursor`` is the number of qualifying keys
+        skipped after this page and ``summary`` holds ``conflictKeys``
+        (the total number of qualifying keys), ``conflictPairs`` (their
+        total conflict pairs), and ``returnedKeys`` (this page's entry
+        count). Raises ValueError when ``after`` is past the total number
+        of qualifying keys; ``after`` equal to the total yields an empty
+        page with ``has_more`` False. The read mutates neither memory nor
+        the data file, and with ``--data-file`` the recovered candidate
+        state yields the same entries, order, counts, and pages as before
+        the restart.
+        """
+        with self._lock:
+            entries = []
+            total_conflict_pairs = 0
+            for key, candidates in self._candidates.items():
+                ordered = sorted(
+                    candidates,
+                    key=lambda c: (c["replicaId"], c["operationId"]),
+                )
+                count = len(ordered)
+                distinct_values = {c["value"] for c in ordered}
+                if len(distinct_values) <= 1:
+                    continue
+                candidate_pairs = 0
+                conflict_pairs = 0
+                for first in range(count):
+                    first_value = ordered[first]["value"]
+                    for second in range(first + 1, count):
+                        candidate_pairs += 1
+                        if ordered[second]["value"] != first_value:
+                            conflict_pairs += 1
+                total_conflict_pairs += conflict_pairs
+                entries.append(
+                    {
+                        "key": key,
+                        "candidates": count,
+                        "candidatePairs": candidate_pairs,
+                        "conflictPairs": conflict_pairs,
+                        "distinctValues": len(distinct_values),
+                    }
+                )
+            entries.sort(
+                key=lambda entry: (
+                    -entry["conflictPairs"],
+                    -entry["candidates"],
+                    entry["key"],
+                )
+            )
+            total = len(entries)
+            if after > total:
+                raise ValueError("after is past the end of the conflict-key report")
+            page = entries[after : after + limit]
+            summary = {
+                "conflictKeys": total,
+                "conflictPairs": total_conflict_pairs,
+                "returnedKeys": len(page),
+            }
+        next_cursor = after + len(page)
+        return page, next_cursor, next_cursor < total, summary
+
     def get_verification_digest(self) -> dict[str, Any]:
         """Return the read-only replica-convergence digest from one snapshot.
 
@@ -12911,6 +12999,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._handle_metrics_conflicts_get()
             return
         if (
+            len(segments) == 4
+            and segments[0] == "v1"
+            and segments[1] == "metrics"
+            and segments[2] == "conflicts"
+            and segments[3] == "keys"
+        ):
+            self._handle_metrics_conflicts_keys_get()
+            return
+        if (
             len(segments) == 3
             and segments[0] == "v1"
             and segments[1] == "integrity"
@@ -13446,6 +13543,47 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         self._json(HTTPStatus.OK, self._store.get_conflict_metrics())
+
+    def _handle_metrics_conflicts_keys_get(self) -> None:
+        # The route-shape check in do_GET already ran: a missing or extra
+        # segment, a trailing slash, or a non-GET method is 404 there,
+        # before any query check, so a wrong path shape with an illegal
+        # query is still 404. The endpoint accepts only the shared
+        # ``after``/``limit`` paging parameters — an unknown, repeated,
+        # blank, negative, non-ASCII-decimal, or out-of-range parameter is
+        # 400 invalid_request without reading or changing any state, as is
+        # an ``after`` past the total number of qualifying keys. The page,
+        # cursor, and summary are computed from one committed snapshot
+        # under the commit lock and the read is strictly read-only: it
+        # changes neither memory, the data file, logs, nor audits. An
+        # unexpected internal failure is 500 internal_error with all state
+        # unchanged.
+        params = parse_paging_query(urlsplit(self.path).query)
+        if params is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        after, limit = params
+        try:
+            entries, next_cursor, has_more, summary = (
+                self._store.get_conflict_key_metrics(after, limit)
+            )
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        except Exception:
+            self._json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+            )
+            return
+        self._json(
+            HTTPStatus.OK,
+            {
+                "entries": entries,
+                "hasMore": has_more,
+                "nextCursor": next_cursor,
+                "summary": summary,
+            },
+        )
 
     def _handle_integrity_verify_get(self) -> None:
         # The route-shape check in do_GET already ran: a missing or extra

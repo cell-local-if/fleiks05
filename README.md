@@ -480,6 +480,28 @@ An empty store reports six zeroes; a single-candidate key contributes only to `k
 
 All six counters are computed from one snapshot under the same commit lock used by local writes, sync-import batches, and repairs, so they always describe a single commit. The request is strictly read-only — it modifies neither memory, the data file, logs, nor audits. With `--data-file`, the recovered candidate state yields the same counters after a restart as just before it.
 
+### Read-only per-key conflict report
+
+`GET /v1/metrics/conflicts/keys` returns HTTP 200 with a UTF-8 JSON object containing exactly four fields — a paginated report that localizes the global conflict pressure to the keys causing it:
+
+```json
+{"entries":[{"key":"k","candidates":3,"candidatePairs":3,"conflictPairs":2,"distinctValues":2}],"hasMore":false,"nextCursor":1,"summary":{"conflictKeys":1,"conflictPairs":2,"returnedKeys":1}}
+```
+
+A key qualifies when at least one pair of its candidates disagrees on the value; keys whose candidates all agree never appear. Each entry contains exactly five fields:
+
+- `key`: the key name.
+- `candidates`: the key's current candidate count.
+- `candidatePairs`: unordered candidate pairs within the key, counted once per pair (candidates enumerated in ascending `(replicaId, operationId)` order).
+- `conflictPairs`: the subset of those pairs whose two candidates disagree on the value; same-value concurrent candidates never count as conflicts.
+- `distinctValues`: the number of distinct candidate values within the key.
+
+Qualifying keys are ordered by `conflictPairs` descending, then `candidates` descending, then `key` in ascending Unicode code-point order, so the heaviest keys page first. The `summary` object reports `conflictKeys` (the total number of qualifying keys), `conflictPairs` (their total conflict pairs), and `returnedKeys` (the number of entries in this page).
+
+The query accepts only the shared paging parameters: `after` (default `0`, a non-negative cursor counting qualifying keys already skipped) and `limit` (default `100`, range 1–100). `nextCursor` is the number of qualifying keys skipped after this page and `hasMore` tells whether more remain; when no key qualifies, `entries` is empty, and an `after` equal to the total returns an empty page with `hasMore` false. An `after` past the total, an unknown, repeated, blank, negative, or non-ASCII-decimal parameter, and a `limit` outside 1–100 return HTTP 400 with `{"error":"invalid_request"}`. A missing or extra path segment or a trailing slash (for example `/v1/metrics/conflicts/keys/`) returns HTTP 404 with `{"error":"not_found"}`, as does any non-GET method; route matching runs before query validation.
+
+The page, the cursor, and the summary are computed from one snapshot under the same commit lock used by local writes, sync-import batches, and repairs, so a page never observes half a batch or counts that disagree with its entries. The request is strictly read-only — it modifies neither memory, the data file, logs, nor audits. With `--data-file`, the recovered candidate state yields the same entries, order, counts, and pages after a restart as just before it.
+
 ### Replica-convergence verification digest
 
 `GET /v1/verification/digest` returns HTTP 200 with a UTF-8 JSON object containing exactly four fields:
