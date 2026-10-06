@@ -1460,6 +1460,46 @@ def parse_checkpoint_payload(raw: bytes | str | dict[str, Any]) -> int:
     return cursor
 
 
+def parse_conditional_checkpoint_payload(
+    raw: bytes | str | dict[str, Any],
+) -> tuple[int, int]:
+    """Parse and validate a conditional checkpoint body.
+
+    The body must be a JSON object whose only keys are ``expectedCursor``
+    and ``cursor``, each holding a non-negative integer (booleans are
+    rejected, as everywhere else), with ``expectedCursor`` not greater
+    than ``cursor``. Returns ``(expected_cursor, cursor)``. The bound of
+    ``cursor`` against the accepted-log length is checked by the store,
+    not here, because the cursor is only meaningful against a committed
+    snapshot. Raises ValueError on any violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    if isinstance(raw, str):
+        try:
+            payload: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or set(payload.keys()) != {
+        "expectedCursor",
+        "cursor",
+    }:
+        raise ValueError("body must be an object with only expectedCursor and cursor")
+    expected_cursor = payload["expectedCursor"]
+    cursor = payload["cursor"]
+    for value in (expected_cursor, cursor):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("expectedCursor and cursor must be non-negative integers")
+    if expected_cursor > cursor:
+        raise ValueError("expectedCursor must not exceed cursor")
+    return expected_cursor, cursor
+
+
 def parse_empty_object_payload(raw: bytes | str | dict[str, Any]) -> None:
     """Validate a request body that must be exactly the empty object.
 
@@ -9058,6 +9098,70 @@ class StateStore:
                 self._checkpoints[peer_id] = cursor
             return HTTPStatus.OK, None
 
+    def save_checkpoint_conditional(
+        self, peer_id: str, expected_cursor: int, cursor: int
+    ) -> tuple[HTTPStatus, str | None]:
+        """Persist ``cursor`` for ``peer_id`` only if the current cursor matches.
+
+        The compare-and-set companion of :meth:`save_checkpoint`: the
+        stored cursor moves to ``cursor`` only when the registered cursor
+        equals ``expected_cursor`` at commit time (or the peer is
+        unregistered and ``expected_cursor`` is 0, which performs the
+        first registration), so a concurrent coordinator or a retried
+        request holding a stale read can never overwrite newer progress.
+        Like a plain checkpoint this is not an operation: it never
+        touches the accepted log, the identity index, the candidate
+        state, sync export, the receipt chain, the per-key audit, or the
+        metrics counters, but it shares their commit lock, so the
+        comparison, the durable commit, and the visibility of the new
+        cursor are one indivisible step.
+
+        Returns ``(status, error)``: 200 with ``error=None`` for a first
+        registration, an equal-value replay (registered cursor equals
+        both ``expected_cursor`` and ``cursor`` — answered without a
+        durable rewrite), or an advance; 409 with
+        ``"checkpoint_conflict"`` when the registered cursor differs from
+        ``expected_cursor``, or when the peer is unregistered and
+        ``expected_cursor`` is not 0. Raises ValueError when ``cursor``
+        is past the accepted-log length of the validation snapshot;
+        raises PersistenceError when the durable commit fails, in which
+        case memory and the file are unchanged and the request can be
+        retried.
+        """
+        with self._lock:
+            # Validate against the same committed snapshot the write will
+            # use, so the cursor can never be committed past an unaccepted
+            # or not-yet-durable record.
+            if cursor > len(self._accepted):
+                raise ValueError("cursor is past the end of the accepted log")
+            current = self._checkpoints.get(peer_id)
+            if current is None:
+                if expected_cursor != 0:
+                    return HTTPStatus.CONFLICT, "checkpoint_conflict"
+            elif current != expected_cursor:
+                return HTTPStatus.CONFLICT, "checkpoint_conflict"
+            elif current == cursor:
+                # An equal-value replay is idempotent and needs no durable
+                # rewrite, so it succeeds even while persistence is faulty.
+                return HTTPStatus.OK, None
+            if self._data_file is not None:
+                # Same commit discipline as the unconditional checkpoint:
+                # stage the new mapping, make the atomic rename the single
+                # commit point, and move the visible state only after it
+                # succeeds.
+                self._checkpoints[peer_id] = cursor
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    if current is None:
+                        del self._checkpoints[peer_id]
+                    else:
+                        self._checkpoints[peer_id] = current
+                    raise
+            else:
+                self._checkpoints[peer_id] = cursor
+            return HTTPStatus.OK, None
+
     def acknowledge_operations(
         self, peer_id: str, ack_id: str, cursor: int, operations: list[dict[str, str]]
     ) -> tuple[HTTPStatus, str | None]:
@@ -12594,6 +12698,28 @@ class RequestHandler(BaseHTTPRequestHandler):
             return False, ""
         return True, unquote(parts[4])
 
+    def _conditional_checkpoint_route(self) -> tuple[bool, str]:
+        """Match ``/v1/sync/peers/{peerId}/checkpoint/conditional`` on the raw path.
+
+        Returns ``(matched, peer_id)``. As with :meth:`_checkpoint_route`,
+        the empty segment of ``/v1/sync/peers//checkpoint/conditional`` is
+        preserved so the shape still matches and yields an empty
+        ``peer_id``; the conditional contract treats an empty peer id
+        exactly like a shape failure (404), so the handler rejects it
+        before any query check. Any other segment count — missing
+        segments, extra segments such as ``.../conditional/extra``, or a
+        trailing slash — falls through to the generic 404.
+        """
+        parts = urlsplit(self.path).path.split("/")
+        if len(parts) != 7:
+            return False, ""
+        if parts[1:4] != ["v1", "sync", "peers"] or parts[5:7] != [
+            "checkpoint",
+            "conditional",
+        ]:
+            return False, ""
+        return True, unquote(parts[4])
+
     def _peer_operations_route(self) -> tuple[bool, str]:
         """Match ``/v1/sync/peers/{peerId}/operations`` on the raw path.
 
@@ -13201,6 +13327,53 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(status, {"error": error})
             return
         self._json(status, {"peerId": peer_id, "cursor": cursor})
+
+    def _handle_conditional_checkpoint_post(self, peer_id: str) -> None:
+        # Route-shape matching ran first in do_POST (missing/extra segments
+        # and trailing slashes never reach here); an empty peer id is a
+        # shape failure and stays 404 even when the query is malformed.
+        if peer_id == "":
+            self._json_canonical_newline(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        # The route accepts no query parameters; any parameter — repeated,
+        # blank-named, or blank-valued — is an invalid request.
+        if not parse_metrics_query(urlsplit(self.path).query):
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        raw = self._read_bounded_body()
+        if raw is None:
+            return
+        try:
+            expected_cursor, cursor = parse_conditional_checkpoint_payload(raw)
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        try:
+            status, error = self._store.save_checkpoint_conditional(
+                peer_id, expected_cursor, cursor
+            )
+        except ValueError:
+            self._json_canonical_newline(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        except PersistenceError:
+            self._json_canonical_newline(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
+            )
+            return
+        if status is HTTPStatus.CONFLICT:
+            self._json_canonical_newline(status, {"error": error})
+            return
+        # The contract fixes the response field order (peerId, then
+        # cursor) and a single trailing newline.
+        self._json_ordered_newline(status, {"peerId": peer_id, "cursor": cursor})
 
     def _handle_acknowledge_post(self, peer_id: str) -> None:
         # Route-shape matching ran first in do_POST (missing/extra segments
@@ -14850,6 +15023,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         matched, checkpoint_peer = self._checkpoint_route()
+        matched_conditional, conditional_peer = self._conditional_checkpoint_route()
         matched_ack, acknowledge_peer = self._acknowledge_route()
         segments = self._path_segments()
         is_operation_post = (
@@ -14987,6 +15161,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
         if (
             matched
+            or matched_conditional
             or matched_ack
             or is_operation_post
             or is_conditional_operation_post
@@ -15092,6 +15267,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if matched:
             self._handle_checkpoint_post(checkpoint_peer)
+            return
+        if matched_conditional:
+            self._handle_conditional_checkpoint_post(conditional_peer)
             return
         if matched_ack:
             self._handle_acknowledge_post(acknowledge_peer)
