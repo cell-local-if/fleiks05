@@ -65,7 +65,13 @@ class RequestLimitTests(unittest.TestCase):
         conn.putrequest("POST", path)
         for name, value in headers:
             conn.putheader(name, value)
-        conn.endheaders(body if body else None)
+        try:
+            conn.endheaders(body if body else None)
+        except (BrokenPipeError, ConnectionResetError):
+            # An over-limit declaration is rejected before the body is
+            # read, so the server may answer and close while a large body
+            # is still being sent; the response is still readable.
+            pass
         response = conn.getresponse()
         payload = json.loads(response.read().decode("utf-8"))
         conn.close()
