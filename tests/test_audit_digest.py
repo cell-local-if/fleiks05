@@ -688,6 +688,7 @@ class PersistentDigestHttpServerTests(unittest.TestCase):
             )
         response = conn.getresponse()
         raw = response.read()
+        self.last_headers = dict(response.getheaders())
         payload = json.loads(raw.decode("utf-8")) if raw else None
         conn.close()
         return response.status, payload
@@ -821,8 +822,9 @@ class PersistentDigestHttpServerTests(unittest.TestCase):
                 "/v1/replicas/r1/operations",
                 operation("o1", "k", "v1", {"r1": 1}),
             )
-            self.assertEqual(status, 500)
-            self.assertEqual(payload, {"error": "internal_error"})
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_headers.get("Retry-After"), "1")
             status, payload = self.request(
                 server,
                 "POST",

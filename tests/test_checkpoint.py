@@ -354,6 +354,7 @@ class HttpCheckpointTests(unittest.TestCase):
             )
         response = conn.getresponse()
         raw = response.read()
+        self.last_headers = dict(response.getheaders())
         payload = json.loads(raw.decode("utf-8")) if raw else None
         conn.close()
         return response.status, payload
@@ -524,6 +525,7 @@ class PersistentCheckpointHttpTests(unittest.TestCase):
             )
         response = conn.getresponse()
         raw = response.read()
+        self.last_headers = dict(response.getheaders())
         payload = json.loads(raw.decode("utf-8")) if raw else None
         conn.close()
         return response.status, payload
@@ -540,7 +542,7 @@ class PersistentCheckpointHttpTests(unittest.TestCase):
         leftovers = [p.name for p in self.tmp.iterdir() if p.name != self.data_file.name]
         self.assertEqual(leftovers, [])
 
-    def test_persistence_failure_is_500_retryable_and_leaves_everything(self) -> None:
+    def test_persistence_failure_is_503_retryable_and_leaves_everything(self) -> None:
         server = self.start_server()
         # Seed a checkpoint and an operation so both register and advance
         # failure paths are observable.
@@ -562,13 +564,15 @@ class PersistentCheckpointHttpTests(unittest.TestCase):
             status, payload = self.request(
                 server, "POST", "/v1/sync/peers/p1/checkpoint", {"cursor": 1}
             )
-            self.assertEqual(status, 500)
-            self.assertEqual(payload, {"error": "internal_error"})
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_headers.get("Retry-After"), "1")
             status, payload = self.request(
                 server, "POST", "/v1/sync/peers/p2/checkpoint", {"cursor": 0}
             )
-            self.assertEqual(status, 500)
-            self.assertEqual(payload, {"error": "internal_error"})
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_headers.get("Retry-After"), "1")
             # A replay needs no write and still succeeds under the fault.
             status, payload = self.request(
                 server, "POST", "/v1/sync/peers/p1/checkpoint", {"cursor": 0}

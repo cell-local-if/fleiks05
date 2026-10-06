@@ -779,6 +779,7 @@ class PersistentAcknowledgeHttpTests(unittest.TestCase):
             )
         response = conn.getresponse()
         raw = response.read()
+        self.last_headers = dict(response.getheaders())
         payload = json.loads(raw.decode("utf-8")) if raw else None
         conn.close()
         return response.status, payload
@@ -821,7 +822,7 @@ class PersistentAcknowledgeHttpTests(unittest.TestCase):
         leftovers = [p.name for p in self.tmp.iterdir() if p.name != self.data_file.name]
         self.assertEqual(leftovers, [])
 
-    def test_persistence_failure_is_500_retryable_and_leaves_everything(self) -> None:
+    def test_persistence_failure_is_503_retryable_and_leaves_everything(self) -> None:
         server = self.start_server()
         pairs = self.seed(server)
         before = self.data_file.read_bytes()
@@ -835,8 +836,9 @@ class PersistentAcknowledgeHttpTests(unittest.TestCase):
                 "/v1/sync/peers/p1/acknowledge",
                 {"ackId": "a1", "cursor": 2, "operations": pairs},
             )
-            self.assertEqual(status, 500)
-            self.assertEqual(payload, {"error": "internal_error"})
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_headers.get("Retry-After"), "1")
 
         # File and visible memory are exactly the pre-failure state.
         self.assertEqual(self.data_file.read_bytes(), before)

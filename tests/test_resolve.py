@@ -150,6 +150,7 @@ class HttpServerTestCase(unittest.TestCase):
             )
         response = conn.getresponse()
         raw = response.read()
+        self.last_headers = dict(response.getheaders())
         payload = json.loads(raw.decode("utf-8")) if raw else None
         conn.close()
         return response.status, payload
@@ -491,6 +492,7 @@ class PersistentResolveTestCase(unittest.TestCase):
             )
         response = conn.getresponse()
         raw = response.read()
+        self.last_headers = dict(response.getheaders())
         payload = json.loads(raw.decode("utf-8")) if raw else None
         conn.close()
         return response.status, payload
@@ -545,7 +547,7 @@ class PersistentResolveTestCase(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(payload, {"error": "operation_conflict"})
 
-    def test_persistence_failure_is_500_and_changes_nothing(self) -> None:
+    def test_persistence_failure_is_503_and_changes_nothing(self) -> None:
         server = self.start_server()
         self.seed_conflict(server)
         before = self.data_file.read_bytes()
@@ -556,8 +558,9 @@ class PersistentResolveTestCase(unittest.TestCase):
             status, payload = self.request(
                 server, "POST", "/v1/states/k/resolve", self.good_resolution()
             )
-            self.assertEqual(status, 500)
-            self.assertEqual(payload, {"error": "internal_error"})
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_headers.get("Retry-After"), "1")
 
         # Memory, identity index, and file are exactly as before.
         self.assertEqual(self.data_file.read_bytes(), before)

@@ -564,7 +564,7 @@ class PreflightServerTests(TempDirTestCase):
         with self.assertRaises(OSError):
             self.request_once(port)
 
-    def test_runtime_persistence_failure_is_500_and_recoverable(self) -> None:
+    def test_runtime_persistence_failure_is_503_and_recoverable(self) -> None:
         server = SemanticStateServer(
             ("127.0.0.1", 0), RequestHandler, data_file=str(self.data_file)
         )
@@ -573,7 +573,7 @@ class PreflightServerTests(TempDirTestCase):
         self.addCleanup(server.shutdown)
         self.addCleanup(server.server_close)
 
-        def http_post(replica: str, body: dict) -> int:
+        def http_post(replica: str, body: dict) -> tuple[int, dict, str | None]:
             conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
             conn.request(
                 "POST",
@@ -582,7 +582,9 @@ class PreflightServerTests(TempDirTestCase):
                 headers={"Content-Type": "application/json"},
             )
             try:
-                return conn.getresponse().status
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                return response.status, payload, response.getheader("Retry-After")
             finally:
                 conn.close()
 
@@ -598,9 +600,10 @@ class PreflightServerTests(TempDirTestCase):
         with patch.object(
             StateStore, "_persist_locked", side_effect=PersistenceError("disk unavailable")
         ):
-            self.assertEqual(
-                http_post("r1", operation("o1", "k", "v", {"r1": 1})), 500
-            )
+            status, payload, retry_after = http_post("r1", operation("o1", "k", "v", {"r1": 1}))
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(retry_after, "1")
         # Pre-request state is preserved in memory and in the data file.
         status, _ = http_get("/v1/states/k")
         self.assertEqual(status, 404)
@@ -608,7 +611,8 @@ class PreflightServerTests(TempDirTestCase):
         status, _ = reloaded.get_state("k")
         self.assertIs(status, HTTPStatus.NOT_FOUND)
         # The same request succeeds once persistence works again.
-        self.assertEqual(http_post("r1", operation("o1", "k", "v", {"r1": 1})), 201)
+        status, _, _ = http_post("r1", operation("o1", "k", "v", {"r1": 1}))
+        self.assertEqual(status, 201)
         status, _ = http_get("/v1/states/k")
         self.assertEqual(status, 200)
 
