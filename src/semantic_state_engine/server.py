@@ -28,8 +28,9 @@ MAX_CLOCK_COMPONENTS_LIMIT = 1024
 # option existed. When set, every clock participating in a causal
 # decision — request operation clocks, manual and automatic resolution
 # clocks, transaction and compensation entry clocks, sync-import and
-# remote-snapshot clocks, causal-at boundary clocks, and every clock
-# recovered from the data file — may hold at most this many components.
+# remote-snapshot clocks, causal-at boundary clocks, causal-conditional
+# expected clocks, and every clock recovered from the data file — may
+# hold at most this many components.
 _MAX_CLOCK_COMPONENTS: int | None = None
 
 
@@ -193,6 +194,73 @@ def parse_conditional_operation_payload(
         )
 
     return operation, expected
+
+
+def parse_causal_conditional_operation_payload(
+    raw: bytes | str | dict[str, Any], replica_id: str
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Parse and validate a causal-conditional write payload for ``replica_id``.
+
+    The body must be a JSON object with exactly ``operationId``, ``key``,
+    ``value``, ``clock``, and ``expectedClock``; a duplicated key anywhere
+    in the document raises ValueError. The first four follow the ordinary
+    write constraints (see :func:`parse_operation_payload`).
+    ``expectedClock`` is the caller-observed causal boundary: a boundary
+    vector clock (see :func:`_validate_boundary_clock`), so it may be
+    empty (the causal origin) and is not required to contain
+    ``replica_id``. The operation clock must strictly dominate the
+    expected clock — every component no smaller and at least one larger.
+    Returns the normalized operation dict — the same shape an ordinary
+    write commits, so identity replays match across all three write entry
+    points — and the normalized expected clock. Raises ValueError on any
+    violation.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("body must be UTF-8 JSON") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        # Already-decoded mappings come from store-level callers, which
+        # bypass JSON and therefore the duplicate-key hook.
+        text = None
+
+    if text is not None:
+
+        def reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+            document: dict[Any, Any] = {}
+            for key, value in pairs:
+                if key in document:
+                    raise ValueError("duplicate field in body")
+                document[key] = value
+            return document
+
+        try:
+            payload: Any = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError("body must be valid JSON") from exc
+    else:
+        payload = raw
+    if not isinstance(payload, dict) or set(payload.keys()) != {
+        "operationId",
+        "key",
+        "value",
+        "clock",
+        "expectedClock",
+    }:
+        raise ValueError(
+            "payload must be an object with only operationId, key, value, "
+            "clock, expectedClock"
+        )
+
+    operation = parse_operation_payload(payload, replica_id)
+    expected_clock = _validate_boundary_clock(payload["expectedClock"])
+    if not clock_dominates(operation["clock"], expected_clock):
+        raise ValueError("clock must strictly dominate expectedClock")
+
+    return operation, expected_clock
 
 
 def parse_resolve_payload(raw: bytes | str | dict[str, Any]) -> dict[str, Any]:
@@ -6449,6 +6517,70 @@ class StateStore:
             }
             if current_identities != expected_identities:
                 return HTTPStatus.CONFLICT, "state_conflict"
+
+            next_candidates = self._next_candidates(current, replica_id, operation)
+            if self._data_file is not None:
+                # Same commit discipline as ordinary writes: the atomic
+                # rename is the single commit point, and memory moves only
+                # after it.
+                self._accepted.append((replica_id, operation))
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    self._accepted.pop()
+                    raise
+            else:
+                self._accepted.append((replica_id, operation))
+            self._operations[identity] = operation
+            self._candidates[operation["key"]] = next_candidates
+            return HTTPStatus.CREATED, None
+
+    def apply_causal_conditional_operation(
+        self,
+        replica_id: str,
+        operation: dict[str, Any],
+        expected_clock: dict[str, int],
+    ) -> tuple[HTTPStatus, str | None]:
+        """Apply a validated causal-conditional write, returning status and error.
+
+        The expected clock constrains only the first commit. Under the
+        same commit lock the ordinary idempotence rules run first: a known
+        identity with identical content is a replay (200) however the
+        candidate set has moved since and whatever boundary the request
+        expects, and a known identity with different content is an
+        operation conflict (409 ``"operation_conflict"``). Only an unseen
+        identity is checked against the key's current candidates: every
+        candidate clock must be covered by ``expected_clock`` —
+        componentwise no greater, missing components counting as 0. A
+        candidate the boundary does not cover is 409 ``"state_conflict"``
+        and commits nothing — no operation, candidate, audit, receipt,
+        checkpoint, or data-file content changes. A covered set commits
+        exactly like an ordinary write: first-accepted operations are
+        persisted (when configured) before the in-memory commit becomes
+        visible, and a durable failure leaves memory, the identity index,
+        and the file unchanged.
+
+        Returns ``(status, error)``: 201/200 with ``error=None`` on
+        commit/replay, or 409 with ``"operation_conflict"`` or
+        ``"state_conflict"``. Raises PersistenceError when the durable
+        commit fails.
+        """
+        with self._lock:
+            identity = (replica_id, operation["operationId"])
+            seen = self._operations.get(identity)
+            if seen is not None:
+                if seen == operation:
+                    return HTTPStatus.OK, None
+                return HTTPStatus.CONFLICT, "operation_conflict"
+
+            current = self._candidates.get(operation["key"], [])
+            for candidate in current:
+                candidate_clock = candidate["clock"]
+                if any(
+                    tick > expected_clock.get(component, 0)
+                    for component, tick in candidate_clock.items()
+                ):
+                    return HTTPStatus.CONFLICT, "state_conflict"
 
             next_candidates = self._next_candidates(current, replica_id, operation)
             if self._data_file is not None:
@@ -14730,6 +14862,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             and segments[3] == "operations"
             and segments[4] == "conditional"
         )
+        is_causal_conditional_operation_post = (
+            len(segments) == 5
+            and segments[0] == "v1"
+            and segments[1] == "replicas"
+            and segments[3] == "operations"
+            and segments[4] == "causal-conditional"
+        )
         is_resolve_post = (
             len(segments) == 4
             and segments[0] == "v1"
@@ -14855,6 +14994,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             or matched_ack
             or is_operation_post
             or is_conditional_operation_post
+            or is_causal_conditional_operation_post
             or is_resolve_post
             or is_auto_resolve_post
             or is_sync_post
@@ -15006,6 +15146,45 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 status, error = self._store.apply_conditional_operation(
                     replica_id, operation, expected_candidates
+                )
+            except PersistenceError:
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "persistence_unavailable"},
+                    _PERSISTENCE_UNAVAILABLE_HEADERS,
+                )
+                return
+            if status is HTTPStatus.CONFLICT:
+                self._json(status, {"error": error})
+                return
+            payload = {
+                "status": "ok" if status is HTTPStatus.OK else "created",
+                "replicaId": replica_id,
+                "operationId": operation["operationId"],
+                "key": operation["key"],
+            }
+            self._json(status, payload)
+            return
+        if is_causal_conditional_operation_post:
+            replica_id = segments[2]
+            # The route accepts no query parameters, and that check
+            # precedes the body check.
+            if not parse_metrics_query(urlsplit(self.path).query):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            raw = self._read_bounded_body()
+            if raw is None:
+                return
+            try:
+                operation, expected_clock = parse_causal_conditional_operation_payload(
+                    raw, replica_id
+                )
+            except ValueError:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            try:
+                status, error = self._store.apply_causal_conditional_operation(
+                    replica_id, operation, expected_clock
                 )
             except PersistenceError:
                 self._json(
