@@ -438,6 +438,7 @@ class PersistentSyncTestCase(unittest.TestCase):
         response = conn.getresponse()
         raw = response.read()
         payload = json.loads(raw.decode("utf-8")) if raw else None
+        self.last_retry_after = response.getheader("Retry-After")
         conn.close()
         return response.status, payload
 
@@ -469,7 +470,7 @@ class PersistentSyncTestCase(unittest.TestCase):
         leftovers = [p.name for p in self.tmp.iterdir() if p.name != self.data_file.name]
         self.assertEqual(leftovers, [])
 
-    def test_persistence_failure_is_500_and_changes_nothing(self) -> None:
+    def test_persistence_failure_is_503_and_changes_nothing(self) -> None:
         server = self.start_server()
         # Seed one durable operation so replay-under-failure is observable.
         seed = record("r0", operation("o0", "k", "v0", {"r0": 1}))
@@ -486,8 +487,9 @@ class PersistentSyncTestCase(unittest.TestCase):
                 ]
             }
             status, payload = self.request(server, "POST", "/v1/sync/operations", batch)
-            self.assertEqual(status, 500)
-            self.assertEqual(payload, {"error": "internal_error"})
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_retry_after, "1")
             # A pure replay needs no durable write and still succeeds.
             status, payload = self.request(
                 server, "POST", "/v1/sync/operations", {"operations": [seed]}

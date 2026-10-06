@@ -37,8 +37,10 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from semantic_state_engine.server import (
+    PersistenceError,
     RequestHandler,
     SemanticStateServer,
     StateStore,
@@ -906,6 +908,115 @@ class RepairApplyHttpTests(RepairHttpFixture):
         )
         self.assertEqual(status, 400)
         self.assertEqual(payload, {"error": "invalid_request"})
+
+
+class RepairApplyHttpPersistenceTests(unittest.TestCase):
+    """The apply endpoint's durable-failure contract over real HTTP."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.data_file = self.tmp / "state.json"
+        self.server = SemanticStateServer(
+            ("127.0.0.1", 0), RequestHandler, data_file=str(self.data_file)
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+
+    def request(self, method, path, body=None):
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=5
+        )
+        if body is None:
+            conn.request(method, path)
+        else:
+            conn.request(
+                method,
+                path,
+                body=json.dumps(body),
+                headers={"Content-Type": "application/json"},
+            )
+        response = conn.getresponse()
+        raw = response.read()
+        retry_after = response.getheader("Retry-After")
+        conn.close()
+        payload = json.loads(raw.decode("utf-8")) if raw else None
+        return response.status, payload, retry_after
+
+    def test_persistence_failure_is_503_retryable_and_changes_nothing(self) -> None:
+        for index in range(4):
+            status, _, _ = self.request(
+                "POST",
+                f"/v1/replicas/r{index}/operations",
+                operation(f"o{index}", "k", f"v{index}", {f"r{index}": 1}),
+            )
+            self.assertEqual(status, 201)
+        status, _, _ = self.request(
+            "POST", "/v1/sync/peers/peer-a/checkpoint", {"cursor": 4}
+        )
+        self.assertEqual(status, 200)
+        self.server.store._acks[("peer-a", "ack-1")] = {
+            "cursor": 1,
+            "operations": [identity("r0", "o0")],
+        }
+        self.server.store._acks[("peer-a", "ack-2")] = {
+            "cursor": 3,
+            "operations": [identity("r2", "o2")],
+        }
+        status, repairs, _ = self.request(
+            "GET", "/v1/replication/repairs?after=0&limit=100"
+        )
+        self.assertEqual(status, 200)
+        item = [s for s in repairs["suggestions"] if s["peer"] == "peer-a"][0]
+        suggestion = {
+            "action": item["action"],
+            "ackId": item["ackId"],
+            "location": item["location"],
+            "target": item["target"],
+        }
+        if item["action"] == "correct_identity":
+            suggestion["expected"] = item["expected"]
+            suggestion["observed"] = item["observed"]
+        status, receipts, _ = self.request(
+            "GET", "/v1/sync/peers/peer-a/receipts?after=0&limit=100"
+        )
+        self.assertEqual(status, 200)
+        document = {
+            "peerId": "peer-a",
+            "ackId": "exec-1",
+            "expectedCheckpoint": 4,
+            "expectedReceipts": receipts["digest"],
+            "suggestions": [suggestion],
+        }
+        before = self.data_file.read_bytes()
+
+        with patch.object(
+            StateStore, "_persist_locked", side_effect=PersistenceError("disk gone")
+        ):
+            status, payload, retry_after = self.request(
+                "POST", APPLY_PATH, document
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(retry_after, "1")
+
+        # File, checkpoint, and repair bindings are exactly as before.
+        self.assertEqual(self.data_file.read_bytes(), before)
+        self.assertNotIn(("peer-a", "exec-1"), self.server.store._repairs)
+        status, checkpoint, _ = self.request("GET", "/v1/sync/peers/peer-a/checkpoint")
+        self.assertEqual(checkpoint, {"peerId": "peer-a", "cursor": 4})
+        leftovers = [p.name for p in self.tmp.iterdir() if p.name != self.data_file.name]
+        self.assertEqual(leftovers, [])
+        # The same execution commits cleanly once persistence is back.
+        status, payload, _ = self.request("POST", APPLY_PATH, document)
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["status"], "created")
+        status, payload, _ = self.request("POST", APPLY_PATH, document)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "ok")
 
 
 class RepairRequestLimitsTests(RepairHttpFixture):

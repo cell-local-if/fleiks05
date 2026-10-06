@@ -12,10 +12,13 @@ import http.client
 import json
 import threading
 import unittest
+from unittest.mock import patch
 
 from semantic_state_engine.server import (
+    PersistenceError,
     RequestHandler,
     SemanticStateServer,
+    StateStore,
     parse_conditional_operation_payload,
 )
 
@@ -457,6 +460,7 @@ class ConditionalOperationPersistenceTests(unittest.TestCase):
             )
         response = conn.getresponse()
         payload = json.loads(response.read().decode("utf-8"))
+        self.last_retry_after = response.getheader("Retry-After")
         conn.close()
         return response.status, payload
 
@@ -537,6 +541,74 @@ class ConditionalOperationPersistenceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         with open(self.data_file, "rb") as handle:
             self.assertEqual(handle.read(), committed)
+
+    def test_persistence_failure_is_503_retryable_and_changes_nothing(self) -> None:
+        server = self.start_server()
+        status, _ = self.request(
+            server,
+            "POST",
+            "/v1/replicas/r1/operations/conditional",
+            conditional_body("op-1", "color", "blue", {"r1": 1}, []),
+        )
+        self.assertEqual(status, 201)
+        with open(self.data_file, "rb") as handle:
+            committed = handle.read()
+
+        with patch.object(
+            StateStore, "_persist_locked", side_effect=PersistenceError("disk gone")
+        ):
+            status, payload = self.request(
+                server,
+                "POST",
+                "/v1/replicas/r2/operations/conditional",
+                conditional_body(
+                    "op-2",
+                    "color",
+                    "red",
+                    {"r2": 1},
+                    [{"replicaId": "r1", "operationId": "op-1"}],
+                ),
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_retry_after, "1")
+            # Replays and conflicts need no durable write and keep their
+            # usual results under the fault.
+            status, _ = self.request(
+                server,
+                "POST",
+                "/v1/replicas/r1/operations/conditional",
+                conditional_body("op-1", "color", "blue", {"r1": 1}, []),
+            )
+            self.assertEqual(status, 200)
+            status, payload = self.request(
+                server,
+                "POST",
+                "/v1/replicas/r1/operations/conditional",
+                conditional_body("op-1", "color", "tampered", {"r1": 1}, []),
+            )
+            self.assertEqual(status, 409)
+            self.assertEqual(payload, {"error": "operation_conflict"})
+
+        # The failed commit left no trace in memory or on disk.
+        with open(self.data_file, "rb") as handle:
+            self.assertEqual(handle.read(), committed)
+        status, state = self.request(server, "GET", "/v1/states/color")
+        self.assertEqual(state["value"], "blue")
+        # The same write commits cleanly once persistence is back.
+        status, _ = self.request(
+            server,
+            "POST",
+            "/v1/replicas/r2/operations/conditional",
+            conditional_body(
+                "op-2",
+                "color",
+                "red",
+                {"r2": 1},
+                [{"replicaId": "r1", "operationId": "op-1"}],
+            ),
+        )
+        self.assertEqual(status, 201)
 
 
 if __name__ == "__main__":

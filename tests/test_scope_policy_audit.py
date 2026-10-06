@@ -5,7 +5,7 @@ scope-policy hot reloads. The tests cover the request precedence chain
 (404 path shape, 401 authentication with a Bearer challenge, 403 without
 one, the scope-policy-only mode gate, 400 query validation), the paging
 contract, the full-history SHA-256 digest, atomic commit of a reload
-together with its event (a durable failure is 500 and keeps the old
+together with its event (a durable failure is 503 and keeps the old
 policy and history), ``--data-file`` persistence and recovery, and the
 read-only/no-temp-file guarantees.
 """
@@ -528,17 +528,18 @@ class ScopePolicyAuditHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.server.store._policy_events, [])
 
-    def test_durable_reload_failure_is_500_and_keeps_old_policy_and_history(self) -> None:
+    def test_durable_reload_failure_is_503_and_keeps_old_policy_and_history(self) -> None:
         self.reload(b'{"keep":["admin"]}')
         self.write_policy(b'{"keep":["admin"],"next":["read"]}')
         with patch.object(
             StateStore, "_persist_locked", side_effect=PersistenceError("disk gone")
         ):
-            status, payload, _, _ = self.request(
+            status, payload, _, headers = self.request(
                 "POST", RELOAD_PATH, token="keep", body={}
             )
-        self.assertEqual(status, 500)
-        self.assertEqual(payload, {"error": "internal_error"})
+        self.assertEqual(status, 503)
+        self.assertEqual(payload, {"error": "persistence_unavailable"})
+        self.assertEqual(headers.get("Retry-After"), "1")
         # The old policy stays in force: the new token is unknown, the old
         # one still reads, and the history did not gain the failed event.
         self.assertEqual(self.audit("?after=0&limit=100", token="next")[0], 401)

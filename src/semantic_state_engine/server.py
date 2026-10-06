@@ -11599,7 +11599,7 @@ class StateStore:
         atomic commit protocol as business state *before* it becomes
         visible: a durable failure raises PersistenceError and leaves
         the in-memory history exactly as it was, so a caller can answer
-        HTTP 500 while both the old policy and the old history stay in
+        HTTP 503 while both the old policy and the old history stay in
         force. Returns the committed event.
         """
         with self._lock:
@@ -12286,6 +12286,12 @@ class SemanticStateServer(ThreadingHTTPServer):
 
 
 _FALLBACK_STORE = StateStore()
+
+# The durable-commit failure contract shared by every endpoint that adds
+# persistent state: HTTP 503 with a fixed ``persistence_unavailable`` body
+# and a one-second retry hint. The body never carries the path, the
+# underlying OS error, or any credential detail.
+_PERSISTENCE_UNAVAILABLE_HEADERS = {"Retry-After": "1"}
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -13050,7 +13056,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         except PersistenceError:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
+            )
             return
         if status is HTTPStatus.CONFLICT:
             self._json(status, {"error": error})
@@ -13087,7 +13097,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
         except PersistenceError:
             self._json_canonical_newline(
-                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
             )
             return
         if status is HTTPStatus.NOT_FOUND:
@@ -13264,7 +13276,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         status, payload = self._store.get_state_explanation(key)
         self._json_newline(status, payload)
 
-    def _json_canonical_newline(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+    def _json_canonical_newline(self, status: HTTPStatus, payload: dict[str, Any], extra_headers: dict[str, str] | None = None) -> None:
         """Respond with canonical compact JSON terminated by one newline.
 
         The body is serialized by :func:`_canonical_json_bytes`: sorted
@@ -13277,10 +13289,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def _json_ordered_newline(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+    def _json_ordered_newline(self, status: HTTPStatus, payload: dict[str, Any], extra_headers: dict[str, str] | None = None) -> None:
         """Respond with compact JSON in the payload's field order, newline-terminated.
 
         The body is serialized by :func:`_ordered_json_bytes`: object fields
@@ -13292,6 +13306,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -13646,7 +13662,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         except PersistenceError:
             self._json_canonical_newline(
-                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
             )
             return
         if status is HTTPStatus.CONFLICT:
@@ -13733,7 +13751,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
         except PersistenceError:
             self._json_ordered_newline(
-                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"}
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
             )
             return
         if status is HTTPStatus.CONFLICT:
@@ -14176,7 +14196,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             status, accepted, replayed = self._store.import_operations(records)
         except PersistenceError:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
+            )
             return
         if status is HTTPStatus.CONFLICT:
             self._json(status, {"error": "operation_conflict"})
@@ -14205,7 +14229,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         except PersistenceError:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
+            )
             return
         if status is HTTPStatus.CONFLICT:
             self._json(status, {"error": error})
@@ -14235,7 +14263,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         except PersistenceError:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
+            )
             return
         if status is HTTPStatus.CONFLICT:
             self._json(status, {"error": error})
@@ -14266,7 +14298,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 entries
             )
         except PersistenceError:
-            self._json_newline(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            self._json_newline(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
+            )
             return
         if status is HTTPStatus.CONFLICT:
             self._json_newline(status, {"error": error})
@@ -14343,7 +14379,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         except PersistenceError:
-            self._json_newline(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            self._json_newline(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
+            )
             return
         if status is HTTPStatus.CONFLICT:
             self._json_newline(status, {"error": error})
@@ -14427,7 +14467,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json_newline(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         except PersistenceError:
-            self._json_newline(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            self._json_newline(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
+            )
             return
         if status in (HTTPStatus.CONFLICT, HTTPStatus.NOT_FOUND):
             self._json_newline(status, {"error": error})
@@ -14479,7 +14523,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.CONFLICT, {"error": "policy_conflict"})
             return
         except PersistenceError:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "persistence_unavailable"},
+                _PERSISTENCE_UNAVAILABLE_HEADERS,
+            )
             return
         # Field order is part of the contract: status, policyDigest, tokens.
         self._json_ordered(
@@ -14926,7 +14974,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 status = self._store.apply_operation(replica_id, operation)
             except PersistenceError:
-                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "persistence_unavailable"},
+                    _PERSISTENCE_UNAVAILABLE_HEADERS,
+                )
                 return
             if status is HTTPStatus.CONFLICT:
                 self._json(status, {"error": "operation_conflict"})
@@ -14956,7 +15008,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     replica_id, operation, expected_candidates
                 )
             except PersistenceError:
-                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "persistence_unavailable"},
+                    _PERSISTENCE_UNAVAILABLE_HEADERS,
+                )
                 return
             if status is HTTPStatus.CONFLICT:
                 self._json(status, {"error": error})

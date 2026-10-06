@@ -868,6 +868,7 @@ class PersistentTransactionTestCase(unittest.TestCase):
         response = conn.getresponse()
         raw = response.read()
         payload = json.loads(raw.decode("utf-8")) if raw else None
+        self.last_retry_after = response.getheader("Retry-After")
         conn.close()
         return response.status, payload
 
@@ -965,7 +966,7 @@ class PersistentTransactionTestCase(unittest.TestCase):
         status, _ = self.request(server, "POST", APPLY_PATH, changed)
         self.assertEqual(status, 409)
 
-    def test_persistence_failure_is_500_and_changes_nothing(self) -> None:
+    def test_persistence_failure_is_503_and_changes_nothing(self) -> None:
         server = self.start_server()
         self.seed_key(server, "k1", "r1", "o1")
         before = self.data_file.read_bytes()
@@ -977,8 +978,9 @@ class PersistentTransactionTestCase(unittest.TestCase):
             StateStore, "_persist_locked", side_effect=server_module.PersistenceError("disk gone")
         ):
             status, payload = self.request(server, "POST", APPLY_PATH, doc)
-            self.assertEqual(status, 500)
-            self.assertEqual(payload, {"error": "internal_error"})
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_retry_after, "1")
 
         # File, memory, identity index, and bindings are exactly as before.
         self.assertEqual(self.data_file.read_bytes(), before)

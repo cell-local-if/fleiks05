@@ -41,6 +41,7 @@ import threading
 import unittest
 from http import HTTPStatus
 from pathlib import Path
+from unittest.mock import patch
 
 from semantic_state_engine.server import (
     MAX_BODY_BYTES,
@@ -984,6 +985,7 @@ class ApplyHttpPersistenceTests(unittest.TestCase):
         response = conn.getresponse()
         raw = response.read()
         payload = json.loads(raw.decode("utf-8")) if raw else None
+        self.last_retry_after = response.getheader("Retry-After")
         conn.close()
         return response.status, payload
 
@@ -1024,6 +1026,38 @@ class ApplyHttpPersistenceTests(unittest.TestCase):
         self.assertEqual(payload, {"error": "apply_conflict"})
         self.assertEqual(Path(self.data_file).read_bytes(), before_bytes)
         self.assertEqual(set(os.listdir(self._tmp.name)), before_entries)
+
+    def test_persistence_failure_is_503_retryable_and_changes_nothing(self) -> None:
+        server = self.start_server()
+        self.request(
+            server, "POST", "/v1/replicas/r1/operations",
+            operation("o1", "k", "a", {"r1": 1}),
+        )
+        _, digest_payload = self.request(server, "GET", "/v1/verification/digest")
+        document = {
+            "replicaId": "remote",
+            "expectedLocalDigest": digest_payload["digest"],
+            "snapshot": {"k": [candidate("r2", "o2", "b", {"r2": 1})]},
+            "actions": [fetch_action("k", "r2", "o2", "b", {"r2": 1})],
+        }
+        before_bytes = Path(self.data_file).read_bytes()
+
+        with patch.object(
+            StateStore, "_persist_locked", side_effect=PersistenceError("disk gone")
+        ):
+            status, payload = self.request(server, "POST", APPLY_PATH, document)
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_retry_after, "1")
+
+        # File and visible memory are exactly the pre-failure state.
+        self.assertEqual(Path(self.data_file).read_bytes(), before_bytes)
+        status, state = self.request(server, "GET", "/v1/states/k")
+        self.assertEqual(state["value"], "a")
+        # The same batch commits cleanly once persistence is back.
+        status, payload = self.request(server, "POST", APPLY_PATH, document)
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["accepted"], 1)
 
 
 if __name__ == "__main__":

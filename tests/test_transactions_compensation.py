@@ -22,11 +22,14 @@ import threading
 import unittest
 from http import HTTPStatus
 from pathlib import Path
+from unittest.mock import patch
 
 from semantic_state_engine.server import (
     MAX_BODY_BYTES,
+    PersistenceError,
     RequestHandler,
     SemanticStateServer,
+    StateStore,
     load_data_file,
     load_data_file_compensations,
     load_data_file_transactions,
@@ -747,6 +750,7 @@ class PersistentCompensationTestCase(unittest.TestCase):
         response = conn.getresponse()
         raw = response.read()
         payload = json.loads(raw.decode("utf-8")) if raw else None
+        self.last_retry_after = response.getheader("Retry-After")
         conn.close()
         return response.status, payload
 
@@ -831,6 +835,36 @@ class PersistentCompensationTestCase(unittest.TestCase):
             compensate_document("c-1", digest, operations),
         )
         self.assertEqual(status, 201)
+
+    def test_persistence_failure_is_503_retryable_and_changes_nothing(self) -> None:
+        server = self.start_server()
+        plan = self.seed_and_commit(server)
+        digest = plan["expectedPlanDigest"]
+        operations = [item["operation"] for item in plan["keys"]]
+        doc = compensate_document("c-1", digest, operations)
+        before = self.data_file.read_bytes()
+
+        with patch.object(
+            StateStore, "_persist_locked", side_effect=PersistenceError("disk gone")
+        ):
+            status, payload = self.request(
+                server, "POST", "/v1/transactions/tx-1/compensate", doc
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_retry_after, "1")
+
+        # File, memory, and bindings are exactly the pre-failure state.
+        self.assertEqual(self.data_file.read_bytes(), before)
+        self.assertEqual(load_data_file_compensations(str(self.data_file)), {})
+        status, state = self.request(server, "GET", "/v1/states/k1")
+        self.assertEqual(state["value"], "n1")
+        # The failed compensation commits cleanly once persistence is back.
+        status, payload = self.request(
+            server, "POST", "/v1/transactions/tx-1/compensate", doc
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(list(load_data_file_compensations(str(self.data_file))), ["c-1"])
 
     def test_old_data_file_without_compensations_section_recovers(self) -> None:
         # A version:1 file written before compensations existed has no

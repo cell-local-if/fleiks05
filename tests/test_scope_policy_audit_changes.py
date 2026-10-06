@@ -729,11 +729,12 @@ class ScopePolicyChangesHttpTests(unittest.TestCase):
         with patch.object(
             StateStore, "_persist_locked", side_effect=PersistenceError("disk gone")
         ):
-            status, payload, _, _ = self.request(
+            status, payload, _, headers = self.request(
                 "POST", RELOAD_PATH, token="keep", body={}
             )
-        self.assertEqual(status, 500)
-        self.assertEqual(payload, {"error": "internal_error"})
+        self.assertEqual(status, 503)
+        self.assertEqual(payload, {"error": "persistence_unavailable"})
+        self.assertEqual(headers.get("Retry-After"), "1")
         self.assertEqual(self.changes("?after=0&limit=100", token="next")[0], 401)
         status, _, _, _ = self.request("GET", METRICS_PATH, token="keep")
         self.assertEqual(status, 200)

@@ -1046,6 +1046,7 @@ class PersistentBatchTestCase(unittest.TestCase):
         response = conn.getresponse()
         raw = response.read()
         payload = json.loads(raw.decode("utf-8")) if raw else None
+        self.last_retry_after = response.getheader("Retry-After")
         conn.close()
         return response.status, payload
 
@@ -1111,7 +1112,7 @@ class PersistentBatchTestCase(unittest.TestCase):
         self.assertEqual(payload["replayed"], 2)
         self.assertEqual(len(load_data_file(str(self.data_file))), 6)
 
-    def test_persistence_failure_is_500_and_changes_nothing(self) -> None:
+    def test_persistence_failure_is_503_and_changes_nothing(self) -> None:
         server = self.start_server()
         self.seed_conflicts(server, "k1", "k2")
         before = self.data_file.read_bytes()
@@ -1123,8 +1124,9 @@ class PersistentBatchTestCase(unittest.TestCase):
             StateStore, "_persist_locked", side_effect=server_module.PersistenceError("disk gone")
         ):
             status, payload = self.request(server, "POST", BATCH_PATH, doc)
-            self.assertEqual(status, 500)
-            self.assertEqual(payload, {"error": "internal_error"})
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"error": "persistence_unavailable"})
+            self.assertEqual(self.last_retry_after, "1")
 
         # File and memory are exactly as they were before the batch.
         self.assertEqual(self.data_file.read_bytes(), before)
