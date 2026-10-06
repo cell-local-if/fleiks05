@@ -742,6 +742,23 @@ A checkpoint is not an operation. It changes neither the accepted-operation log 
 
 With `--data-file`, a new or advanced checkpoint is written to the data file in the same atomic commit protocol (`write temp file → fsync → rename → fsync directory`) before the HTTP 200. A durable failure returns HTTP 503 `{"error":"persistence_unavailable"}` with a `Retry-After: 1` header and leaves both memory and the file unchanged — a new registration is absent and an advanced cursor keeps its old value — so the request is safely retryable; an equal-value replay needs no write and still succeeds during the fault. A version:1 file written before checkpoints existed (without the `checkpoints` section) recovers with no registered checkpoints and otherwise unchanged semantics; after the format is supplemented on disk, a restart preserves both the checkpoints and every existing behavior. Without `--data-file` checkpoints live only in memory, exactly like the rest of the state.
 
+#### Conditional checkpoint advance
+
+`POST /v1/sync/peers/{peerId}/checkpoint/conditional` advances a peer's checkpoint only when the registered cursor still equals a caller-supplied expectation, so concurrent coordinators and retried requests can never overwrite newer progress with a stale read:
+
+```json
+POST /v1/sync/peers/peer-a/checkpoint/conditional
+{"expectedCursor": 1, "cursor": 2}
+```
+
+- `{peerId}` follows the same percent-decoding rules as the other sync routes; an empty segment (`/v1/sync/peers//checkpoint/conditional`), a missing or extra segment, or a trailing slash is a route-shape failure and returns HTTP 404 with `{"error":"not_found"}`. The route-shape check takes precedence over the query-parameter check, and the route accepts no query parameters: any parameter returns HTTP 400 with `{"error":"invalid_request"}`.
+- The body must be a JSON object with exactly `expectedCursor` and `cursor`, both non-boolean, non-negative integers with `expectedCursor` not greater than `cursor`; `cursor` must not exceed the accepted-log length at validation time. Any other shape, type, or range returns HTTP 400 with `{"error":"invalid_request"}`.
+- When the peer's registered cursor differs from `expectedCursor` — including an unregistered peer with a nonzero expectation — the request returns HTTP 409 with `{"error":"checkpoint_conflict"}` and nothing changes. An unregistered peer with `expectedCursor` 0 is registered for the first time.
+- A matching expectation with `cursor` equal to the registered cursor is an idempotent replay; a matching expectation with a larger `cursor` is an advance. Both return HTTP 200 with exactly `{"peerId","cursor"}` — a compact JSON object terminated by a single newline.
+- With `--data-file`, a first registration and a real advance commit to the data file in the same atomic protocol before the HTTP 200; a durable failure returns HTTP 503 `{"error":"persistence_unavailable"}` with a `Retry-After: 1` header and leaves memory and the file exactly as they were, so the request is safely retryable. An idempotent replay writes nothing and still returns HTTP 200 during the fault.
+
+A conditional checkpoint is not an operation either: like the unconditional POST it changes neither the accepted log, sync export, candidate state, the receipt chain, the audit streams, nor the metrics counters, and it shares the same commit lock and registration as every other checkpoint route. The unconditional `POST`, the `GET`, and their registration, replay, advance, and conflict semantics are unchanged.
+
 #### Picking up operations past a peer's checkpoint
 
 `GET /v1/sync/peers/{peerId}/operations?after=N&limit=N` lets a consuming replica fetch the accepted operations it has not yet consumed, anchored at a checkpoint previously registered with `POST /v1/sync/peers/{peerId}/checkpoint`. The peer only selects the progress anchor: the response is the tail of the **shared accepted-operation log** beginning right after that peer's registered cursor, in global commit order — every accepted record past the cursor is returned whatever its `replicaId`, each item keeping the committed sync record's own `{"replicaId","operation"}` identity and content, exactly as `GET /v1/sync/operations` would export from that position.
